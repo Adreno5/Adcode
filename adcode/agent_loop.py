@@ -24,8 +24,8 @@ from adcode.llm.context import (
     ConversationContext, StablePrefix, TokenBudgetExceeded, stream_compact,
 )
 from adcode.llm.usage import (
-    TokenBudget, effective_reserved, estimate_tokens, normalize_tool_result,
-    normalize_usage,
+    TokenBudget, effective_reserved, estimate_tokens, merge_usage,
+    normalize_tool_result, normalize_usage,
 )
 from adcode.session import (
     LAST_SESSION, SessionPayload, SessionStore, TranscriptItem, new_session_name,
@@ -35,7 +35,6 @@ from adcode.system_prompt import build_system_prompt
 from adcode.tools.registry import ToolRegistry
 from adcode.tools.runtime import ToolContext, pop_context, push_context
 
-MAX_TOOL_ITERATIONS = 120
 MAX_CONTINUATIONS = 3
 CHECKPOINT_INTERVAL = 30.0
 
@@ -155,6 +154,9 @@ class AgentLoop:
         text = text.strip()
         if not text:
             return False
+        # A queued request starts clean: an interrupt issued for the previous
+        # turn must not cancel this one before it begins.
+        self._interrupt.clear()
         self._work.put((mode, text))
         self._emit('queued', text=text, mode=mode,
                    position=self._work.qsize())
@@ -165,6 +167,20 @@ class AgentLoop:
 
     def stop_turn(self) -> None:
         self._interrupt.set()
+
+    def _quiesce(self, timeout: float = 2.0) -> bool:
+        """Interrupt the active turn and wait until the worker is idle."""
+        if not self.busy:
+            return True
+        self._interrupt.set()
+        deadline = time.monotonic() + timeout
+        while self.busy and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return not self.busy
+
+    def _require_idle(self, action: str) -> None:
+        if not self._quiesce():
+            raise RuntimeError(f'{action} while a turn is still running')
 
     def add_notice(self, text: str, level: str = 'info') -> None:
         self._append_notice(text, level)
@@ -180,6 +196,7 @@ class AgentLoop:
         self._emit('diff_added')
 
     def request_compact(self) -> None:
+        self._interrupt.clear()
         self._work.put(('compact', ''))
 
     # ── event delivery ──────────────────────────────────────
@@ -263,6 +280,7 @@ class AgentLoop:
                     if self.status != 'idle':
                         self.status = 'idle'
                         self._emit('status', status='idle')
+                self._interrupt.clear()
         with self._lock:
             self.status = 'idle'
 
@@ -272,7 +290,7 @@ class AgentLoop:
             self.turn += 1
             turn = self.turn
             if not self.session_name:
-                self.session_name = new_session_name()
+                self.session_name = self.store.unique_name(new_session_name())
                 self.session_created = time.strftime('%Y-%m-%d %H:%M')
             if not self.session_title:
                 self.session_title = _title_from(text)
@@ -283,7 +301,6 @@ class AgentLoop:
             self.status = 'thinking'
         self._emit('turn_start', turn=turn, text=text)
         self._emit('status', status='thinking')
-        self._interrupt.clear()
         context = self.context
         context.stage({'role': 'user', 'content': text})
         tool_context = ToolContext(cwd='.', interrupt=self._interrupt, agent='root')
@@ -293,7 +310,10 @@ class AgentLoop:
         continuations = 0
         try:
             with self.agents.root_scope():
-                for iteration in range(MAX_TOOL_ITERATIONS):
+                # The turn runs until the model answers without tool calls; the
+                # user's interrupt and the token budget are the only ways out,
+                # so long investigations are not cut off at an arbitrary count.
+                while True:
                     if self._stop.is_set():
                         break
                     if self._interrupt.is_set():
@@ -318,10 +338,11 @@ class AgentLoop:
                             self._append_notice(
                                 'Output token limit reached; continuation stopped.',
                                 level='warning')
-                            context.stage({
-                                'role': 'assistant', 'content': full,
-                                'reasoning_content': thinking,
-                            })
+                            if full:
+                                context.stage({
+                                    'role': 'assistant', 'content': full,
+                                    'reasoning_content': thinking,
+                                })
                             context.commit()
                             committed = True
                             break
@@ -329,16 +350,14 @@ class AgentLoop:
                         continuation = _continuation_prompt(thinking, full)
                         context.stage({'role': 'assistant', 'content': continuation})
                         continue
-                    context.stage({
-                        'role': 'assistant', 'content': full,
-                        'reasoning_content': thinking,
-                    })
+                    if full:
+                        context.stage({
+                            'role': 'assistant', 'content': full,
+                            'reasoning_content': thinking,
+                        })
                     context.commit()
                     committed = True
                     break
-                else:
-                    self._append_notice('Stopped after reaching the tool iteration limit.',
-                                        level='warning')
                 if not committed and not interrupted and self._interrupt.is_set():
                     interrupted = True
         except TokenBudgetExceeded as error:
@@ -447,7 +466,7 @@ class AgentLoop:
                 normalized = normalize_usage(event.get('usage'))
                 if (normalized.get('input_tokens') is not None
                         or normalized.get('output_tokens') is not None):
-                    request_usage = normalized
+                    request_usage = merge_usage(request_usage, normalized)
             elif kind == 'finish':
                 finish_reason = str(event.get('reason', ''))
             elif kind == 'retry':
@@ -475,15 +494,22 @@ class AgentLoop:
                        full: str = '') -> bool:
         """Execute a tool batch; returns False when the turn was interrupted."""
         draft: list[dict[str, Any]] = []
+        # Providers occasionally omit call ids; the assistant message and every
+        # matching tool result must agree on the same fallback id.
+        stamp = int(time.time() * 1000)
+        call_ids = [
+            str(call.get('id') or f'call_{stamp}_{index}')
+            for index, call in enumerate(tool_calls)
+        ]
         with self._lock:
             self.status = 'tool'
         self._emit('status', status='tool')
-        for call in tool_calls:
+        for index, call in enumerate(tool_calls):
             if self._interrupt.is_set() or self._stop.is_set():
                 return False
             name = str(call.get('name', ''))
             args = call.get('args', {}) if isinstance(call.get('args'), dict) else {}
-            call_id = str(call.get('id', '') or f'call_{int(time.time() * 1000)}')
+            call_id = call_ids[index]
             display = self._display_tool(name)
             item = TranscriptItem(kind='tool', turn=turn, call_id=call_id,
                                   name=name, display=display, args=args,
@@ -528,12 +554,12 @@ class AgentLoop:
             'content': full or None,
             'reasoning_content': thinking,
             'tool_calls': [{
-                'id': str(call.get('id', '')), 'type': 'function',
+                'id': call_ids[index], 'type': 'function',
                 'function': {
                     'name': str(call.get('name', '')),
                     'arguments': json.dumps(call.get('args', {}), ensure_ascii=False),
                 },
-            } for call in tool_calls],
+            } for index, call in enumerate(tool_calls)],
         }
         context.stage(assistant_message)
         context.stage(*draft)
@@ -549,20 +575,38 @@ class AgentLoop:
             self.status = 'compacting'
         self._emit('status', status='compacting')
         parts: list[str] = []
+        usage: dict[str, Any] | None = None
 
         def emit_delta(delta: str) -> None:
             parts.append(delta)
             self._emit('compaction_delta', text=delta)
 
-        removed = stream_compact(
-            context, max(1024, budget.usable() - estimate_tokens(context.draft)),
-            lambda messages, **kwargs: self.client.chat(
+        def compact_stream(messages: list[dict[str, Any]], **kwargs: Any):
+            nonlocal usage
+            for event in self.client.chat(
                 messages, self.model,
                 effort=self.config.context.compaction_reasoning_effort,
                 **kwargs,
-            ),
-            emit_delta, self.config.context.keep_recent_turns,
+            ):
+                if event.get('kind') == 'usage':
+                    normalized = normalize_usage(event.get('usage'))
+                    if (normalized.get('input_tokens') is not None
+                            or normalized.get('output_tokens') is not None):
+                        usage = merge_usage(usage, normalized)
+                if self._interrupt.is_set() or self._stop.is_set():
+                    # stream_compact catches this and falls back to the
+                    # deterministic summary instead of keeping partial text.
+                    raise RuntimeError('compaction interrupted')
+                yield event
+
+        removed = stream_compact(
+            context, max(1024, budget.usable() - estimate_tokens(context.draft)),
+            compact_stream, emit_delta, self.config.context.keep_recent_turns,
         )
+        if usage is not None:
+            usage.update({'provider': self.provider.name, 'model': self.model.id,
+                          'prefix_generation': context.stable_prefix.generation})
+            self._record_usage(usage)
         text = ''.join(parts).strip()
         summary = text or '(deterministic summary)'
         self._append_notice(
@@ -574,6 +618,9 @@ class AgentLoop:
         self._emit('status', status='thinking')
 
     def _run_compact(self) -> None:
+        if self._interrupt.is_set() or self._stop.is_set():
+            self._append_notice('Compaction cancelled.', level='info')
+            return
         budget = TokenBudget(
             context_window=self.model.context_window,
             reserved_output=effective_reserved(
@@ -589,6 +636,8 @@ class AgentLoop:
 
     # ── aside questions ─────────────────────────────────────
     def _run_aside(self, question: str) -> None:
+        if self._interrupt.is_set() or self._stop.is_set():
+            return
         with self._lock:
             self.status = 'aside'
         self._emit('aside_start', question=question)
@@ -597,6 +646,8 @@ class AgentLoop:
             {'role': 'user', 'content': question},
         ]
         parts: list[str] = []
+        usage: dict[str, Any] | None = None
+        started = time.time()
         try:
             for event in self.client.chat(
                 messages, self.model,
@@ -608,12 +659,25 @@ class AgentLoop:
             ):
                 if self._interrupt.is_set() or self._stop.is_set():
                     break
-                if event.get('kind') == 'text':
+                kind = event.get('kind')
+                if kind == 'text':
                     delta = str(event.get('content', ''))
                     parts.append(delta)
                     self._emit('aside_delta', text=delta)
+                elif kind == 'usage':
+                    normalized = normalize_usage(event.get('usage'))
+                    if (normalized.get('input_tokens') is not None
+                            or normalized.get('output_tokens') is not None):
+                        usage = merge_usage(usage, normalized)
         except Exception as error:
             self._emit('error', text=str(error))
+        if usage is not None:
+            usage.update({
+                'provider': self.provider.name, 'model': self.model.id,
+                'prefix_generation': self.context.stable_prefix.generation,
+                'latency_ms': round((time.time() - started) * 1000),
+            })
+            self._record_usage(usage)
         answer = ''.join(parts).strip()
         with self._lock:
             self.items.append(TranscriptItem(kind='aside', turn=self.turn,
@@ -726,15 +790,19 @@ class AgentLoop:
     def _refresh_prefix(self, force: bool = False) -> None:
         schemas = self.registry.schemas(self.provider.wire)
         current = self.context.stable_prefix
+        # ``self.system`` is authoritative: ``_refresh_system_and_prefix`` has
+        # already folded new goals, instructions or skills into it.  Using the
+        # old prefix text here silently discarded those updates.
+        system = self.system
         candidate = StablePrefix.create(
             provider=self.provider.name, endpoint=self.provider.base_url,
-            model=self.model.id, system=current.system, tools=schemas,
+            model=self.model.id, system=system, tools=schemas,
             generation=current.generation, wire=self.provider.wire,
         )
         if force or candidate.fingerprint != current.fingerprint:
             self.context.stable_prefix = StablePrefix.create(
                 provider=self.provider.name, endpoint=self.provider.base_url,
-                model=self.model.id, system=current.system, tools=schemas,
+                model=self.model.id, system=system, tools=schemas,
                 generation=current.generation + 1, wire=self.provider.wire,
             )
         self.agents.update_root(self.context, self.provider, self.model, self.system)
@@ -792,6 +860,9 @@ class AgentLoop:
         self.save_active()
 
     def save_as(self, name: str) -> None:
+        name = name.strip()
+        if not name:
+            raise ValueError('session name must not be empty')
         with self._lock:
             previous = self.session_name
             self.session_name = name
@@ -809,6 +880,7 @@ class AgentLoop:
         return True
 
     def apply_payload(self, payload: SessionPayload) -> None:
+        self._require_idle('cannot load a session')
         provider = self.config.provider_by_name(payload.provider) or self.provider
         model = provider.model(payload.model) or (
             provider.models[0] if provider.models else self.model)
@@ -841,6 +913,7 @@ class AgentLoop:
                    title=self.session_title)
 
     def clear(self) -> None:
+        self._require_idle('cannot clear the conversation')
         with self._lock:
             self.context.committed.clear()
             self.context.draft.clear()
@@ -869,14 +942,24 @@ class AgentLoop:
 
     def rewind(self, turn: int) -> str:
         """Drop the given turn and everything after it; returns the user text."""
+        self._require_idle('cannot rewind the conversation')
         with self._lock:
             from adcode.session import SessionStore as _Store
             starts = _Store.turn_starts(self.context.committed)
+            # Transcript turn ids survive compaction, but the retained history
+            # starts later.  Align the oldest retained user message with the
+            # suffix of transcript turns instead of assuming ``turn - 1``.
+            turn_ids = sorted({item.turn for item in self.items
+                               if item.kind == 'user' and item.turn > 0})
+            index = len(starts) - sum(1 for value in turn_ids if value >= turn)
             text = ''
-            if 1 <= turn <= len(starts):
-                cut = starts[turn - 1]
+            if 0 <= index < len(starts):
+                cut = starts[index]
                 message = self.context.committed[cut]
                 text = str(message.get('content') or '')
+                marker = '</conversation_summary>'
+                if text.startswith('<conversation_summary>') and marker in text:
+                    text = text.split(marker, 1)[1].lstrip('\n')
                 del self.context.committed[cut:]
             else:
                 self.context.committed.clear()
@@ -889,9 +972,15 @@ class AgentLoop:
         return text
 
     def fork(self, name: str = '') -> str:
+        self._require_idle('cannot fork the conversation')
         with self._lock:
             source = self.session_name
-            new_name = name or f'{new_session_name()}_fork'
+            if name:
+                new_name = name.strip()
+            else:
+                new_name = self.store.unique_name(f'{new_session_name()}_fork')
+            if not new_name:
+                raise ValueError('session name must not be empty')
             self.session_name = new_name
             self.session_title = f'Fork of {self.session_title or source or "session"}'
         payload = self.payload()
@@ -903,6 +992,7 @@ class AgentLoop:
 
     # ── model switching ─────────────────────────────────────
     def set_model(self, provider: ProviderConfig, model: ModelConfig) -> None:
+        self._require_idle('cannot switch models')
         with self._lock:
             self.provider = provider
             self.model = model
@@ -927,7 +1017,9 @@ class AgentLoop:
         if self.config.agents.enabled:
             self.registry.register_many(self.agents.tool_specs())
         self.registry.register_many(self.skills.tool_specs())
-        self._refresh_prefix(force=True)
+        # Skills and delegation limits also appear in the system prompt, so
+        # rebuild it instead of only refreshing the tool schemas.
+        self._refresh_system_and_prefix(force=True)
         self._emit('tools_refreshed')
 
 

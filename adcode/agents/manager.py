@@ -30,8 +30,8 @@ from adcode.llm.context import (
     ConversationContext, StablePrefix, stream_compact,
 )
 from adcode.llm.usage import (
-    TokenBudget, effective_reserved, estimate_tokens, normalize_tool_result,
-    normalize_usage,
+    TokenBudget, effective_reserved, estimate_tokens, merge_usage,
+    normalize_tool_result, normalize_usage,
 )
 from adcode.tools.registry import ToolRegistry, ToolResult, ToolSpec
 from adcode.tools.runtime import ToolContext, pop_context, push_context
@@ -174,7 +174,7 @@ class AgentManager:
         return name in {spec.name for spec in self.tool_specs()}
 
     def tool_specs(self) -> list[ToolSpec]:
-        return [
+        specs = [
             ToolSpec(
                 'spawn_agent',
                 ('Spawn a background sub-agent with its own streaming ReAct loop. '
@@ -254,6 +254,9 @@ class AgentManager:
                 self._tool_update_goal, source='agent',
             ),
         ]
+        if not self.config.agents.team_enabled:
+            specs = [spec for spec in specs if spec.name != 'spawn_team']
+        return specs
 
     # ── tool handlers ───────────────────────────────────────
     def _tool_spawn_agent(self, args: dict[str, Any]) -> str:
@@ -307,7 +310,8 @@ class AgentManager:
         if status not in {'active', 'paused', 'completed', 'blocked', 'cancelled'}:
             return 'Error: invalid goal status'
         result = str(args.get('result', '')).strip()
-        self.goal_store.update(goal, status=status, result=result)  # type: ignore[arg-type]
+        self.goal_store.update(goal, status=status,  # type: ignore[arg-type]
+                               result=result or None)
         return _json({'goal_id': goal.id, 'status': goal.status, 'result': goal.result})
 
     # ── spawning ────────────────────────────────────────────
@@ -612,14 +616,20 @@ class AgentManager:
                         if self._shutdown:
                             terminal_status = AgentStatus.SHUTDOWN
                         elif record.interrupt.is_set():
-                            terminal_status = AgentStatus.INTERRUPTED
-                        elif not record.pending_turns:
-                            if record.thread is current_thread:
-                                record.thread = None
-                            record.updated_at = time.time()
-                            self._activity.notify_all()
-                            return
-                        else:
+                            if record.restart_after_interrupt and record.pending_turns:
+                                # A follow-up arrived while interrupting the
+                                # pending task; keep the worker alive for it.
+                                record.interrupt.clear()
+                                record.restart_after_interrupt = False
+                            else:
+                                terminal_status = AgentStatus.INTERRUPTED
+                        if terminal_status is None:
+                            if not record.pending_turns:
+                                if record.thread is current_thread:
+                                    record.thread = None
+                                record.updated_at = time.time()
+                                self._activity.notify_all()
+                                return
                             task = record.pending_turns.popleft()
                             queued = list(record.inbox)
                             record.inbox.clear()
@@ -629,7 +639,7 @@ class AgentManager:
                             record.status = AgentStatus.RUNNING
                             record.updated_at = time.time()
                             self._activity.notify_all()
-                        if terminal_status is not None:
+                        else:
                             record.status = terminal_status
                             record.updated_at = time.time()
                             self._activity.notify_all()
@@ -718,6 +728,7 @@ class AgentManager:
         context.stage({'role': 'user', 'content': task})
         client = LLMClient(scope.provider)
         last_answer = ''
+        answer = ''
         turns = 0
         continuations = 0
         tool_context = ToolContext(
@@ -771,13 +782,21 @@ class AgentManager:
                         and context.needs_compaction(
                             budget, self.config.context.compact_threshold)):
                     self._emit(AgentEvent(scope.name, 'compaction_start'))
-                    stream_compact(
-                        context, budget.usable() - estimate_tokens(context.draft),
-                        lambda messages, **kwargs: client.chat(
+
+                    def compact_stream(messages: list[dict[str, Any]],
+                                       **kwargs: Any):
+                        for event in client.chat(
                             messages, scope.model,
                             effort=self.config.context.compaction_reasoning_effort,
                             **kwargs,
-                        ),
+                        ):
+                            if record.interrupt.is_set() or self._shutdown:
+                                raise RuntimeError('compaction interrupted')
+                            yield event
+
+                    stream_compact(
+                        context, budget.usable() - estimate_tokens(context.draft),
+                        compact_stream,
                         lambda delta: self._emit(
                             AgentEvent(scope.name, 'compaction_delta', delta)),
                         self.config.context.keep_recent_turns,
@@ -803,7 +822,7 @@ class AgentManager:
                 ):
                     if record.interrupt.is_set():
                         context.rollback()
-                        return full or last_answer
+                        return (answer + full) or last_answer
                     kind = event.get('kind', '')
                     if kind == 'thinking':
                         delta = str(event.get('content', ''))
@@ -816,25 +835,33 @@ class AgentManager:
                     elif kind == 'tool_call':
                         tool_calls.append(event)
                     elif kind == 'usage':
-                        usage = normalize_usage(event.get('usage'))
-                        self._emit(AgentEvent(scope.name, 'usage',
-                                              content=_json(usage)))
+                        normalized = normalize_usage(event.get('usage'))
+                        if (normalized.get('input_tokens') is not None
+                                or normalized.get('output_tokens') is not None):
+                            usage = merge_usage(usage, normalized)
+                            self._emit(AgentEvent(scope.name, 'usage',
+                                                  content=_json(usage)))
                     elif kind == 'finish':
                         finish_reason = str(event.get('reason', ''))
                 if tool_calls:
+                    stamp = int(time.time() * 1000)
+                    call_ids = [
+                        str(call.get('id') or f'call_{stamp}_{index}')
+                        for index, call in enumerate(tool_calls)
+                    ]
                     draft: list[dict[str, Any]] = [{
                         'role': 'assistant',
                         'content': full or None,
                         'reasoning_content': thinking,
                         'tool_calls': [{
-                            'id': call.get('id', ''), 'type': 'function',
+                            'id': call_ids[index], 'type': 'function',
                             'function': {
                                 'name': call.get('name', ''),
                                 'arguments': _json(call.get('args', {})),
                             },
-                        } for call in tool_calls],
+                        } for index, call in enumerate(tool_calls)],
                     }]
-                    for call in tool_calls:
+                    for index, call in enumerate(tool_calls):
                         if record.interrupt.is_set():
                             context.rollback()
                             return last_answer
@@ -859,11 +886,12 @@ class AgentManager:
                             tool_name=name, tool_args=args,
                             file_diff=detailed.file_diff))
                         draft.append({
-                            'role': 'tool', 'tool_call_id': call.get('id', ''),
+                            'role': 'tool', 'tool_call_id': call_ids[index],
                             'content': normalized,
                         })
                     context.stage(*draft)
                     last_answer = full or last_answer
+                    answer = ''
                     continue
 
                 if finish_reason == 'length' and continuations < MAX_CONTINUATIONS:
@@ -877,15 +905,18 @@ class AgentManager:
                         'limit. Continue exactly where it stopped. Do not repeat '
                         'anything above.]')
                     context.stage({'role': 'assistant', 'content': continuation})
+                    answer += full
                     continuations += 1
                     continue
 
-                context.stage({
-                    'role': 'assistant', 'content': full,
-                    'reasoning_content': thinking,
-                })
+                answer += full
+                if full:
+                    context.stage({
+                        'role': 'assistant', 'content': full,
+                        'reasoning_content': thinking,
+                    })
                 context.commit()
-                return full or last_answer
+                return answer or last_answer or '(no response)'
         finally:
             pop_context(token)
 

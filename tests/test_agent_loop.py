@@ -105,6 +105,30 @@ def test_tool_turn(loop):
     assert tool_item.duration >= 0
 
 
+def test_turn_is_not_capped_by_tool_rounds(loop):
+    """A long investigation is only ended by the model, not a fixed count."""
+    rounds = 130
+    sessions = {'n': 0}
+
+    def long_chat(messages, model, **kwargs):
+        sessions['n'] += 1
+        if sessions['n'] <= rounds:
+            yield {'kind': 'tool_call', 'id': f'c{sessions["n"]}',
+                   'name': 'probe', 'args': {'value': str(sessions['n'])}}
+            yield {'kind': 'finish', 'reason': 'tool_calls'}
+            return
+        yield {'kind': 'text', 'content': 'finished.'}
+        yield {'kind': 'finish', 'reason': 'stop'}
+
+    loop.client.chat = long_chat
+    loop.submit('keep going')
+    wait_idle(loop, timeout=30)
+    assert not any('tool iteration limit' in item.text for item in loop.items
+                   if item.kind == 'notice')
+    assert [item.kind for item in loop.items].count('tool') == rounds
+    assert loop.context.committed[-1]['content'] == 'finished.'
+
+
 def test_compaction_trigger(loop):
     loop.model.context_window = 8_000
     loop.config.max_output_tokens = 4_000
