@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -13,6 +14,14 @@ from typing import Any, Iterable
 
 SESSION_VERSION = 2
 LAST_SESSION = '__last__'
+# GoalStore shares the sessions directory; these files are not sessions.
+RESERVED_SESSION_NAMES = {LAST_SESSION, 'goals'}
+_INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_RESERVED_DEVICES = {
+    'con', 'prn', 'aux', 'nul',
+    *(f'com{index}' for index in range(1, 10)),
+    *(f'lpt{index}' for index in range(1, 10)),
+}
 
 
 @dataclass
@@ -88,11 +97,28 @@ class SessionPayload:
 
     @classmethod
     def from_json(cls, raw: dict[str, Any]) -> 'SessionPayload':
-        items = [item for raw_item in raw.get('items') or []
-                 if (item := TranscriptItem.from_dict(raw_item)) is not None]
-        messages = list(raw.get('messages') or raw.get('history') or [])
+        if not isinstance(raw, dict):
+            raw = {}
+        items: list[TranscriptItem] = []
+        raw_items = raw.get('items')
+        if isinstance(raw_items, list):
+            for raw_item in raw_items:
+                item = TranscriptItem.from_dict(raw_item)
+                if item is not None:
+                    items.append(item)
+        raw_messages = raw.get('messages') or raw.get('history') or []
+        if isinstance(raw_messages, dict):
+            raw_messages = [raw_messages]
+        if not isinstance(raw_messages, list):
+            raw_messages = []
+        messages = [dict(message) for message in raw_messages
+                    if isinstance(message, dict)]
         if not items and messages:
             items = _items_from_legacy_messages(messages)
+        raw_archive = raw.get('compaction_archive')
+        archive = ([dict(message) for message in raw_archive
+                    if isinstance(message, dict)]
+                   if isinstance(raw_archive, list) else [])
         return cls(
             name=str(raw.get('name') or raw.get('session') or ''),
             title=str(raw.get('title') or ''),
@@ -100,12 +126,19 @@ class SessionPayload:
             updated=str(raw.get('updated') or ''),
             provider=str(raw.get('provider') or ''),
             model=str(raw.get('model') or ''),
-            turn=int(raw.get('turn') or 0),
-            prefix_generation=max(1, int(raw.get('prefix_generation') or 1)),
+            turn=_safe_int(raw.get('turn'), 0),
+            prefix_generation=max(1, _safe_int(raw.get('prefix_generation'), 1)),
             messages=messages,
-            compaction_archive=list(raw.get('compaction_archive') or []),
+            compaction_archive=archive,
             items=items,
         )
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _items_from_legacy_messages(messages: list[dict[str, Any]]) -> list[TranscriptItem]:
@@ -113,6 +146,8 @@ def _items_from_legacy_messages(messages: list[dict[str, Any]]) -> list[Transcri
     items: list[TranscriptItem] = []
     turn = 0
     for message in messages:
+        if not isinstance(message, dict):
+            continue
         role = message.get('role')
         content = message.get('content')
         text = content if isinstance(content, str) else ''
@@ -127,8 +162,15 @@ def _items_from_legacy_messages(messages: list[dict[str, Any]]) -> list[Transcri
             if reasoning:
                 items.append(TranscriptItem(kind='thinking', turn=turn,
                                             text=str(reasoning)))
-            for call in message.get('tool_calls') or []:
-                function = call.get('function', {}) if isinstance(call, dict) else {}
+            calls = message.get('tool_calls') or []
+            if isinstance(calls, dict):
+                calls = [calls]
+            for call in calls if isinstance(calls, list) else []:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get('function')
+                if not isinstance(function, dict):
+                    function = {}
                 items.append(TranscriptItem(
                     kind='tool', turn=turn, name=str(function.get('name', '')),
                     display=str(function.get('name', '')), status='done'))
@@ -145,16 +187,33 @@ class SessionStore:
         self._lock = threading.Lock()
 
     def path_for(self, name: str) -> Path:
-        safe = name.strip().replace('/', '_').replace('\\', '_')
+        safe = name.strip()
+        safe = _INVALID_FILENAME.sub('_', safe).strip(' .')
+        safe = safe[:100] or 'session'
+        if safe.lower() in _RESERVED_DEVICES:
+            safe = f'_{safe}'
         return self.directory / f'{safe}.json'
 
+    def unique_name(self, base: str) -> str:
+        """Return a session name whose file does not exist yet."""
+        stem = base.strip() or new_session_name()
+        candidate = stem
+        index = 2
+        while self.path_for(candidate).exists():
+            candidate = f'{stem}_{index}'
+            index += 1
+        return candidate
+
     def save(self, payload: SessionPayload, as_name: str | None = None) -> None:
+        name = (as_name if as_name is not None else payload.name).strip()
+        if not name:
+            raise ValueError('session name must not be empty')
         payload.updated = time.strftime('%Y-%m-%d %H:%M')
         if not payload.created:
             payload.created = payload.updated
         with self._lock:
             self.directory.mkdir(parents=True, exist_ok=True)
-            path = self.path_for(as_name or payload.name)
+            path = self.path_for(name)
             fd, temp_name = tempfile.mkstemp(
                 prefix=f'.{path.name}.', suffix='.tmp', dir=str(self.directory))
             try:
@@ -175,7 +234,10 @@ class SessionStore:
             return None
         if not isinstance(raw, dict):
             return None
-        payload = SessionPayload.from_json(raw)
+        try:
+            payload = SessionPayload.from_json(raw)
+        except (TypeError, ValueError):
+            return None
         if not payload.name:
             payload.name = name
         return payload
@@ -193,7 +255,7 @@ class SessionStore:
         rows: list[dict[str, Any]] = []
         for path in self.directory.glob('*.json'):
             name = path.stem
-            if name == LAST_SESSION:
+            if name in RESERVED_SESSION_NAMES:
                 continue
             try:
                 raw = json.loads(path.read_text(encoding='utf-8-sig'))
@@ -201,12 +263,16 @@ class SessionStore:
                 continue
             if not isinstance(raw, dict):
                 continue
+            if not any(key in raw for key in ('messages', 'history', 'items')):
+                # Not a session payload (for example goals.json).
+                continue
+            messages = raw.get('messages')
             rows.append({
                 'name': name,
                 'title': str(raw.get('title') or name),
                 'created': str(raw.get('created') or ''),
                 'updated': str(raw.get('updated') or ''),
-                'messages': len(raw.get('messages') or []),
+                'messages': len(messages) if isinstance(messages, list) else 0,
             })
         rows.sort(key=lambda row: (row['updated'], row['created']), reverse=True)
         return rows

@@ -137,18 +137,11 @@ class ConversationContext:
     def apply_compaction(self, plan: CompactionPlan, summary: dict[str, Any]) -> int:
         if not plan.removed:
             return 0
-        kept_messages = list(plan.kept_messages)
-        if kept_messages and kept_messages[0].get('role') == 'user':
-            first = dict(kept_messages[0])
-            first_content = first.get('content') or ''
-            if isinstance(first_content, str):
-                first['content'] = f'{summary["content"]}\n\n{first_content}'
-            kept_messages[0] = first
-            replacement = kept_messages
-        else:
-            replacement = [summary, *kept_messages]
+        # Keep the summary as its own user message.  Merging it into the first
+        # retained user message hid that real turn from turn_starts() and broke
+        # /rewind (and /edit prefill) after any compaction.
         self.archived.extend(plan.removed)
-        self.committed[:] = replacement
+        self.committed[:] = [summary, *plan.kept_messages]
         self.stable_prefix = replace(
             self.stable_prefix, generation=self.stable_prefix.generation + 1)
         return len(plan.removed)
@@ -197,6 +190,8 @@ def _conversation_groups(messages: list[dict[str, Any]]) -> list[list[dict[str, 
 
 
 def _message_text(message: dict[str, Any], limit: int = 600) -> str:
+    if not isinstance(message, dict):
+        return str(message)[:limit]
     content = message.get('content') or ''
     if not isinstance(content, str):
         content = canonical_json(content)
@@ -204,9 +199,17 @@ def _message_text(message: dict[str, Any], limit: int = 600) -> str:
     if len(content) > limit:
         content = content[:limit] + '...'
     calls = message.get('tool_calls') or []
-    if calls:
-        names = [call.get('function', {}).get('name', '') for call in calls]
-        content = f'{content} [tools: {", ".join(filter(None, names))}]'.strip()
+    if isinstance(calls, dict):
+        calls = [calls]
+    if isinstance(calls, list):
+        names = [
+            str(call.get('function', {}).get('name', ''))
+            for call in calls if isinstance(call, dict)
+            and isinstance(call.get('function'), dict)
+        ]
+        names = [name for name in names if name]
+        if names:
+            content = f'{content} [tools: {", ".join(names)}]'.strip()
     return content
 
 
