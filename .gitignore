@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .pi/
+sessions/
+config.json
+.ruff_cache/
+.mypy_cache/
