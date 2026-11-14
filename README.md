@@ -186,6 +186,10 @@ frames, and the per-frame duration. The `partial` mode configures:
 | `result` | Only the result section |
 | `both` | The call line and the result section |
 
+The call line bleeds one cell into the transcript's left margin, so its accent
+bar sits flush with the screen edge while the `│ ` gutter keeps the name one
+space away from it. Result rows stay aligned with the wrapped text.
+
 Result sections support the same negative-row window, style, gradient, and
 ellipsis controls as thinking, plus a full mode with an optional line cap.
 File diffs are rendered inline and can be toggled.
@@ -308,8 +312,10 @@ session files are migrated on load.
 - `/save` / `/load` / `/sessions` manage named sessions.
 
 Goals live in `sessions/goals.json` and are injected into the system prompt
-while active. Project instructions are read from `AGENTS.md` (or `prompt`) in
-the working directory.
+while active. Global instructions are read from `~/.adcode/AGENTS.md` and
+project instructions from `AGENTS.md` (or `prompt`) in the working directory.
+Both are inserted into the system prompt; when they conflict, the project
+instructions take precedence.
 
 ## Rendering Architecture
 
@@ -361,7 +367,7 @@ adcode/
 ├── session.py        # transcript items, save/load, rewind/fork
 ├── goals.py          # durable goal store
 ├── skills.py         # skill discovery, preview and tools
-├── system_prompt.py  # AGENTS.md, environment, goals and skills
+├── system_prompt.py  # global/project instructions, environment, goals and skills
 ├── commands.py       # slash commands and completion
 ├── diff.py           # file snapshots, unified diffs, git worktree
 ├── theme.py          # palettes and semantic colour roles
