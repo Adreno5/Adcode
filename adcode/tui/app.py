@@ -124,6 +124,16 @@ def _format_tokens(value: int) -> str:
     return str(value)
 
 
+def _row_offset(line: Line) -> int:
+    """Left column of a transcript row.
+
+    Rows normally sit one cell in from the screen edge; a row that declares a
+    bleed (a tool call row and its accent bar) starts at column 0 instead,
+    keeping its own gutter so the text stays aligned.
+    """
+    return max(0, 1 - min(getattr(line, 'bleed', 0), 1))
+
+
 def _prompt_layout(text: str, cursor: int, anchor: int | None, width: int
                    ) -> tuple[list[Line], int, int]:
     """Wrap the input into visual rows and locate the caret."""
@@ -958,7 +968,8 @@ class AdCodeApp:
             tool_output=self.live_tool_output,
         )
         return self.transcript.render(self.items, live, width, self.config,
-                                      self.config_version, time.time())
+                                      self.config_version, time.time(),
+                                      self.palette)
 
     # ── rendering ───────────────────────────────────────────
     def _viewport_height(self, rows: int) -> int:
@@ -1014,7 +1025,11 @@ class AdCodeApp:
         start = max(0, min(total - viewport_h - self.scroll, max_scroll))
         visible = lines[start:start + viewport_h]
         for index, line in enumerate(visible):
-            self._draw_line(1, transcript_top + index, line, max(1, columns - 2))
+            # Tool call rows declare a bleed so their accent bar sits flush with
+            # the left edge; the gutter inside the row keeps the text aligned.
+            x = _row_offset(line)
+            self._draw_line(x, transcript_top + index, line,
+                            max(1, columns - x - 1))
         self._draw_scrollbar(columns, transcript_top, viewport_h, total, start)
         self.canvas.hline(0, separator_y, columns, self.palette.border, alpha=110)
         for index, line in enumerate(visible_prompt):

@@ -120,6 +120,12 @@ LIGHT_BASE = Palette(
 
 THEMES = {'dark': DARK_BASE, 'light': LIGHT_BASE}
 
+# A tool call row opens with a soft accent glow: the first cell carries a faint
+# tint of the theme colour and the tint decays cell by cell until it has become
+# the plain panel grey.
+LEAD_IN_COLUMNS = 6
+LEAD_IN_ALPHA = 56
+
 DEFAULT_ACCENT = (143, 167, 214)
 
 ACCENT_PRESETS: list[tuple[str, str]] = [
@@ -156,3 +162,19 @@ def resolve_role(palette: Palette, role: str | RGB | None,
     if isinstance(role, tuple):
         return role
     return getattr(palette, role, palette.text)
+
+
+def lead_in_gradient(palette: Palette, columns: int = LEAD_IN_COLUMNS,
+                     alpha: int = LEAD_IN_ALPHA) -> list[RGB]:
+    """Return the per-cell background of a tool call row's opening glow.
+
+    Column 0 is a barely-there tint of ``palette.accent`` over the panel grey,
+    and every following column walks that tint back towards the plain grey, so
+    the last entry is exactly ``palette.panel``.
+    """
+    columns = max(1, columns)
+    tint = blend_alpha(palette.accent, palette.panel, alpha)
+    if columns == 1:
+        return [tint]
+    return [mix(tint, palette.panel, index / (columns - 1))
+            for index in range(columns)]

@@ -5,10 +5,12 @@ from adcode.tui.text import plain_text
 from adcode.tui.transcript import LiveRender, TranscriptRenderer, _thinking_suffix
 
 
-def render(config, items, width=80, live=None, version=0, now=None):
+def render(config, items, width=80, live=None, version=0, now=None,
+           palette=None):
     renderer = TranscriptRenderer()
     return renderer.render(items, live or LiveRender(), width, config,
-                           version, now if now is not None else time.time())
+                           version, now if now is not None else time.time(),
+                           palette)
 
 
 def texts(lines):
@@ -80,6 +82,61 @@ def test_tool_display_modes(config):
     config.tools.mode = 'both'
     joined = ' '.join(texts(render(config, [item])))
     assert 'bash' in joined and 'three' in joined
+
+
+def test_tool_call_lead_in_gradient(config, palette):
+    from adcode.theme import lead_in_gradient
+    from adcode.config import ToolDisplay
+    item = TranscriptItem(kind='tool', turn=1, name='bash', display='bash',
+                          args={'command': 'ls -la'}, status='done')
+    config.tools = ToolDisplay(mode='call')
+
+    def cell_backgrounds(line):
+        # Tool call rows only use single-cell characters here, so one character
+        # maps to one terminal column.
+        return [span.bg for span in line for _ in span.text]
+
+    lines = render(config, [item], palette=palette)
+    assert len(lines) == 1
+    colors = lead_in_gradient(palette)
+    for column, bg in enumerate(cell_backgrounds(lines[0])[:len(colors)]):
+        assert bg == colors[column]
+    assert colors[0] != palette.panel
+    # Past the glow the row is plain panel grey again.
+    for bg in cell_backgrounds(lines[0])[len(colors):]:
+        assert bg == 'panel'
+
+    # Without a palette the row keeps the plain role-based background.
+    plain = render(config, [item])
+    assert all(span.bg == 'panel' for span in plain[0])
+
+
+def test_tool_call_row_hugs_the_left_edge(config, palette):
+    """The accent bar sits flush left; its gutter cell is still reserved."""
+    from adcode.tui.text import ROW_BLEED, line_width
+    item = TranscriptItem(kind='tool', turn=1, name='bash', display='bash',
+                          args={'command': 'ls -la'}, status='done')
+    config.tools.mode = 'call'
+    lines = render(config, [item], palette=palette)
+    row = lines[0]
+    # The row claims one cell of the transcript's left margin ...
+    assert getattr(row, 'bleed', 0) == ROW_BLEED
+    # ... but keeps the two-cell gutter, so the name keeps its separation.
+    assert plain_text(row).startswith('│ bash')
+    assert row[0].fg == 'accent' and row[0].text == '│'
+    # The row is one cell wider than wrapped text, so both edges line up.
+    assert line_width(row) == 80 + ROW_BLEED
+
+    # Every other row keeps the plain one-cell margin.
+    others = render(config, [TranscriptItem(kind='user', turn=1, text='hi')])
+    assert getattr(others[0], 'bleed', 0) == 0
+
+
+def test_row_offset_for_bleeding_tool_rows():
+    from adcode.tui.app import _row_offset
+    from adcode.tui.text import ROW_BLEED, Row, Span
+    assert _row_offset([Span('> hi', 'accent')]) == 1
+    assert _row_offset(Row([Span('│ bash', 'accent', 'panel')], ROW_BLEED)) == 0
 
 
 def test_tool_result_partial_and_full(config):

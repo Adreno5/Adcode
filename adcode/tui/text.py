@@ -19,6 +19,22 @@ class Span:
 
 Line = list[Span]
 
+# A tool call row keeps its ``│ `` gutter but starts flush with the screen edge,
+# so it declares how far it bleeds into the transcript's left margin.  The
+# gutter cell is preserved: the bar sits in it, the text keeps its one-space
+# separation, and nothing else gains a column.
+ROW_BLEED = 1
+
+
+class Row(list):
+    """A visual row that may draw to the left of the normal text margin."""
+
+    __slots__ = ('bleed',)
+
+    def __init__(self, line: Line | None = None, bleed: int = 0) -> None:
+        super().__init__(line or [])
+        self.bleed = bleed
+
 
 def _same_style(left: Span, right: Span) -> bool:
     return (left.fg == right.fg and left.bg == right.bg

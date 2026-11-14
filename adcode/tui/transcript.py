@@ -14,10 +14,11 @@ from typing import Any
 
 from adcode.config import AppConfig, ThinkingDisplay
 from adcode.session import TranscriptItem
-from adcode.tui.canvas import BOLD, DIM
+from adcode.theme import RGB, Palette, lead_in_gradient
+from adcode.tui.canvas import BOLD, DIM, char_width
 from adcode.tui.markdown import MarkdownRenderer
 from adcode.tui.text import (
-    Line, Span, add_span, line_width, truncate_line,
+    ROW_BLEED, Line, Row, Span, add_span, line_width, truncate_line,
     wrap_line, wrap_lines,
 )
 
@@ -118,6 +119,40 @@ def _apply_gradient(lines: list[Line], top_alpha: int) -> list[Line]:
     return result
 
 
+def _paint_lead_in(line: Line, colors: list[RGB]) -> Line:
+    """Recolour the first cells of ``line`` with a column-by-column background.
+
+    Spans are split wherever the background changes, so a tool call row can fade
+    its opening cells from a light accent tint into the plain panel grey.
+    """
+    if not colors or not line:
+        return line
+    result: Line = []
+    column = 0
+    for span in line:
+        if column >= len(colors):
+            add_span(result, Span(span.text, span.fg, span.bg, span.attrs,
+                                  span.alpha))
+            continue
+        text = ''
+        bg: str | RGB | None = span.bg
+        for char in span.text:
+            size = char_width(char)
+            if size == 0:
+                text += char
+                continue
+            target = colors[column] if column < len(colors) else span.bg
+            if target != bg:
+                add_span(result, Span(text, span.fg, bg, span.attrs, span.alpha))
+                text = ''
+                bg = target
+            text += char
+            column += size
+        if text:
+            add_span(result, Span(text, span.fg, bg, span.attrs, span.alpha))
+    return result
+
+
 def _ellipsis_line(mode: str, omitted: int, label: str) -> list[Line]:
     if omitted <= 0 or mode == 'none':
         return []
@@ -171,13 +206,15 @@ class TranscriptRenderer:
     # ── public entry point ──────────────────────────────────
     def render(self, items: list[TranscriptItem], live: LiveRender, width: int,
                config: AppConfig, config_version: int = 0,
-               now: float | None = None) -> list[Line]:
+               now: float | None = None,
+               palette: Palette | None = None) -> list[Line]:
         now = time.time() if now is None else now
         width = max(16, width)
         output: list[Line] = []
         previous = ''
         for item in items:
-            block = self._item_lines(item, width, config, config_version, now)
+            block = self._item_lines(item, width, config, config_version, now,
+                                     palette)
             if not block:
                 continue
             if output and self._needs_gap(previous, item.kind):
@@ -219,20 +256,23 @@ class TranscriptRenderer:
 
     # ── items ───────────────────────────────────────────────
     def _item_lines(self, item: TranscriptItem, width: int, config: AppConfig,
-                    config_version: int, now: float) -> list[Line]:
+                    config_version: int, now: float,
+                    palette: Palette | None = None) -> list[Line]:
         signature = (width, config_version, item.kind, item.text, item.status,
                      len(item.output), item.duration,
                      bool(item.diff), item.display, item.agent, item.level,
-                     item.name, _args_signature(item.args))
+                     item.name, _args_signature(item.args),
+                     _palette_signature(palette))
         cached = self._cache.get(id(item))
         if cached is not None and cached[0] == signature:
             return cached[1]
-        lines = self._render_item(item, width, config, now)
+        lines = self._render_item(item, width, config, now, palette)
         self._cache[id(item)] = (signature, lines)
         return lines
 
     def _render_item(self, item: TranscriptItem, width: int,
-                     config: AppConfig, now: float) -> list[Line]:
+                     config: AppConfig, now: float,
+                     palette: Palette | None = None) -> list[Line]:
         if item.kind == 'user':
             return self._render_user(item, width)
         if item.kind == 'assistant':
@@ -240,7 +280,7 @@ class TranscriptRenderer:
         if item.kind == 'thinking':
             return self._render_thinking(item, width, config)
         if item.kind == 'tool':
-            return self._render_tool(item, width, config, now)
+            return self._render_tool(item, width, config, now, palette)
         if item.kind == 'notice':
             return self._render_notice(item, width)
         if item.kind == 'aside':
@@ -291,13 +331,14 @@ class TranscriptRenderer:
         )
 
     def _render_tool(self, item: TranscriptItem, width: int, config: AppConfig,
-                     now: float) -> list[Line]:
+                     now: float, palette: Palette | None = None) -> list[Line]:
         mode = config.tools.mode
         if mode == 'hidden':
             return []
         output: list[Line] = []
         if mode in ('call', 'both'):
-            output.extend(self._tool_call_line(item, width, config, now))
+            output.extend(self._tool_call_line(item, width, config, now,
+                                               palette))
         if mode in ('result', 'both'):
             output.extend(self._tool_result_lines(item, width, config))
             if config.tools.show_diff and item.diff:
@@ -305,7 +346,10 @@ class TranscriptRenderer:
         return output
 
     def _tool_call_line(self, item: TranscriptItem, width: int, config: AppConfig,
-                        now: float) -> list[Line]:
+                        now: float, palette: Palette | None = None) -> list[Line]:
+        # The row bleeds one cell left of the transcript margin, so it is one
+        # cell wider than the wrapped text around it.
+        row_width = width + ROW_BLEED
         line: Line = [Span('│ ', 'accent', 'panel')]
         add_span(line, Span(item.display or item.name, 'text', 'panel', attrs=BOLD))
         if config.tools.show_args:
@@ -319,11 +363,13 @@ class TranscriptRenderer:
             add_span(line, Span(' ' + dots, 'muted', 'panel'))
         elif status == 'error':
             add_span(line, Span('  !', 'error', 'panel'))
-        line = truncate_line(line, width, ellipsis='…')
+        line = truncate_line(line, row_width, ellipsis='…')
+        if palette is not None:
+            line = _paint_lead_in(line, lead_in_gradient(palette))
         used = line_width(line)
-        if used < width:
-            add_span(line, Span(' ' * (width - used), None, 'panel'))
-        return [line]
+        if used < row_width:
+            add_span(line, Span(' ' * (row_width - used), None, 'panel'))
+        return [Row(line, ROW_BLEED)]
 
     def _tool_result_lines(self, item: TranscriptItem, width: int,
                            config: AppConfig) -> list[Line]:
@@ -476,3 +522,10 @@ def _args_signature(args: dict[str, Any]) -> tuple[str, ...]:
         return tuple(f'{key}={str(value)[:40]}' for key, value in sorted(args.items()))
     except Exception:
         return ()
+
+
+def _palette_signature(palette: Palette | None) -> tuple[Any, ...]:
+    """Cache key for the palette parts the transcript actually paints with."""
+    if palette is None:
+        return ()
+    return (palette.name, palette.panel, palette.accent, palette.background)
