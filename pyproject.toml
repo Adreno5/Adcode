@@ -1,0 +1,24 @@
+[project]
+name = "adcode"
+version = "2.0.0"
+description = "A configurable full-screen terminal coding agent"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "anthropic>=0.116.0",
+    "cryptography>=44.0.0",
+    "keyring>=25.7.0",
+    "openai>=2.45.0",
+    "pyperclip>=1.11.0",
+]
+
+[project.scripts]
+adcode = "adcode.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,1209 @@
+"""The AdCode full-screen application.
+
+The render loop composites every widget onto a canvas each frame and writes the
+whole screen in one terminal write.  The transcript is a virtual scrollback
+owned by the app, and the agent loop streams from a worker thread into the
+event queue consumed here.
+"""
+
+from __future__ import annotations
+
+import os
+import queue
+import threading
+import time
+from typing import Any, Callable
+
+from adcode.agent_loop import AgentLoop, AgentSnapshot
+from adcode.config import AppConfig, ConfigStore, ProviderConfig, ModelConfig
+from adcode.goals import GoalStore
+from adcode.mcp.manager import get_mcp_manager
+from adcode.session import SessionStore, TranscriptItem
+from adcode.skills import SkillRegistry
+from adcode.theme import Palette, build_palette
+from adcode.tools.builtin import shutdown_shell_sessions
+from adcode.tools.registry import ToolRegistry
+from adcode.tui.canvas import BOLD, DIM, Canvas, text_width, truncate_text
+from adcode.tui.dialogs import (
+    ConfirmDialog, DialogItem, MessageDialog, Overlay,
+    SelectDialog, TextPrompt,
+)
+from adcode.tui.input import InputThread, KeyEvent, get_clipboard, set_clipboard
+from adcode.tui.markdown import MarkdownRenderer
+from adcode.tui.screen import TerminalScreen
+from adcode.tui.settings import SettingsOverlay
+from adcode.tui.text import Line, Span, add_span, line_width
+from adcode.tui.transcript import LiveRender, TranscriptRenderer
+
+SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+_RENDER_INTERVAL = 1 / 30
+
+
+class PromptState:
+    def __init__(self) -> None:
+        self.text = ''
+        self.cursor = 0
+        self.anchor: int | None = None
+        self.history: list[str] = []
+        self.history_index = 0
+        self.history_draft = ''
+        self.undo: list[tuple[str, int]] = []
+        self.redo: list[tuple[str, int]] = []
+        self.completion_index = 0
+        self.completion_closed_for = ''
+
+    def snapshot(self) -> None:
+        if not self.undo or self.undo[-1] != (self.text, self.cursor):
+            self.undo.append((self.text, self.cursor))
+            del self.undo[:-200]
+            self.redo.clear()
+
+    def set_text(self, text: str, cursor: int | None = None) -> None:
+        self.snapshot()
+        self.text = text
+        self.cursor = len(text) if cursor is None else max(0, min(len(text), cursor))
+        self.anchor = None
+
+    def insert(self, text: str) -> None:
+        clean = text.replace('\r\n', '\n').replace('\r', '\n')
+        self.snapshot()
+        start, end = self.selection()
+        self.text = self.text[:start] + clean + self.text[end:]
+        self.cursor = start + len(clean)
+        self.anchor = None
+
+    def selection(self) -> tuple[int, int]:
+        if self.anchor is None:
+            return self.cursor, self.cursor
+        return min(self.anchor, self.cursor), max(self.anchor, self.cursor)
+
+    def delete_backward(self) -> None:
+        start, end = self.selection()
+        if start != end:
+            self.snapshot()
+            self.text = self.text[:start] + self.text[end:]
+            self.cursor = start
+            self.anchor = None
+        elif self.cursor > 0:
+            self.snapshot()
+            self.text = self.text[:self.cursor - 1] + self.text[self.cursor:]
+            self.cursor -= 1
+
+    def delete_forward(self) -> None:
+        start, end = self.selection()
+        if start != end:
+            self.snapshot()
+            self.text = self.text[:start] + self.text[end:]
+            self.cursor = start
+            self.anchor = None
+        elif self.cursor < len(self.text):
+            self.snapshot()
+            self.text = self.text[:self.cursor] + self.text[self.cursor + 1:]
+
+    def cut(self) -> str:
+        start, end = self.selection()
+        if start == end:
+            return ''
+        text = self.text[start:end]
+        self.snapshot()
+        self.text = self.text[:start] + self.text[end:]
+        self.cursor = start
+        self.anchor = None
+        return text
+
+    def copy(self) -> str:
+        start, end = self.selection()
+        return self.text[start:end] if start != end else ''
+
+
+def _format_tokens(value: int) -> str:
+    if value >= 1_000_000:
+        return f'{value / 1_000_000:.1f}M'
+    if value >= 1_000:
+        return f'{value / 1_000:.1f}k'
+    return str(value)
+
+
+def _prompt_layout(text: str, cursor: int, anchor: int | None, width: int
+                   ) -> tuple[list[Line], int, int]:
+    """Wrap the input into visual rows and locate the caret."""
+    width = max(4, width)
+    content_width = max(1, width - 2)
+    selection_start, selection_end = (
+        (min(anchor, cursor), max(anchor, cursor)) if anchor is not None
+        else (cursor, cursor)
+    )
+    rows: list[Line] = []
+    caret_row = 0
+    caret_col = 2
+    global_offset = 0
+    logical_lines = text.split('\n')
+    for logical_index, logical in enumerate(logical_lines):
+        chunks: list[tuple[str, int]] = []
+        current = ''
+        current_start = global_offset
+        current_width = 0
+        for char in logical:
+            size = max(0, text_width(char))
+            if current_width and current_width + size > content_width:
+                chunks.append((current, current_start))
+                current = ''
+                current_start += len(chunks[-1][0])
+                current_width = 0
+            current += char
+            current_width += size
+        chunks.append((current, current_start))
+        for chunk_index, (chunk, start_offset) in enumerate(chunks):
+            line: Line = []
+            prefix = '> ' if (logical_index == 0 and chunk_index == 0) else '  '
+            add_span(line, Span(prefix, 'accent' if prefix == '> ' else 'muted',
+                                attrs=BOLD if prefix == '> ' else 0))
+            for char_index, char in enumerate(chunk):
+                offset = start_offset + char_index
+                selected = selection_start <= offset < selection_end
+                add_span(line, Span(
+                    char,
+                    'selection_fg' if selected else 'text',
+                    'selection_bg' if selected else None,
+                ))
+            rows.append(line)
+            row_start = start_offset
+            row_end = start_offset + len(chunk)
+            if row_start <= cursor <= row_end:
+                if cursor == row_end and chunk_index < len(chunks) - 1:
+                    # Caret at the wrap boundary belongs to the next row.
+                    continue
+                caret_row = len(rows) - 1
+                caret_col = 2 + sum(text_width(char) for char in chunk[:cursor - row_start])
+        # The newline itself: caret immediately before it sits at the row end.
+        if logical_index < len(logical_lines) - 1:
+            if global_offset + len(logical) == cursor:
+                # Find the row whose end is this offset.
+                if rows:
+                    caret_row = len(rows) - 1
+                    caret_col = line_width(rows[-1])
+            global_offset += len(logical) + 1
+        else:
+            global_offset += len(logical)
+    if not rows:
+        rows = [[Span('> ', 'accent', attrs=BOLD)]]
+    return rows, caret_row, caret_col
+
+
+class AdCodeApp:
+    def __init__(self, cwd: str | None = None, resume: bool = True,
+                 config_path: str | os.PathLike[str] | None = None) -> None:
+        self.cwd = cwd or os.getcwd()
+        self.store = ConfigStore(config_path)
+        self.config: AppConfig = self.store.load()
+        self.screen = TerminalScreen()
+        self.palette: Palette = build_palette(self.config.ui.theme, self.config.ui.accent)
+        self.canvas = Canvas(*self._screen_size(), self.palette)
+        self.input_queue: 'queue.Queue[KeyEvent]' = queue.Queue()
+        self.input_thread = InputThread(self.input_queue)
+        self.posted: 'queue.Queue[Callable[[], None]]' = queue.Queue()
+        self.session_store = SessionStore(os.path.join(self.cwd, 'sessions'))
+        self.goals = GoalStore(os.path.join(self.cwd, 'sessions', 'goals.json'))
+        self.skills = SkillRegistry(self.config.skills, self.cwd).scan()
+        self.registry = ToolRegistry()
+        self.mcp = get_mcp_manager(self.registry)
+        self.loop: AgentLoop | None = None
+        self.standalone_items: list[TranscriptItem] = []
+        self.transcript = TranscriptRenderer()
+        self.prompt = PromptState()
+        self.overlay: Overlay | None = None
+        self.running = True
+        self.dirty = True
+        self.follow = True
+        self.scroll = 0
+        self.phase = 'idle'
+        self.config_version = 0
+        self.btw_mode = False
+        self.exit_armed = False
+        self.last_render = 0.0
+        self.last_interrupt = 0.0
+        self.last_width = 0
+        self.last_title = ''
+        self._last_total = 0
+        self._last_viewport = 0
+        self._last_max_scroll = 0
+        self.live_thinking_text = ''
+        self.live_thinking = MarkdownRenderer(self._content_width())
+        self.live_thinking_started = 0.0
+        self.live_answer_text = ''
+        self.live_answer = MarkdownRenderer(self._content_width())
+        self.live_compaction = MarkdownRenderer(self._content_width())
+        self.live_aside_question = ''
+        self.live_aside = MarkdownRenderer(self._content_width())
+        self.live_tool_output: list[str] = []
+        self.active_tool = ''
+        self.status_hint = ''
+        self._resume = resume
+        self._started_at = time.time()
+        self._tool_signature = self._tool_config_signature()
+
+    # ── boot ────────────────────────────────────────────────
+    def _screen_size(self) -> tuple[int, int]:
+        size = self.screen.size()
+        return size.columns, size.rows
+
+    def _content_width(self) -> int:
+        columns, _ = self._screen_size()
+        return max(16, columns - 2)
+
+    def run(self) -> None:
+        self.screen.enter()
+        self.input_thread.start()
+        try:
+            self._build_loop()
+            if self._resume and self.loop is not None:
+                self._auto_resume()
+            if self.loop is None:
+                from adcode.tui.provider_ui import ProviderWizard
+                self.post(lambda: ProviderWizard(self).run_add(first_run=True))
+            self._loop()
+        finally:
+            self._shutdown()
+
+    def _build_loop(self) -> None:
+        selected = self.config.selected()
+        if selected is None:
+            self.loop = None
+            return
+        provider, model = selected
+        self.loop = AgentLoop(
+            self.config, self.registry, self.session_store, self.goals,
+            self.skills, emit=self._wake, mcp_manager=self.mcp,
+        )
+        self.loop.start()
+        self._start_mcp_load()
+        self._update_title()
+
+    def _start_mcp_load(self) -> None:
+        servers = list(self.config.mcp_servers)
+        if not servers or self.loop is None:
+            return
+
+        def worker() -> None:
+            self.mcp.load(servers, self._mcp_status)
+            self.post(self._after_mcp_load)
+
+        threading.Thread(target=worker, name='adcode-mcp-load', daemon=True).start()
+
+    def _mcp_status(self, name: str, state: str, detail: str) -> None:
+        if state == 'connecting':
+            self.post(lambda: self.notify(f'MCP {name}: connecting…', 'info'))
+        elif state == 'ready':
+            self.post(lambda: self.notify(f'MCP {name}: ready ({detail})', 'success'))
+        elif state == 'failed':
+            self.post(lambda: self.notify(f'MCP {name}: failed — {detail}', 'error'))
+
+    def _after_mcp_load(self) -> None:
+        if self.loop is not None:
+            self.loop.refresh_tools()
+        self.dirty = True
+
+    def _auto_resume(self) -> None:
+        payload = self.session_store.latest()
+        if payload is None or not payload.messages or self.loop is None:
+            return
+        self.loop.apply_payload(payload)
+        self.loop.add_notice(
+            f'Resumed session "{payload.title or payload.name}" '
+            f'({len(payload.messages)} messages).', level='info')
+        self.follow = True
+        self.dirty = True
+
+    # ── shutdown ────────────────────────────────────────────
+    def _shutdown(self) -> None:
+        try:
+            self.input_thread.stop()
+            if self.loop is not None:
+                self.loop.shutdown()
+                self.loop.save_active()
+            self.mcp.shutdown()
+            shutdown_shell_sessions()
+            self.store.save()
+        finally:
+            self.screen.leave()
+
+    def request_exit(self) -> None:
+        self.running = False
+
+    # ── thread plumbing ─────────────────────────────────────
+    def _wake(self, kind: str, payload: dict[str, Any]) -> None:
+        # The loop's own queue is authoritative; this only shortens the wait.
+        pass
+
+    def post(self, function: Callable[[], None]) -> None:
+        self.posted.put(function)
+
+    def open_overlay(self, overlay: Overlay) -> None:
+        self.overlay = overlay
+        self.dirty = True
+
+    # ── notifications ───────────────────────────────────────
+    def notify(self, text: str, level: str = 'info') -> None:
+        if self.loop is not None:
+            self.loop.add_notice(text, level)
+        else:
+            self.standalone_items.append(TranscriptItem(kind='notice', text=text,
+                                                        level=level))
+        self.dirty = True
+
+    # ── configuration ───────────────────────────────────────
+    def save_config(self) -> None:
+        self.store.save()
+
+    def config_changed(self) -> None:
+        self.save_config()
+        self.config_version += 1
+        self.palette = build_palette(self.config.ui.theme, self.config.ui.accent)
+        self.canvas.palette = self.palette
+        self.transcript.invalidate()
+        signature = self._tool_config_signature()
+        if signature != self._tool_signature:
+            self._tool_signature = signature
+            self.skills.settings = self.config.skills
+            self.skills.scan()
+            if self.loop is not None:
+                self.loop.refresh_tools()
+        self.dirty = True
+
+    def _tool_config_signature(self) -> tuple[Any, ...]:
+        return (
+            self.config.agents.enabled,
+            self.config.agents.team_enabled,
+            self.config.skills.enabled,
+            self.config.skills.include_project,
+            tuple(self.config.skills.extra_paths),
+        )
+
+    def refresh_tools(self) -> None:
+        if self.loop is not None:
+            self.loop.refresh_tools()
+        self.dirty = True
+
+    def select_model(self, provider: ProviderConfig, model: ModelConfig) -> None:
+        self.config.select(provider.name, model.id)
+        self.save_config()
+        if self.loop is not None:
+            self.loop.set_model(provider, model)
+        self.notify(f'Model: {provider.name} / {model.id}', 'info')
+        self.dirty = True
+
+    def after_provider_change(self) -> None:
+        selected = self.config.selected()
+        if selected is None:
+            if self.loop is not None:
+                self.loop.save_active()
+                self.loop.shutdown()
+                self.loop = None
+            return
+        provider, model = selected
+        if self.loop is None:
+            self._build_loop()
+        else:
+            self.loop.set_model(provider, model)
+        self.dirty = True
+
+    def clear_conversation(self) -> None:
+        if self.loop is not None:
+            self.loop.clear()
+        self.standalone_items.clear()
+        self.transcript.invalidate()
+        self.follow = True
+        self.scroll = 0
+        self.notify('Conversation cleared.', 'info')
+
+    def load_session(self, name: str) -> None:
+        if self.loop is None:
+            return
+        if self.loop.load_session(name):
+            self.transcript.invalidate()
+            self.follow = True
+            self.scroll = 0
+            self.dirty = True
+        else:
+            self.notify(f'Session not found: {name}', 'error')
+
+    # ── provider selection helpers ──────────────────────────
+    def ensure_selection(self) -> tuple[ProviderConfig, ModelConfig] | None:
+        return self.config.selected()
+
+    @property
+    def items(self) -> list[TranscriptItem]:
+        if self.loop is not None:
+            return self.loop.items_snapshot()
+        return list(self.standalone_items)
+
+    def snapshot(self) -> AgentSnapshot:
+        if self.loop is not None:
+            snap = self.loop.snapshot()
+        else:
+            selected = self.config.selected()
+            snap = AgentSnapshot(
+                provider=selected[0].name if selected else '',
+                model=selected[1].id if selected else '',
+                effort=self.config.reasoning.effort,
+            )
+        snap.status = self.phase
+        return snap
+
+    def _update_title(self) -> None:
+        if self.loop is None:
+            return
+        snap = self.loop.snapshot()
+        title = f'AdCode - {snap.session_title}' if snap.session_title else 'AdCode'
+        if title != self.last_title:
+            self.last_title = title
+            self.screen.set_title(title)
+
+    # ── event loop ──────────────────────────────────────────
+    def _loop(self) -> None:
+        while self.running:
+            busy = self.phase not in ('idle',)
+            timeout = 0.03 if (busy or self._needs_animation()) else 0.15
+            try:
+                event = self.input_queue.get(timeout=timeout)
+            except queue.Empty:
+                event = None
+            try:
+                self._process_posted()
+                if self.loop is not None:
+                    self.loop.pump_agent_events()
+                    self._apply_loop_events()
+                if event is not None:
+                    self._handle_event(event)
+                self._check_resize()
+                self._tick_animation()
+                self._render_if_due()
+            except Exception as error:
+                # A UI exception must never take down the session silently.
+                try:
+                    self.notify(f'UI error: {error}', 'error')
+                except Exception:
+                    pass
+
+    def _process_posted(self) -> None:
+        while True:
+            try:
+                function = self.posted.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                function()
+            except Exception as error:
+                self.notify(f'Background error: {error}', 'error')
+
+    def _apply_loop_events(self) -> None:
+        if self.loop is None:
+            return
+        events = self.loop.drain_ui_events()
+        for kind, payload in events:
+            self._apply_event(kind, payload)
+        if events:
+            self._update_title()
+            self.dirty = True
+
+    def _apply_event(self, kind: str, payload: dict[str, Any]) -> None:
+        if kind == 'turn_start':
+            self._reset_live()
+            self.phase = 'thinking'
+            self.follow = True
+            self.scroll = 0
+        elif kind == 'thinking_delta':
+            if self.phase != 'thinking':
+                self._reset_live()
+                self.phase = 'thinking'
+            if not self.live_thinking_text:
+                self.live_thinking_started = time.time()
+            self.live_thinking_text += payload.get('text', '')
+            self.live_thinking.feed(payload.get('text', ''))
+        elif kind == 'thinking_end':
+            self.live_thinking_text = ''
+            self.live_thinking = MarkdownRenderer(self._content_width())
+            if self.phase == 'thinking':
+                self.phase = 'idle'
+        elif kind == 'text_delta':
+            if self.phase != 'answering':
+                self.live_answer = MarkdownRenderer(self._content_width())
+                self.live_answer_text = ''
+                self.phase = 'answering'
+            self.live_answer_text += payload.get('text', '')
+            self.live_answer.feed(payload.get('text', ''))
+        elif kind == 'text_end':
+            self.live_answer = MarkdownRenderer(self._content_width())
+            self.live_answer_text = ''
+            if self.phase == 'answering':
+                self.phase = 'idle'
+        elif kind == 'tool_start':
+            self.live_answer = MarkdownRenderer(self._content_width())
+            self.live_answer_text = ''
+            self.active_tool = payload.get('call_id', '')
+            self.live_tool_output = []
+            self.phase = 'tool'
+            self.status_hint = payload.get('display', '')
+        elif kind == 'tool_output':
+            if payload.get('call_id') == self.active_tool:
+                self.live_tool_output.append(payload.get('text', ''))
+                del self.live_tool_output[:-30]
+        elif kind == 'tool_end':
+            self.active_tool = ''
+            self.live_tool_output = []
+            self.phase = 'thinking'
+        elif kind == 'compaction_start':
+            self.phase = 'compacting'
+            self.live_compaction = MarkdownRenderer(self._content_width())
+        elif kind == 'compaction_delta':
+            self.live_compaction.feed(payload.get('text', ''))
+        elif kind == 'compaction_end':
+            self.live_compaction = MarkdownRenderer(self._content_width())
+            self.phase = 'thinking'
+        elif kind == 'usage':
+            self.dirty = True
+        elif kind == 'notice':
+            level = payload.get('level', 'info')
+            if level == 'error':
+                self.phase = 'idle'
+        elif kind == 'error':
+            self.phase = 'idle'
+        elif kind == 'interrupted':
+            self._reset_live()
+            self.phase = 'idle'
+        elif kind == 'turn_end':
+            self._reset_live()
+            self.phase = 'idle'
+            self.status_hint = ''
+        elif kind == 'aside_start':
+            self.phase = 'aside'
+            self.live_aside_question = payload.get('question', '')
+            self.live_aside = MarkdownRenderer(self._content_width())
+        elif kind == 'aside_delta':
+            self.live_aside.feed(payload.get('text', ''))
+        elif kind == 'aside_end':
+            self._reset_live()
+            self.phase = 'idle'
+        elif kind == 'status':
+            self.phase = payload.get('status', self.phase)
+        elif kind == 'session_loaded' or kind == 'session_rewound':
+            self.transcript.invalidate()
+            self._reset_live()
+            self.phase = 'idle'
+            self.follow = True
+            self.scroll = 0
+            self._update_title()
+        elif kind == 'session_cleared':
+            self.transcript.invalidate()
+            self._reset_live()
+            self.phase = 'idle'
+            self.follow = True
+            self.scroll = 0
+        elif kind == 'agents_refresh':
+            self.dirty = True
+        elif kind == 'model_changed':
+            self.dirty = True
+        self.dirty = True
+
+    def _reset_live(self) -> None:
+        width = self._content_width()
+        self.live_thinking_text = ''
+        self.live_thinking = MarkdownRenderer(width)
+        self.live_answer_text = ''
+        self.live_answer = MarkdownRenderer(width)
+        self.live_compaction = MarkdownRenderer(width)
+        self.live_aside_question = ''
+        self.live_aside = MarkdownRenderer(width)
+        self.live_tool_output = []
+        self.active_tool = ''
+
+    def _needs_animation(self) -> bool:
+        return self.phase in ('thinking', 'answering', 'tool', 'compacting', 'aside')
+
+    def _tick_animation(self) -> None:
+        if self._needs_animation():
+            self.dirty = True
+
+    def _check_resize(self) -> None:
+        columns, rows = self.screen.size()
+        if columns != self.canvas.width or rows != self.canvas.height:
+            self.canvas.resize(columns, rows)
+            self.live_thinking = MarkdownRenderer(max(16, columns - 2))
+            self.live_answer = MarkdownRenderer(max(16, columns - 2))
+            self.live_compaction = MarkdownRenderer(max(16, columns - 2))
+            self.live_aside = MarkdownRenderer(max(16, columns - 2))
+            if self.live_thinking_text:
+                self.live_thinking.feed(self.live_thinking_text)
+            if self.live_answer_text:
+                self.live_answer.feed(self.live_answer_text)
+            self.transcript.invalidate()
+            self.dirty = True
+
+    # ── input ───────────────────────────────────────────────
+    def _handle_event(self, event: KeyEvent) -> None:
+        if event.kind == 'mouse':
+            if event.action == 'wheel_up':
+                self.follow = False
+                self.scroll = min(self._max_scroll(), self.scroll
+                                  + max(1, self.config.ui.mouse_scroll_lines))
+                self.dirty = True
+            elif event.action == 'wheel_down':
+                self.scroll = max(0, self.scroll
+                                  - max(1, self.config.ui.mouse_scroll_lines))
+                self.follow = self.scroll <= 0
+                self.dirty = True
+            return
+        if self.overlay is not None:
+            overlay = self.overlay
+            overlay.handle(event)
+            if overlay.closed and self.overlay is overlay:
+                self.overlay = None
+            self.dirty = True
+            return
+        if event.kind == 'paste':
+            self.prompt.insert(event.text)
+            self.dirty = True
+            return
+        if event.kind == 'text':
+            if self.prompt.selection()[0] != self.prompt.selection()[1]:
+                self.prompt.insert(event.text)
+            else:
+                self.prompt.snapshot()
+                self.prompt.text = (self.prompt.text[:self.prompt.cursor]
+                                    + event.text + self.prompt.text[self.prompt.cursor:])
+                self.prompt.cursor += len(event.text)
+            self.dirty = True
+            return
+        if event.kind != 'key':
+            return
+        key = event.key
+        if key != 'ctrl+c':
+            self.exit_armed = False
+        if key in ('pgup',):
+            self.follow = False
+            self.scroll = min(self._max_scroll(), self.scroll + self._page_size())
+            self.dirty = True
+            return
+        if key in ('pgdn',):
+            self.scroll = max(0, self.scroll - self._page_size())
+            self.follow = self.scroll <= 0
+            self.dirty = True
+            return
+        if key == 'ctrl+l':
+            self.dirty = True
+            return
+        if key == 'ctrl+c':
+            if self.prompt.selection()[0] != self.prompt.selection()[1]:
+                copied = self.prompt.copy()
+                set_clipboard(copied)
+                self.prompt.anchor = None
+            elif self.prompt.text:
+                self.prompt.set_text('')
+            elif self.overlay is None and self.phase != 'idle' and self.loop is not None:
+                self.loop.interrupt()
+            elif self.exit_armed:
+                self.request_exit()
+            else:
+                self.exit_armed = True
+                self.status_hint = 'press ctrl+c again to exit'
+            self.dirty = True
+            return
+        if key == 'ctrl+d':
+            if not self.prompt.text:
+                self.request_exit()
+            return
+        if key == 'ctrl+v':
+            self.prompt.insert(get_clipboard())
+            self.dirty = True
+            return
+        if key == 'ctrl+x':
+            cut = self.prompt.cut()
+            if cut:
+                set_clipboard(cut)
+            self.dirty = True
+            return
+        if key == 'ctrl+a':
+            self.prompt.anchor = 0
+            self.prompt.cursor = len(self.prompt.text)
+            self.dirty = True
+            return
+        if key == 'ctrl+z':
+            self._undo()
+            return
+        if key == 'ctrl+y':
+            self._redo()
+            return
+        if key == 'esc':
+            if self._completion_visible():
+                self.prompt.completion_closed_for = self.prompt.text
+                self.prompt.anchor = None
+            elif self.phase != 'idle' and self.loop is not None:
+                self.loop.interrupt()
+            else:
+                self.prompt.anchor = None
+            self.dirty = True
+            return
+        if key in ('ctrl+j', 'alt+enter', 'shift+enter'):
+            self.prompt.insert('\n')
+            self.dirty = True
+            return
+        if key == 'enter':
+            self._handle_enter(event)
+            return
+        if key == 'tab':
+            self._apply_completion()
+            return
+        if key == 'up':
+            if self._completion_visible():
+                self._move_completion(-1)
+            else:
+                self._history_move(-1)
+            self.dirty = True
+            return
+        if key == 'down':
+            if self._completion_visible():
+                self._move_completion(1)
+            else:
+                self._history_move(1)
+            self.dirty = True
+            return
+        if key == 'left':
+            self._move_horizontal(-1, event.shift)
+            return
+        if key == 'right':
+            self._move_horizontal(1, event.shift)
+            return
+        if key == 'home':
+            self._move_line_edge(start=True, whole=(key == 'ctrl+home'))
+            return
+        if key == 'end':
+            self._move_line_edge(start=False, whole=False)
+            return
+        if key == 'backspace':
+            self.prompt.delete_backward()
+            self.dirty = True
+            return
+        if key == 'delete':
+            self.prompt.delete_forward()
+            self.dirty = True
+            return
+        if key == 'ctrl+home':
+            self.prompt.cursor = 0
+            self.prompt.anchor = None
+            self.dirty = True
+            return
+        if key == 'ctrl+end':
+            self.prompt.cursor = len(self.prompt.text)
+            self.prompt.anchor = None
+            self.dirty = True
+            return
+
+    def _handle_enter(self, event: KeyEvent) -> None:
+        # A trailing backslash is the portable newline gesture.
+        if self.prompt.text.endswith('\\') and \
+                self.prompt.cursor == len(self.prompt.text):
+            self.prompt.snapshot()
+            self.prompt.text = self.prompt.text[:-1]
+            self.prompt.cursor = min(self.prompt.cursor, len(self.prompt.text))
+            self.prompt.insert('\n')
+            self.dirty = True
+            return
+        if self._completion_visible():
+            candidates = self._completion_candidates()
+            if candidates:
+                index = min(self.prompt.completion_index, len(candidates) - 1)
+                completed = candidates[index][0]
+                if (self.prompt.text.strip()
+                        and completed.rstrip() != self.prompt.text.rstrip()):
+                    self.prompt.set_text(completed)
+                    self.prompt.cursor = len(completed)
+                    self.dirty = True
+                    return
+        text = self.prompt.text.strip()
+        if not text:
+            return
+        self.prompt.history.append(self.prompt.text)
+        self.prompt.history_index = len(self.prompt.history)
+        self.prompt.history_draft = ''
+        self.prompt.set_text('')
+        self.prompt.completion_index = 0
+        self.follow = True
+        self.scroll = 0
+        self.submit(text)
+
+    def submit(self, text: str) -> None:
+        from adcode.commands import dispatch
+        if text.startswith('/'):
+            dispatch(self, text)
+            return
+        if self.loop is None:
+            self.notify('No provider is configured. Use /provider add.', 'warning')
+            return
+        mode = 'aside' if self.btw_mode else 'chat'
+        if self.btw_mode:
+            self.btw_mode = False
+        self.loop.submit(text, mode)
+        self.dirty = True
+
+    def _move_horizontal(self, delta: int, extend: bool) -> None:
+        if extend:
+            if self.prompt.anchor is None:
+                self.prompt.anchor = self.prompt.cursor
+        else:
+            self.prompt.anchor = None
+        self.prompt.cursor = max(0, min(len(self.prompt.text),
+                                        self.prompt.cursor + delta))
+        self.dirty = True
+
+    def _move_line_edge(self, start: bool, whole: bool) -> None:
+        text = self.prompt.text
+        cursor = self.prompt.cursor
+        if whole:
+            self.prompt.cursor = 0 if start else len(text)
+        else:
+            if start:
+                position = text.rfind('\n', 0, cursor)
+                self.prompt.cursor = 0 if position == -1 else position + 1
+            else:
+                position = text.find('\n', cursor)
+                self.prompt.cursor = len(text) if position == -1 else position
+        self.prompt.anchor = None
+        self.dirty = True
+
+    def _history_move(self, delta: int) -> None:
+        history = self.prompt.history
+        if not history:
+            return
+        if self.prompt.text and self.prompt.history_index >= len(history):
+            self.prompt.history_draft = self.prompt.text
+        index = self.prompt.history_index + delta
+        index = max(0, min(len(history), index))
+        self.prompt.history_index = index
+        value = (self.prompt.history_draft if index >= len(history)
+                 else history[index])
+        self.prompt.set_text(value)
+        self.prompt.cursor = len(value)
+        self.prompt.anchor = None
+
+    def _undo(self) -> None:
+        if not self.prompt.undo:
+            return
+        self.prompt.redo.append((self.prompt.text, self.prompt.cursor))
+        self.prompt.text, self.prompt.cursor = self.prompt.undo.pop()
+        self.prompt.anchor = None
+        self.dirty = True
+
+    def _redo(self) -> None:
+        if not self.prompt.redo:
+            return
+        self.prompt.undo.append((self.prompt.text, self.prompt.cursor))
+        self.prompt.text, self.prompt.cursor = self.prompt.redo.pop()
+        self.prompt.anchor = None
+        self.dirty = True
+
+    # ── slash completion ────────────────────────────────────
+    def _completion_candidates(self) -> list[tuple[str, str, str]]:
+        from adcode.commands import completion_candidates
+        text = self.prompt.text
+        if not text.startswith('/') or '\n' in text:
+            return []
+        if self.prompt.completion_closed_for == text:
+            return []
+        return completion_candidates(text)
+
+    def _completion_visible(self) -> bool:
+        return bool(self._completion_candidates())
+
+    def _move_completion(self, delta: int) -> None:
+        candidates = self._completion_candidates()
+        if not candidates:
+            return
+        self.prompt.completion_index = (
+            self.prompt.completion_index + delta) % len(candidates)
+
+    def _apply_completion(self) -> None:
+        candidates = self._completion_candidates()
+        if not candidates:
+            return
+        index = min(self.prompt.completion_index, len(candidates) - 1)
+        completed = candidates[index][0]
+        self.prompt.set_text(completed)
+        self.prompt.cursor = len(completed)
+        self.prompt.completion_index = 0
+        self.dirty = True
+
+    # ── scrolling ───────────────────────────────────────────
+    def _page_size(self) -> int:
+        columns, rows = self.screen.size()
+        return max(3, self._viewport_height(rows) - 2)
+
+    def _max_scroll(self) -> int:
+        rows = self.screen.size().rows
+        viewport = self._last_viewport or self._viewport_height(rows)
+        total = self._last_total or len(self._transcript_lines())
+        return max(0, total - viewport)
+
+    def _transcript_lines(self) -> list[Line]:
+        width = max(16, self.screen.size().columns - 2)
+        live = LiveRender(
+            phase=self.phase,
+            thinking_lines=self.live_thinking.lines() if self.phase == 'thinking' else [],
+            thinking_started=self.live_thinking_started,
+            answer_lines=self.live_answer.lines() if self.phase == 'answering' else [],
+            compaction_lines=self.live_compaction.lines() if self.phase == 'compacting' else [],
+            aside_question=self.live_aside_question,
+            aside_lines=self.live_aside.lines() if self.phase == 'aside' else [],
+            tool_name=self.status_hint,
+            tool_running=self.phase == 'tool',
+            tool_output=self.live_tool_output,
+        )
+        return self.transcript.render(self.items, live, width, self.config,
+                                      self.config_version, time.time())
+
+    # ── rendering ───────────────────────────────────────────
+    def _viewport_height(self, rows: int) -> int:
+        header = 2 if self.config.ui.show_header else 0
+        return max(1, rows - header - 1 - 1 - 3)
+
+    def _render_if_due(self) -> None:
+        now = time.monotonic()
+        if not self.dirty:
+            return
+        if now - self.last_render < _RENDER_INTERVAL:
+            return
+        self.last_render = now
+        self.dirty = False
+        self._render()
+
+    def _render(self) -> None:
+        columns, rows = self.screen.size()
+        if columns != self.canvas.width or rows != self.canvas.height:
+            self.canvas.resize(columns, rows)
+        self.canvas.palette = self.palette
+        self.canvas.clear()
+        now = time.time()
+        header_h = 2 if self.config.ui.show_header else 0
+        if self.config.ui.show_header:
+            self._draw_header(columns)
+        prompt_rows, caret_row, caret_col = _prompt_layout(
+            self.prompt.text, self.prompt.cursor, self.prompt.anchor,
+            max(16, columns - 2))
+        max_prompt = max(3, min(10, rows // 3))
+        window_start = 0
+        if len(prompt_rows) > max_prompt:
+            window_start = max(0, min(caret_row - max_prompt + 1,
+                                      len(prompt_rows) - max_prompt))
+        visible_prompt = prompt_rows[window_start:window_start + max_prompt]
+        prompt_h = max(1, len(visible_prompt))
+        footer_y = rows - 1
+        prompt_top = footer_y - prompt_h
+        separator_y = prompt_top - 1
+        transcript_top = header_h
+        viewport_h = max(1, separator_y - transcript_top)
+        lines = self._transcript_lines()
+        total = len(lines)
+        max_scroll = max(0, total - viewport_h)
+        if not self.follow and total > self._last_total:
+            # Anchor a scrolled-up viewport to the same content as new lines
+            # stream in, instead of letting it drift downward every frame.
+            self.scroll += total - self._last_total
+        self._last_total = total
+        self._last_viewport = viewport_h
+        self._last_max_scroll = max_scroll
+        self.scroll = 0 if self.follow else min(self.scroll, max_scroll)
+        start = max(0, min(total - viewport_h - self.scroll, max_scroll))
+        visible = lines[start:start + viewport_h]
+        for index, line in enumerate(visible):
+            self._draw_line(1, transcript_top + index, line, max(1, columns - 2))
+        self._draw_scrollbar(columns, transcript_top, viewport_h, total, start)
+        self.canvas.hline(0, separator_y, columns, self.palette.border, alpha=110)
+        for index, line in enumerate(visible_prompt):
+            self._draw_line(0, prompt_top + index, line, columns)
+        if self._completion_visible():
+            self._draw_completions(columns, separator_y)
+        self._draw_footer(columns, footer_y, max_scroll)
+        cursor: tuple[int, int] | None = None
+        if self.overlay is not None:
+            self.overlay.render(self.canvas, columns, rows, self.palette, now)
+            cursor = self.overlay.cursor()
+        else:
+            caret_screen_row = prompt_top + (caret_row - window_start)
+            if 0 <= caret_row - window_start < len(visible_prompt):
+                cursor = (min(columns - 1, caret_col), caret_screen_row)
+        frame = self.canvas.render()
+        if cursor is not None and not (self.overlay is not None and cursor is None):
+            frame += f'\x1b[{cursor[1] + 1};{cursor[0] + 1}H\x1b[?25h'
+        else:
+            frame += '\x1b[?25l'
+        self.screen.flush_frame(frame)
+
+    def _draw_line(self, x: int, y: int, line: Line, width: int) -> None:
+        if not line:
+            return
+        cursor = x
+        for span in line:
+            if cursor - x >= width:
+                break
+            fg = self._color(span.fg, 'text')
+            bg = self._color(span.bg, None) if span.bg is not None else None
+            available = width - (cursor - x)
+            text = truncate_text(span.text, available)
+            if not text:
+                continue
+            cursor += self.canvas.draw_text(cursor, y, text, fg, bg,
+                                            span.attrs, span.alpha)
+
+    def _color(self, role: Any, default: str | None) -> Any:
+        from adcode.theme import resolve_role
+        if role is None:
+            return resolve_role(self.palette, default) if default else None
+        return resolve_role(self.palette, role, default or 'text')
+
+    def _draw_header(self, columns: int) -> None:
+        self.canvas.fill_row(0, self.palette.status_bg)
+        snap = self.snapshot()
+        title = 'AdCode'
+        self.canvas.draw_text(1, 0, title, self.palette.text, self.palette.status_bg,
+                              BOLD)
+        offset = 1 + len(title)
+        session_title = snap.session_title or ''
+        if session_title:
+            self.canvas.draw_text(offset, 0, '  ·  ', self.palette.muted,
+                                  self.palette.status_bg)
+            offset += 5
+            self.canvas.draw_text(offset, 0,
+                                  truncate_text(session_title, max(1, columns // 3)),
+                                  self.palette.subtext, self.palette.status_bg)
+        right = f'{snap.provider} / {snap.model}'
+        effort = f'  ·  {snap.effort}' if snap.effort else ''
+        text = right + effort
+        right_x = max(1, columns - 2 - text_width(text))
+        if right_x > offset + 4:
+            self.canvas.draw_text(right_x, 0, right, self.palette.subtext,
+                                  self.palette.status_bg)
+            self.canvas.draw_text(right_x + text_width(right), 0, effort,
+                                  self.palette.muted, self.palette.status_bg)
+        self.canvas.hline(0, 1, columns, self.palette.border, alpha=110)
+
+    def _draw_footer(self, columns: int, y: int, max_scroll: int) -> None:
+        snap = self.snapshot()
+        frame = SPINNER[int(time.time() * 10) % len(SPINNER)]
+        phase = self.phase
+        if phase == 'thinking':
+            status = f'{frame} thinking'
+        elif phase == 'answering':
+            status = f'{frame} writing'
+        elif phase == 'tool':
+            status = f'{frame} {self.status_hint or "tool"}'
+        elif phase == 'compacting':
+            status = f'{frame} compacting'
+        elif phase == 'aside':
+            status = f'{frame} aside'
+        else:
+            status = 'ready'
+        color = {
+            'thinking': 'subtext', 'answering': 'text', 'tool': 'accent',
+            'compacting': 'info', 'aside': 'accent', 'idle': 'muted',
+        }[phase]
+        x = 1
+        x += self.canvas.draw_text(x, y, status, self._color(color, 'muted'))
+        extras: list[str] = []
+        queued = snap.queued
+        if queued:
+            extras.append(f'{queued} queued')
+        if self.btw_mode:
+            extras.append('aside question mode')
+        if self.exit_armed:
+            extras.append('ctrl+c again to exit')
+        agents = [row for row in (snap.agents or []) if row.get('status') not in
+                  ('completed', 'errored', 'interrupted', 'shutdown', None)
+                  and not (isinstance(row.get('status'), dict))]
+        if agents and self.config.agents.show_activity:
+            extras.append(f'{len(agents)} agent{"s" if len(agents) > 1 else ""}')
+        if self.scroll > 0:
+            extras.append(f'↑ {self.scroll} lines')
+        if extras:
+            x += self.canvas.draw_text(x, y, '  ·  ', self.palette.border)
+            self.canvas.draw_text(x, y, '  ·  '.join(extras), self.palette.muted)
+        if self.config.ui.show_token_status:
+            context_pct = 0
+            if snap.context_window:
+                context_pct = round(100 * snap.context_tokens / snap.context_window)
+            right = (f'ctx {context_pct}%  ↑{_format_tokens(snap.total_in)} '
+                     f'↓{_format_tokens(snap.total_out)}')
+            right_x = max(1, columns - 1 - text_width(right))
+            self.canvas.draw_text(right_x, y, right, self.palette.muted)
+
+    def _draw_scrollbar(self, columns: int, top: int, height: int, total: int,
+                        start: int) -> None:
+        if total <= height or height <= 0:
+            return
+        x = columns - 1
+        self.canvas.vline(x, top, height, self.palette.border, alpha=80, char='│')
+        thumb_height = max(1, height * height // total)
+        thumb_start = top + (height - thumb_height) * start // max(1, total - height)
+        for offset in range(thumb_height):
+            self.canvas.put(x, thumb_start + offset, '┃', self.palette.muted)
+
+    def _draw_completions(self, columns: int, separator_y: int) -> None:
+        candidates = self._completion_candidates()
+        if not candidates:
+            return
+        window = 8
+        index = min(self.prompt.completion_index, len(candidates) - 1)
+        top = max(0, min(index - window // 2, len(candidates) - window))
+        visible = candidates[top:top + window]
+        width = min(max(44, columns - 4), min(96, columns - 2))
+        height = len(visible) + 2
+        x = 1
+        y = max(1, separator_y - height)
+        self.canvas.box(x, y, width, height, self.palette.border,
+                        bg=self.palette.panel, alpha=255)
+        for row_index, (completed, label, description) in enumerate(visible):
+            row_y = y + 1 + row_index
+            selected = (top + row_index) == index
+            bg = self.palette.selection_bg if selected else self.palette.panel
+            if selected:
+                self.canvas.fill_rect(x + 1, row_y, width - 2, 1, bg)
+            self.canvas.draw_text(x + 2, row_y, '› ' if selected else '  ',
+                                  self.palette.accent if selected else self.palette.muted,
+                                  bg)
+            self.canvas.draw_text(x + 4, row_y,
+                                  truncate_text(label, max(8, min(32, width - 8))),
+                                  self.palette.text if selected else self.palette.subtext,
+                                  bg, BOLD if selected else 0)
+            if description:
+                desc_x = x + 4 + min(32, width // 2)
+                self.canvas.draw_text(desc_x, row_y, truncate_text(
+                    description, max(1, x + width - 2 - desc_x)),
+                    self.palette.muted, bg, DIM)
+
+    # ── prompt manipulation for commands ────────────────────
+    def set_prompt(self, text: str, submit: bool = False) -> None:
+        self.prompt.set_text(text)
+        self.prompt.cursor = len(text)
+        self.overlay = None
+        self.dirty = True
+        if submit:
+            self.submit(text.strip())
+
+    def open_settings(self) -> None:
+        self.open_overlay(SettingsOverlay(self.config, self.config_changed))
+
+    def open_message(self, title: str, message: str) -> None:
+        self.open_overlay(MessageDialog(title, message))
+
+    def open_select(self, title: str, items: list[DialogItem],
+                    on_select: Callable[[Any], None],
+                    width: int = 72) -> None:
+        self.open_overlay(SelectDialog(title, items, on_select, width=width))
+
+    def open_confirm(self, title: str, message: str,
+                     on_result: Callable[[bool], None]) -> None:
+        self.open_overlay(ConfirmDialog(title, message, on_result))
+
+    def open_text_prompt(self, title: str, label: str, initial: str,
+                         on_submit: Callable[[str], None],
+                         hint: str = '', password: bool = False) -> None:
+        self.open_overlay(TextPrompt(title, label, initial, on_submit,
+                                     hint=hint, password=password))

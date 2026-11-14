@@ -1,0 +1,149 @@
+"""Styled text spans and width-aware wrapping."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from adcode.theme import RGB
+from adcode.tui.canvas import char_width, text_width
+
+
+@dataclass
+class Span:
+    text: str
+    fg: str | RGB | None = None
+    bg: str | RGB | None = None
+    attrs: int = 0
+    alpha: int = 255
+
+
+Line = list[Span]
+
+
+def _same_style(left: Span, right: Span) -> bool:
+    return (left.fg == right.fg and left.bg == right.bg
+            and left.attrs == right.attrs and left.alpha == right.alpha)
+
+
+def add_span(line: Line, span: Span) -> Line:
+    if not span.text:
+        return line
+    if line and _same_style(line[-1], span):
+        line[-1].text += span.text
+    else:
+        line.append(span)
+    return line
+
+
+def plain_text(line: Line) -> str:
+    return ''.join(span.text for span in line)
+
+
+def line_width(line: Line) -> int:
+    return sum(text_width(span.text) for span in line)
+
+
+def trim_line(line: Line) -> Line:
+    """Drop leading/trailing whitespace spans without touching interior."""
+    if not line:
+        return line
+    result: Line = [Span(span.text, span.fg, span.bg, span.attrs, span.alpha)
+                    for span in line]
+    while result:
+        result[0].text = result[0].text.lstrip(' ')
+        if result[0].text:
+            break
+        result.pop(0)
+    while result:
+        result[-1].text = result[-1].text.rstrip(' ')
+        if result[-1].text:
+            break
+        result.pop()
+    return result
+
+
+def truncate_line(line: Line, width: int, ellipsis: str = '') -> Line:
+    if width <= 0:
+        return []
+    total = line_width(line)
+    if total <= width:
+        return [Span(span.text, span.fg, span.bg, span.attrs, span.alpha)
+                for span in line]
+    budget = max(0, width - text_width(ellipsis))
+    result: Line = []
+    used = 0
+    for span in line:
+        if used >= budget:
+            break
+        text = ''
+        for ch in span.text:
+            size = char_width(ch)
+            if used + size > budget:
+                break
+            text += ch
+            used += size
+        if text:
+            add_span(result, Span(text, span.fg, span.bg, span.attrs, span.alpha))
+        if used >= budget:
+            break
+    if ellipsis and used + text_width(ellipsis) <= width:
+        add_span(result, Span(ellipsis, 'muted'))
+    return result
+
+
+def wrap_line(line: Line, width: int, first_width: int | None = None) -> list[Line]:
+    """Wrap a styled line into visual rows of at most ``width`` cells."""
+    width = max(1, width)
+    rows: list[Line] = []
+    current: Line = []
+    current_width = 0
+    limit = width if first_width is None else max(1, first_width)
+    for span in line:
+        for ch in span.text:
+            size = char_width(ch)
+            if size == 0:
+                # Combining marks attach to the last character.
+                if current and current[-1].text:
+                    current[-1].text += ch
+                elif rows and rows[-1]:
+                    rows[-1][-1].text += ch
+                continue
+            if current_width and current_width + size > limit:
+                rows.append(current)
+                current = []
+                current_width = 0
+                limit = width
+            if not current and size > limit:
+                # A double-width glyph cannot fit here; place it anyway.
+                add_span(current, Span(ch, span.fg, span.bg, span.attrs, span.alpha))
+                current_width += size
+                continue
+            add_span(current, Span(ch, span.fg, span.bg, span.attrs, span.alpha))
+            current_width += size
+    if current or not rows:
+        rows.append(current)
+    return rows
+
+
+def wrap_lines(lines: list[Line], width: int,
+               first_width: int | None = None) -> list[Line]:
+    result: list[Line] = []
+    for index, line in enumerate(lines):
+        result.extend(wrap_line(line, width, first_width if index == 0 else None))
+    return result
+
+
+def slice_visual(lines: list[Line], from_index: int, to_index: int) -> list[Line]:
+    """Inclusive negative-index slice: (-5, -1) is the last five visual rows."""
+    if not lines:
+        return []
+    total = len(lines)
+    start = max(0, total + from_index) if from_index < 0 else min(from_index, total)
+    end = max(0, total + to_index) if to_index < 0 else min(to_index, total - 1)
+    if end < start:
+        start, end = end, start
+    return lines[start:end + 1]
+
+
+def render_to_strings(lines: list[Line]) -> list[str]:
+    return [plain_text(line) for line in lines]

@@ -1,0 +1,416 @@
+# AdCode
+
+AdCode is a configurable, full-screen terminal coding agent. It streams from
+OpenAI-compatible and Anthropic model APIs, runs a ReAct loop with tools
+(files, search, a persistent shell, HTTP, git diffs), delegates work to
+sub-agents and teams, loads MCP servers, and reads skills from
+`~/.agents/skills`.
+
+The interface is a small software renderer: every widget draws into a shared
+cell canvas with an alpha channel, the compositor blends the frame, and the
+whole screen is written to the terminal in one pass.
+
+## Highlights
+
+- **Full-screen canvas UI** -- a unified style built from white and light grey
+  layers, with the accent colour used only for small markers (`>`, `│`, `›`).
+  Every frame is composited in software and printed at once.
+- **Alpha-aware rendering bus** -- widgets call `draw_text`, `fill_rect`,
+  `box`, and friends; colours blend through 8-bit alpha, which drives the
+  fading thinking window, dimmed modal backdrops, and gradients.
+- **App-managed scrolling** -- the transcript is a virtual scrollback with a
+  scrollbar, mouse-wheel support, PageUp/PageDown, and follow-tail behaviour.
+- **Streaming ReAct loop** -- thinking, answers, tool calls, and usage stream
+  from worker threads; the UI stays responsive and Esc interrupts a turn or a
+  running shell command.
+- **Automatic context compaction** -- old complete turns are summarized
+  through a streaming model call, archived locally, and replaced atomically.
+- **Provider and model management** -- `/provider add` fetches the model list,
+  offers a filterable multi-select table, accepts custom model ids, and fills
+  capabilities (vision, context window, max output tokens, reasoning efforts)
+  from [models.dev](https://models.dev). Every model can be edited by hand.
+- **Sub-agents and agent teams** -- configurable agent types, background ReAct
+  workers, a shared workspace, mailboxes, recursive delegation limits, and
+  team spawning.
+- **MCP support** -- stdio, Streamable HTTP, and legacy SSE transports, with
+  automatic tool scanning (including pagination cursors).
+- **Skills** -- scans `~/.agents/skills` (plus project and extra paths), gives
+  the model a compact preview, and loads full instructions on demand.
+- **Session toolkit** -- rollback, edit-and-resend, fork, aside questions
+  (`/btw`), durable goals, and automatic crash recovery.
+- **Single settings browser** -- `/config` exposes thinking display, tool
+  display, appearance, reasoning, context, agents, skills, and MCP settings.
+
+## Requirements
+
+- Python 3.14 or newer
+- Windows 10/11 is the primary target (virtual-terminal input, `taskkill`
+  process-tree handling). POSIX terminals work through the `termios` path.
+
+## Installation
+
+```bash
+git clone https://github.com/your-username/adcode.git
+cd adcode
+pip install -e .
+```
+
+Or with uv:
+
+```bash
+uv sync
+```
+
+Run it:
+
+```bash
+adcode
+# or
+python main.py
+```
+
+## First Run
+
+AdCode opens a four-step provider setup:
+
+1. **Base URL** -- the API endpoint. End with `#` to use it exactly as typed;
+   otherwise `/v1` is appended when missing.
+2. **API key** -- encrypted with Fernet; the Fernet key lives in the OS
+   keyring (Windows Credential Manager, macOS Keychain, or Secret Service).
+   An empty key is allowed for local servers.
+3. **Display name** -- how the provider appears in the UI.
+4. **API structure** -- OpenAI Chat Completions, OpenAI Responses, or
+   Anthropic Messages.
+
+The model list is fetched next. If the provider exposes `/models`, a
+filterable multi-select table appears (`space` toggles, `enter` confirms, `+`
+adds a custom id). If fetching fails, you can retry, probe with another wire,
+or enter model ids manually. Metadata is matched against models.dev when
+available. A final step lets you review the selected model's context window,
+maximum output, vision support, tool calling, and reasoning efforts.
+
+## Keyboard
+
+| Key | Action |
+|---|---|
+| `enter` | Send the message / run the selected command |
+| `shift+enter`, `alt+enter`, `ctrl+j` | Insert a newline |
+| trailing `\` + `enter` | Insert a newline (works in every terminal) |
+| `up` / `down` | Prompt history, or navigate the `/` command palette |
+| `tab` | Complete the selected command |
+| `esc` | Interrupt the current turn, or close the palette/overlay |
+| `ctrl+c` | Copy selection, else clear the input, else interrupt; press twice on an empty prompt to exit |
+| `ctrl+v` | Paste (bracketed paste is supported) |
+| `ctrl+a` | Select all |
+| `ctrl+x` | Cut selection |
+| `ctrl+z` / `ctrl+y` | Undo / redo input edits |
+| `pgup` / `pgdn` | Scroll the transcript |
+| mouse wheel | Scroll the transcript |
+| `home` / `end` | Line start / end |
+| `ctrl+home` / `ctrl+end` | Input start / end |
+| `ctrl+l` | Redraw the screen |
+
+## Commands
+
+Type `/` to open the command palette. Up/Down selects a candidate, Tab or
+Enter completes it, and Enter runs the command.
+
+| Command | Description |
+|---|---|
+| `/help` | Commands and key bindings |
+| `/config` | Open the settings browser |
+| `/model [list\|edit]` | Switch models or edit the selected model's capabilities |
+| `/provider add\|edit\|remove\|list` | Manage providers and their models |
+| `/effort [level]` | Set `low`, `medium`, `high`, `xhigh`, `max`, or `ultra` |
+| `/thinking [mode]` | Set thinking display: `hidden`, `label`, `partial`, `full` |
+| `/max_tokens [n]` | Set the maximum output tokens per request |
+| `/compact` | Compact older turns immediately |
+| `/context`, `/cache`, `/prefix` | Inspect context size, cache usage, and the stable prefix |
+| `/goal <objective>` | Start a durable goal (`status`, `list`, `pause`, `resume`, `complete`, `blocked`, `cancel`) |
+| `/agents list\|max\|depth\|wait\|interrupt\|types\|teams` | Inspect and configure sub-agents |
+| `/mcp add\|edit\|remove\|list\|doctor\|refresh` | Manage MCP servers and rescan their tools |
+| `/skills [list\|reload]` | Browse and reload installed skills |
+| `/diff [path]` | Show the Git working-tree diff in the transcript |
+| `/sessions` | Browse and load saved sessions |
+| `/save [name]` / `/load [name]` | Save / load a session |
+| `/rewind` | Roll the conversation back to an earlier turn |
+| `/edit` | Rewind to a turn and prefill its message for editing |
+| `/fork [name]` | Fork the conversation into a new session |
+| `/btw [question]` | Ask a side question without touching the main task; with no question, toggles aside mode for the next message |
+| `/clear` or `/new` | Clear the conversation |
+| `/theme` | Change the theme or accent colour |
+| `/quit` or `/exit` | Exit |
+
+## Settings (`/config`)
+
+`/config` is a tree of grouped settings rendered as a modal panel:
+
+- **Move** with Up/Down.
+- **Enter** expands a setting vertically, selects an option, or starts inline
+  editing for numbers and text.
+- **Esc** cancels the item: it restores the values captured when the item was
+  expanded, then collapses it. At the top level it closes the panel.
+- **Enter on an expanded setting's title** confirms it and collapses it.
+- **Ctrl+S** saves and closes.
+
+Selecting an option that has children expands its sub-settings automatically.
+Changes apply to the running app immediately (theme and accent included) and
+are persisted to `config.json`.
+
+### Thinking display
+
+| Mode | Behaviour |
+|---|---|
+| `hidden` | Accept reasoning deltas silently |
+| `label` | One label line with a fixed or rotating suffix |
+| `partial` | A configurable window of the rendered reasoning |
+| `full` | The complete reasoning stream |
+
+The `label` mode configures the label text (`Thinking`, `Reasoning`,
+`Polishing`, ...), the suffix animation (`fixed` or `rotating`), the rotation
+frames, and the per-frame duration. The `partial` mode configures:
+
+- two negative visual-row indices (for example `-5` to `-1` shows the last
+  five visual rows; `-6` to `-2` ends at the second-to-last row),
+- the display style (`normal` Markdown or `gradient` with a configurable top
+  row alpha from 0 to 255),
+- the omitted-content marker (`none`, an ellipsis `label`, or a character
+  `count`).
+
+### Tool display
+
+| Mode | Behaviour |
+|---|---|
+| `hidden` | Execute silently |
+| `call` | One compact line: `│ tool  args` on a light panel background; optionally show arguments |
+| `result` | Only the result section |
+| `both` | The call line and the result section |
+
+Result sections support the same negative-row window, style, gradient, and
+ellipsis controls as thinking, plus a full mode with an optional line cap.
+File diffs are rendered inline and can be toggled.
+
+## Configuration File
+
+`config.json` lives in `~/.adcode/` (user-level, shared across projects). API
+keys are encrypted before writing. An older file next to the package is moved
+there automatically on first load. A minimal file looks like this:
+
+```json
+{
+    "version": 2,
+    "providers": [
+        {
+            "name": "DeepSeek",
+            "base_url": "https://api.deepseek.com/v1",
+            "api_key": "<encrypted>",
+            "wire": "openai chat completions",
+            "models": [
+                {
+                    "id": "deepseek-chat",
+                    "context_window": 131072,
+                    "max_output_tokens": 8192,
+                    "reasoning": false,
+                    "tool_call": true,
+                    "source": "models.dev"
+                }
+            ]
+        }
+    ],
+    "selected_model": "DeepSeek::deepseek-chat",
+    "thinking": {"mode": "partial", "style": "gradient"},
+    "tools": {"mode": "both", "result_mode": "partial"},
+    "agents": {"enabled": true, "max_concurrent": 10, "max_depth": 4},
+    "agent_types": {},
+    "agent_teams": {}
+}
+```
+
+`selected_model` uses the `provider::model` form. `agent_types` and
+`agent_teams` default to the built-in sets (general, explorer, reviewer,
+worker; explore, build, review) and can be replaced with custom definitions:
+
+```json
+{
+    "agent_types": {
+        "docs": {
+            "description": "Writes and reviews documentation",
+            "system": "You are a documentation specialist.",
+            "tools": ["read", "write", "edit", "glob", "grep"],
+            "max_turns": 20
+        }
+    },
+    "agent_teams": {
+        "ship": ["docs", "reviewer"]
+    }
+}
+```
+
+## MCP
+
+MCP servers are managed by `/mcp` and stored in `~/.adcode/config.json`:
+
+```json
+{
+    "name": "filesystem",
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+}
+```
+
+```json
+{
+    "name": "remote",
+    "transport": "http",
+    "url": "https://example.com/mcp"
+}
+```
+
+Transport values are `stdio`, `http` (Streamable HTTP), and `sse` (legacy
+HTTP event stream). Servers connect in parallel, expose tools under
+`mcp__<server>__<tool>` names, and paginate `tools/list` automatically.
+`/mcp doctor` shows protocol versions, tool counts, errors, and recent stderr;
+`/mcp refresh` rescans every connected server.
+
+## Skills
+
+Skills are directories containing `SKILL.md` with YAML frontmatter:
+
+```markdown
+---
+name: my-skill
+description: One line that tells the model when to use this skill.
+---
+
+Full instructions...
+```
+
+AdCode scans `~/.agents/skills`, `<cwd>/.agents/skills`,
+`<cwd>/.adcode/skills`, and any `skills.extra_paths` entries. The system
+prompt lists each skill's name and description; the model calls
+`skill_list(query)` to search and `skill_load(name)` to read the full
+instructions and see the skill's supporting files. `/skills reload` rescans
+after adding or editing a skill.
+
+## Sessions
+
+Sessions are stored under `sessions/` as JSON (history, transcript, compaction
+archive, and prefix generation). Every turn updates a `__last__` checkpoint so
+a crash or restart loses at most the last checkpoint interval. Old AdCode 1.x
+session files are migrated on load.
+
+- `/rewind` lists user turns; selecting one drops that turn and everything
+  after it.
+- `/edit` does the same but prefills the selected message so you can change it
+  and resend.
+- `/fork` copies the conversation into a new session and continues there.
+- `/save` / `/load` / `/sessions` manage named sessions.
+
+Goals live in `sessions/goals.json` and are injected into the system prompt
+while active. Project instructions are read from `AGENTS.md` (or `prompt`) in
+the working directory.
+
+## Rendering Architecture
+
+```
+widgets ──draw──▶ Canvas (width × height cells, fg/bg/attrs/alpha)
+                      │
+              alpha compositing
+                      │
+              full-frame ANSI string ──▶ TerminalScreen (WriteConsoleW / UTF-8)
+```
+
+- `adcode/tui/canvas.py` holds the cell buffer and primitives (`draw_text`,
+  `fill_rect`, `box`, `hline`, `vline`) with clipping, wide-glyph handling,
+  and alpha blending.
+- `adcode/tui/screen.py` enters the alternate buffer, enables bracketed paste
+  and SGR mouse reporting, and writes each frame once.
+- `adcode/tui/app.py` owns the layout (header, virtual transcript viewport,
+  prompt, footer), scrolling, input handling, and overlays.
+- `adcode/tui/transcript.py` renders transcript items and live streaming
+  state according to the `/config` display policies.
+- `adcode/tui/markdown.py` is an incremental Markdown renderer producing
+  styled spans (headings, emphasis, code fences, lists, quotes, tables, links,
+  math).
+
+## Agent Loop
+
+`adcode/agent_loop.py` runs on a worker thread. It stages user messages,
+streams one request at a time, executes tool calls, feeds results back, drains
+sub-agent mailboxes, compacts the context when needed, and persists progress.
+The UI consumes a thread-safe event queue and renders the live state.
+
+- Interrupts are cooperative: `esc` sets an event checked between stream
+  events; the shell tool polls it and kills the process tree.
+- `finish_reason == "length"` triggers a bounded continuation request so long
+  reasoning chains are not truncated.
+- Compaction keeps the most recent turns, summarizes the rest with a streaming
+  model call, appends a deterministic fallback when the model call fails, and
+  archives the removed messages.
+
+## Project Structure
+
+```
+adcode/
+├── cli.py            # console entry point
+├── agent_loop.py     # streaming ReAct loop, events, persistence
+├── config.py         # settings schema, migration, atomic save
+├── crypto.py         # Fernet API-key encryption
+├── models_dev.py     # models.dev catalogue and cache
+├── session.py        # transcript items, save/load, rewind/fork
+├── goals.py          # durable goal store
+├── skills.py         # skill discovery, preview and tools
+├── system_prompt.py  # AGENTS.md, environment, goals and skills
+├── commands.py       # slash commands and completion
+├── diff.py           # file snapshots, unified diffs, git worktree
+├── theme.py          # palettes and semantic colour roles
+├── llm/
+│   ├── client.py     # OpenAI Chat/Responses and Anthropic streaming
+│   ├── context.py    # conversation state, stable prefix, compaction
+│   └── usage.py      # token estimates, budget, usage normalization
+├── tools/
+│   ├── builtin.py    # read, write, edit, glob, grep, bash, fetch, diff, ls
+│   ├── registry.py   # schemas, dispatch, diff attachment
+│   └── runtime.py    # per-thread tool context (interrupts, live output)
+├── mcp/
+│   ├── client.py     # stdio, Streamable HTTP, and SSE transports
+│   └── manager.py    # server lifecycle, tool registration, diagnostics
+├── agents/
+│   └── manager.py    # sub-agent tree, teams, mailboxes, ReAct workers
+└── tui/
+    ├── app.py        # layout, input, scrolling, overlays
+    ├── canvas.py     # software renderer and alpha compositing
+    ├── screen.py     # terminal modes and frame output
+    ├── input.py      # cross-platform key/paste/mouse parser
+    ├── markdown.py   # incremental Markdown -> styled spans
+    ├── text.py       # spans and width-aware wrapping
+    ├── transcript.py # transcript and live-state rendering
+    ├── dialogs.py    # select, multi-select, prompts, confirmations
+    ├── settings.py   # the /config tree browser
+    └── provider_ui.py# provider setup and model editor
+```
+
+## Development
+
+```bash
+uv sync
+python -m pytest
+```
+
+The test suite covers canvas compositing, wrapping and Markdown, config
+migration, models.dev matching, compaction, sessions and rewind, skills, the
+tools, the agent loop, sub-agents, all three MCP transports, commands, input
+parsing, transcript display policies, settings behavior, and prompt layout.
+
+## Dependencies
+
+- `openai` -- OpenAI-compatible Chat Completions and Responses clients
+- `anthropic` -- Messages API client
+- `cryptography` -- Fernet encryption for API keys
+- `keyring` -- OS credential storage
+- `pyperclip` -- clipboard access
+
+## License
+
+MIT

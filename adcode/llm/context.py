@@ -1,0 +1,347 @@
+"""Conversation state, stable prompt prefixes and automatic compaction."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Iterable
+
+from adcode.llm.usage import TokenBudget, TokenBudgetExceeded, estimate_tokens
+
+PROMPT_VERSION = 'adcode-v2'
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+    ).replace('\r\n', '\n').replace('\r', '\n')
+
+
+def normalized_endpoint(endpoint: str) -> str:
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(endpoint.strip())
+    path = parts.path.rstrip('/') or '/'
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, '', ''))
+
+
+def stable_tools(tools: Iterable[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+    def name(tool: dict[str, Any]) -> str:
+        function = tool.get('function', tool)
+        return str(function.get('name', ''))
+
+    return tuple(json.loads(canonical_json(tool)) for tool in sorted(tools, key=name))
+
+
+@dataclass(frozen=True)
+class StablePrefix:
+    generation: int
+    prompt_version: str
+    provider: str
+    endpoint: str
+    model: str
+    system: str
+    tools: tuple[dict[str, Any], ...]
+    fingerprint: str
+
+    @classmethod
+    def create(cls, *, provider: str, endpoint: str, model: str, system: str,
+               tools: Iterable[dict[str, Any]], generation: int = 1,
+               wire: str = '') -> 'StablePrefix':
+        canonical_tool_list = stable_tools(tools)
+        canonical_endpoint = normalized_endpoint(endpoint)
+        canonical_system = system.replace('\r\n', '\n').replace('\r', '\n')
+        payload = {
+            'provider': provider,
+            'endpoint': canonical_endpoint,
+            'model': model,
+            'system': canonical_system,
+            'tools': canonical_tool_list,
+            'prompt_version': PROMPT_VERSION,
+            'wire': wire,
+        }
+        fingerprint = 'sha256:' + hashlib.sha256(
+            canonical_json(payload).encode('utf-8')).hexdigest()
+        return cls(generation, PROMPT_VERSION, provider, canonical_endpoint, model,
+                   canonical_system, canonical_tool_list, fingerprint)
+
+
+@dataclass
+class CompactionPlan:
+    removed: list[dict[str, Any]]
+    kept_messages: list[dict[str, Any]]
+    target_tokens: int
+
+
+@dataclass
+class ConversationContext:
+    stable_prefix: StablePrefix
+    committed: list[dict[str, Any]]
+    draft: list[dict[str, Any]] = field(default_factory=list)
+    archived: list[dict[str, Any]] = field(default_factory=list)
+
+    def request_messages(self) -> list[dict[str, Any]]:
+        return [*self.committed, *self.draft]
+
+    def stage(self, *messages: dict[str, Any]) -> None:
+        self.draft.extend(messages)
+
+    def commit(self) -> None:
+        self.committed.extend(self.draft)
+        self.draft.clear()
+
+    def rollback(self) -> None:
+        self.draft.clear()
+
+    def restore(self, archived: Iterable[dict[str, Any]], generation: int) -> None:
+        self.draft.clear()
+        self.archived[:] = archived
+        self.stable_prefix = replace(
+            self.stable_prefix, generation=max(1, int(generation)))
+
+    def estimated_tokens(self) -> int:
+        return estimate_tokens(self.committed) + estimate_tokens(self.draft)
+
+    def needs_compaction(self, budget: TokenBudget, threshold_percent: int = 85) -> bool:
+        usable = budget.usable()
+        if usable <= 0:
+            return True
+        used = self.estimated_tokens()
+        return used >= usable * threshold_percent / 100
+
+    def compaction_plan(self, target_tokens: int,
+                        keep_recent_turns: int = 2) -> CompactionPlan | None:
+        """Select complete historical turns for replacement without mutating state."""
+        if not self.committed:
+            return None
+        groups = _conversation_groups(self.committed)
+        keep_recent = max(0, min(keep_recent_turns, len(groups)))
+        kept: list[list[dict[str, Any]]] = list(groups[len(groups) - keep_recent:]) \
+            if keep_recent else []
+        kept_tokens = sum(estimate_tokens(group) for group in kept)
+        keep_budget = max(1, target_tokens * 2 // 3)
+        for group in reversed(groups[:len(groups) - keep_recent]):
+            size = estimate_tokens(group)
+            if kept and kept_tokens + size > keep_budget:
+                break
+            kept.insert(0, group)
+            kept_tokens += size
+        removed_count = len(groups) - len(kept)
+        if removed_count <= 0:
+            return None
+        removed = [message for group in groups[:removed_count] for message in group]
+        kept_messages = [message for group in kept for message in group]
+        return CompactionPlan(removed, kept_messages, target_tokens)
+
+    def apply_compaction(self, plan: CompactionPlan, summary: dict[str, Any]) -> int:
+        if not plan.removed:
+            return 0
+        kept_messages = list(plan.kept_messages)
+        if kept_messages and kept_messages[0].get('role') == 'user':
+            first = dict(kept_messages[0])
+            first_content = first.get('content') or ''
+            if isinstance(first_content, str):
+                first['content'] = f'{summary["content"]}\n\n{first_content}'
+            kept_messages[0] = first
+            replacement = kept_messages
+        else:
+            replacement = [summary, *kept_messages]
+        self.archived.extend(plan.removed)
+        self.committed[:] = replacement
+        self.stable_prefix = replace(
+            self.stable_prefix, generation=self.stable_prefix.generation + 1)
+        return len(plan.removed)
+
+    def enforce_budget(self, budget: TokenBudget,
+                       keep_recent_turns: int = 2) -> dict[str, int | bool]:
+        available = budget.usable()
+        draft_tokens = estimate_tokens(self.draft)
+        if draft_tokens > available:
+            _trim_tool_outputs(self.draft, max(256, available // 2))
+            draft_tokens = estimate_tokens(self.draft)
+        if draft_tokens > available:
+            raise TokenBudgetExceeded(
+                f'the current turn needs about {draft_tokens} tokens; '
+                f'the usable budget is {available}')
+        committed_budget = available - draft_tokens
+        before = estimate_tokens(self.committed)
+        removed = 0
+        if before > committed_budget:
+            plan = self.compaction_plan(committed_budget, keep_recent_turns)
+            if plan is not None:
+                summary = structured_summary(
+                    plan.removed, max_tokens=max(256, committed_budget // 3))
+                removed = self.apply_compaction(plan, summary)
+        after = estimate_tokens(self.committed)
+        if after > committed_budget:
+            _trim_tool_outputs(self.committed, max(256, committed_budget // 2))
+            after = estimate_tokens(self.committed)
+        if after > committed_budget:
+            raise TokenBudgetExceeded(
+                f'history needs about {after} tokens; the usable budget is '
+                f'{committed_budget}')
+        return {
+            'compacted': bool(removed), 'removed_messages': removed,
+            'committed_tokens': after, 'draft_tokens': draft_tokens,
+        }
+
+
+def _conversation_groups(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    groups: list[list[dict[str, Any]]] = []
+    for message in messages:
+        if message.get('role') == 'user' or not groups:
+            groups.append([])
+        groups[-1].append(message)
+    return groups
+
+
+def _message_text(message: dict[str, Any], limit: int = 600) -> str:
+    content = message.get('content') or ''
+    if not isinstance(content, str):
+        content = canonical_json(content)
+    content = re.sub(r'\s+', ' ', content).strip()
+    if len(content) > limit:
+        content = content[:limit] + '...'
+    calls = message.get('tool_calls') or []
+    if calls:
+        names = [call.get('function', {}).get('name', '') for call in calls]
+        content = f'{content} [tools: {", ".join(filter(None, names))}]'.strip()
+    return content
+
+
+def structured_summary(messages: list[dict[str, Any]],
+                       max_tokens: int = 2_000) -> dict[str, Any]:
+    """Deterministic fallback summary used when a streamed summary fails."""
+    facts: list[str] = []
+    files: list[str] = []
+    commands: list[str] = []
+    last_results: list[str] = []
+    active_task = ''
+    for message in messages:
+        role = message.get('role', 'unknown')
+        text = _message_text(message, limit=900)
+        if not text:
+            continue
+        if not active_task and role == 'user' and '<conversation_summary>' not in text:
+            active_task = text[:400]
+        facts.append(f'- {role}: {text}')
+        files.extend(re.findall(r'(?:[A-Za-z]:\\|\.?\.?/)[^\s`"\']+', text))
+        if role == 'tool':
+            commands.append(f'- {text[:300]}')
+            last_results.append(text[:400])
+    max_chars = max_tokens * 4
+    fixed_reserve = min(1_200, max_chars // 2)
+    fact_budget = max(128, max_chars - fixed_reserve)
+    selected: list[str] = []
+    used = 0
+    for fact in reversed(facts):
+        if selected and used + len(fact) + 1 > fact_budget:
+            break
+        selected.insert(0, fact[:fact_budget])
+        used += len(selected[0]) + 1
+    goal_line = f'- {active_task}' if active_task else \
+        'Continue the active user task using the preserved facts below.'
+    body = '\n'.join([
+        '## Goal',
+        goal_line,
+        '## State of work',
+        '- The task is NOT finished. Continue from the completed work below; do not redo it.',
+        '## Confirmed facts',
+        *selected,
+        '## Decisions and constraints',
+        '- Earlier messages were compacted deterministically to fit the context window.',
+        '## Files changed',
+        *[f'- {path}' for path in dict.fromkeys(files[-12:])],
+        '## Commands and test results',
+        *commands[-10:],
+        '## Last tool results',
+        *[f'- {line}' for line in last_results[-3:]],
+        '## Unresolved items',
+        '- Re-check archived history when exact earlier wording is required.',
+    ])
+    return {'role': 'user',
+            'content': f'<conversation_summary>\n{body}\n</conversation_summary>'}
+
+
+COMPACTION_SYSTEM = (
+    'You are the AdCode context compactor. Return only a concise, durable project '
+    'context. Preserve the user objective, concrete progress (files edited and their '
+    'state, commands run and outcomes, latest tool results), hard constraints, '
+    'decisions, file paths, identifiers, and unresolved work. The task is not '
+    'finished; the summary must let the next turn continue exactly where it stopped. '
+    'Do not invent facts and do not call tools.'
+)
+
+
+def compaction_source(messages: list[dict[str, Any]], max_tokens: int = 24_000) -> str:
+    limit = max(1, max_tokens) * 4
+    chunks: list[str] = []
+    used = 0
+    for message in messages:
+        role = message.get('role', 'unknown')
+        text = _message_text(message, limit=2_000)
+        chunk = f'{role}: {text}'
+        if chunks and used + len(chunk) + 1 > limit:
+            break
+        chunks.append(chunk)
+        used += len(chunk) + 1
+    return '\n'.join(chunks)
+
+
+def stream_compact(context: ConversationContext, target_tokens: int,
+                   stream_factory: Callable[..., Iterable[dict[str, Any]]],
+                   emit: Callable[[str], None] | None = None,
+                   keep_recent_turns: int = 2) -> int:
+    """Compact with a streaming model call and a deterministic fallback."""
+    plan = context.compaction_plan(target_tokens, keep_recent_turns)
+    if plan is None:
+        return 0
+    prompt = (
+        '<compaction_request>\n'
+        'Rewrite the following earlier conversation into durable context.\n\n'
+        f'{compaction_source(plan.removed)}\n'
+        '</compaction_request>'
+    )
+    parts: list[str] = []
+    try:
+        events = stream_factory(
+            [{'role': 'user', 'content': prompt}],
+            system=COMPACTION_SYSTEM,
+            max_tokens=max(256, min(2_048, target_tokens // 3)),
+            tools=None,
+        )
+        for event in events:
+            if event.get('kind') == 'text':
+                content = str(event.get('content', ''))
+                if content:
+                    parts.append(content)
+                    if emit is not None:
+                        emit(content)
+    except Exception:
+        parts.clear()
+    summary_text = ''.join(parts).strip()
+    if summary_text:
+        summary = {
+            'role': 'user',
+            'content': f'<conversation_summary>\n{summary_text}\n</conversation_summary>',
+        }
+    else:
+        summary = structured_summary(
+            plan.removed, max_tokens=max(256, target_tokens // 3))
+    return context.apply_compaction(plan, summary)
+
+
+def _trim_tool_outputs(messages: list[dict[str, Any]], total_tokens: int) -> None:
+    tools = [message for message in messages if message.get('role') == 'tool']
+    if not tools:
+        return
+    per_tool_chars = max(256, total_tokens * 4 // len(tools))
+    for message in tools:
+        content = message.get('content')
+        if isinstance(content, str) and len(content) > per_tool_chars:
+            head = per_tool_chars * 2 // 3
+            tail = per_tool_chars - head
+            message['content'] = (
+                f'{content[:head]}\n... <tool output compacted> ...\n{content[-tail:]}'
+            )
