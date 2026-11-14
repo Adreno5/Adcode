@@ -83,6 +83,30 @@ def normalize_usage(raw: Any) -> dict[str, int | float | None]:
     }
 
 
+def merge_usage(previous: dict[str, Any] | None,
+                update: dict[str, Any] | None) -> dict[str, int | float | None]:
+    """Merge split usage reports (Anthropic sends prompt and completion counts
+    in separate stream events) without discarding the earlier fields."""
+    merged: dict[str, int | float | None] = dict(previous or {})
+    if update:
+        for key in ('input_tokens', 'cached_input_tokens', 'output_tokens'):
+            value = update.get(key)
+            if value is not None:
+                merged[key] = value
+    input_tokens = merged.get('input_tokens')
+    cached = merged.get('cached_input_tokens')
+    merged['input_tokens'] = input_tokens
+    merged['cached_input_tokens'] = cached
+    merged['output_tokens'] = merged.get('output_tokens')
+    merged['uncached_input_tokens'] = (
+        None if input_tokens is None or cached is None
+        else max(0, int(input_tokens) - int(cached)))
+    merged['cache_hit_rate'] = (
+        None if not input_tokens or cached is None
+        else cached / input_tokens)
+    return merged
+
+
 @dataclass(frozen=True)
 class TokenBudget:
     context_window: int

@@ -50,13 +50,16 @@ def _retry_generator(events_factory: Any, attempts: int = 3) -> Generator[ChatEv
     """Retry only the stream *creation*; mid-stream failures surface to the caller."""
     last_error: Exception | None = None
     for attempt in range(attempts):
+        emitted = False
         try:
             stream = events_factory()
-            yield from stream
+            for event in stream:
+                emitted = True
+                yield event
             return
         except (openai.APIError, anthropic.APIError) as error:
             status = getattr(error, 'status_code', 0) or getattr(error, 'status', 0)
-            if status == 400 or attempt == attempts - 1:
+            if emitted or status == 400 or attempt == attempts - 1:
                 raise
             last_error = error
             wait = 2 ** attempt
@@ -416,9 +419,11 @@ class LLMClient:
                     })
                 out.append({'role': 'assistant', 'content': blocks})
             elif role == 'assistant':
-                out.append({'role': 'assistant', 'content': message.get('content') or ''})
+                if message.get('content'):
+                    out.append({'role': 'assistant', 'content': message['content']})
             elif role == 'user':
-                out.append({'role': 'user', 'content': message.get('content')})
+                if message.get('content'):
+                    out.append({'role': 'user', 'content': message['content']})
         if pending_tool_results:
             out.append({'role': 'user', 'content': pending_tool_results})
         return out
@@ -442,8 +447,10 @@ class LLMClient:
                 'max': 16_384, 'ultra': 24_576,
             }
             budget = budget_map.get(resolve_effort(effort, model.reasoning_efforts), 4_096)
-            budget = max(1_024, min(budget, max(1_024, max_tokens - 512)))
-            kwargs['thinking'] = {'type': 'enabled', 'budget_tokens': budget}
+            # The Messages API requires 1024 <= budget_tokens < max_tokens.
+            budget = max(1_024, min(budget, max_tokens - 1))
+            if budget < max_tokens:
+                kwargs['thinking'] = {'type': 'enabled', 'budget_tokens': budget}
 
         def factory() -> Generator[ChatEvent, None, None]:
             buffers: dict[int, dict[str, Any]] = {}
