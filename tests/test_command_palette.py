@@ -58,6 +58,23 @@ def test_esc_closes_the_palette(harness):
         timeout=5.0, description='the palette to close')
 
 
+def test_the_wheel_scrolls_the_palette(harness):
+    """The wheel must move the selection instead of raising."""
+    harness.press('ctrl+p')
+    harness.wait_until(
+        lambda: harness.overlay is not None,
+        timeout=5.0, description='the command palette to open')
+    harness.wheel('wheel_down')
+    # One notch moves the selection by one row.
+    harness.wait_until(
+        lambda: harness.overlay is not None and harness.overlay.index == 1,
+        timeout=5.0, description='the selection to move down')
+    harness.wheel('wheel_up')
+    harness.wait_until(
+        lambda: harness.overlay is not None and harness.overlay.index == 0,
+        timeout=5.0, description='the selection to move back up')
+
+
 def test_ctrl_q_quits_the_app(harness):
     harness.press('ctrl+q')
     harness.wait_until(

@@ -496,9 +496,11 @@ class CommandPalette(Overlay):
     def handle(self, event: KeyEvent) -> bool:
         visible = self._visible()
         if event.kind == 'mouse':
-            step = _wheel_step(event)
+            step = wheel_step(event)
             if step and visible:
-                self.index = max(0, min(len(visible) - 1, self.index + step * 3))
+                # One notch moves one row: a palette is a short list and a
+                # bigger jump skips over the command the user aimed at.
+                self.index = max(0, min(len(visible) - 1, self.index + step))
             return True
         if event.kind == 'paste':
             self.filter += event.text.replace('\r', '').replace('\n', ' ')
