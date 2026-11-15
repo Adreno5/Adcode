@@ -77,6 +77,42 @@ def test_box_and_render(palette):
     assert '┌' in frame
 
 
+def test_opaque_panel_hides_text_drawn_beneath_it(palette):
+    canvas = Canvas(24, 6, palette)
+    canvas.clear()
+    for y in range(6):
+        canvas.draw_text(0, y, 'underlying text', palette.text)
+    canvas.box(2, 1, 16, 4, palette.border, bg=palette.panel)
+    for y in range(2, 4):
+        for x in range(3, 17):
+            assert canvas.cell(x, y).ch == ' '
+    # Everything outside the panel still shows the page.
+    assert canvas.cell(0, 0).ch == 'u'
+    assert canvas.cell(0, 2).ch == 'u'
+
+
+def test_opaque_panel_never_leaves_half_a_wide_glyph(palette):
+    canvas = Canvas(12, 3, palette)
+    canvas.clear()
+    canvas.draw_text(0, 1, '中文中文中', palette.text)  # columns 0..9
+    canvas.box(3, 0, 6, 3, palette.border, bg=palette.panel)
+    # The glyph at columns 2-3 loses its right half: the left half must go.
+    assert canvas.cell(2, 1).ch == ' '
+    assert canvas.cell(2, 1).cont is False
+    # The glyph at columns 8-9 loses its left half: the orphaned
+    # continuation cell must go too.
+    assert canvas.cell(9, 1).ch == ' '
+    assert canvas.cell(9, 1).cont is False
+
+
+def test_translucent_fill_keeps_text_visible(palette):
+    canvas = Canvas(8, 1, palette)
+    canvas.clear()
+    canvas.draw_text(0, 0, 'keep', palette.text)
+    canvas.fill_rect(0, 0, 8, 1, palette.panel, alpha=128)
+    assert canvas.cell(0, 0).ch == 'k'
+
+
 def test_attributes_serialized(palette):
     canvas = Canvas(3, 1, palette)
     canvas.clear()

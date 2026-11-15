@@ -28,6 +28,20 @@ def test_message_dialog_render_and_close():
     assert dialog.closed
 
 
+def test_overlay_panel_hides_the_page_beneath_it():
+    palette = build_palette('dark')
+    surface = Canvas(100, 30, palette)
+    surface.clear()
+    for y in range(30):
+        surface.draw_text(0, y, 'X' * 100, palette.text)
+    MessageDialog('Info', 'ok').render(surface, 100, 30, palette, 0.0)
+    # The modal body is opaque: the page must not bleed through it.  The
+    # backdrop outside the panel still dims, so only the panel is checked.
+    for y in range(12, 16):
+        for x in range(15, 85):
+            assert surface.cell(x, y).ch != 'X'
+
+
 def test_confirm_dialog():
     results = []
     dialog = ConfirmDialog('Sure?', 'Remove it.', results.append)

@@ -386,9 +386,55 @@ class Canvas:
         self._blit(x, y, ch, new_fg, new_bg, attrs)
 
     # ── primitives ──────────────────────────────────────────
+    def _erase_glyphs(self, x0: int, x1: int, y: int) -> bool:
+        """Blank the glyph plane over one row span.
+
+        Half of a double-width glyph that straddles either edge is blanked
+        too: an orphaned half would otherwise be drawn by the terminal over
+        whatever sits next to the span.  Returns True when anything changed.
+        """
+        frame = self._frame
+        start = y * self.width + x0
+        end = start + (x1 - x0)
+        span = x1 - x0
+        erased = False
+        if x0 > 0:
+            left = start - 1
+            if self._st[left] == frame and self._gw[left] == 2:
+                self._ch[left] = ' '
+                self._gw[left] = 1
+                erased = True
+        if x1 < self.width:
+            right = end
+            if self._st[right] == frame and self._fl[right] & _CONT:
+                self._ch[right] = ' '
+                self._fl[right] = 0
+                self._gw[right] = 1
+                erased = True
+        blank_chars = [' '] * span
+        if self._ch[start:end] != blank_chars:
+            self._ch[start:end] = blank_chars
+            erased = True
+        if self._fl[start:end].count(0) != span:
+            self._fl[start:end] = bytearray(span)
+            erased = True
+        if self._gw[start:end].count(1) != span:
+            self._gw[start:end] = bytearray([1]) * span
+            erased = True
+        self._fg[start:end] = [self._fg_blank] * span
+        self._at[start:end] = [0] * span
+        return erased
+
     def fill_rect(self, x: int, y: int, width: int, height: int,
-                  color: RGB, alpha: int = 255) -> None:
-        """Tint a rectangle.  Opaque fills touch only the surface plane."""
+                  color: RGB, alpha: int = 255,
+                  clear_text: bool = False) -> None:
+        """Tint a rectangle.
+
+        Opaque fills normally touch only the surface plane, so glyphs drawn
+        earlier stay on top.  ``clear_text`` blanks those glyphs as well; an
+        opaque panel uses it so the page underneath cannot show through its
+        body.
+        """
         if width <= 0 or height <= 0 or alpha <= 0:
             return
         x0 = max(x, self._cx0)
@@ -413,6 +459,8 @@ class Canvas:
             for row in range(y0, y1):
                 base = row * line + x0
                 end = base + span
+                if clear_text and self._erase_glyphs(x0, x1, row):
+                    touched[row] = 1
                 if min(stamps[base:end]) != frame:
                     self._ch[base:end] = [' '] * span
                     foregrounds[base:end] = [self._fg_blank] * span
@@ -660,7 +708,7 @@ class Canvas:
         if width < 2 or height < 2:
             return
         if bg is not None:
-            self.fill_rect(x, y, width, height, bg, alpha)
+            self.fill_rect(x, y, width, height, bg, alpha, clear_text=True)
         self.hline(x + 1, y, width - 2, border, alpha)
         self.hline(x + 1, y + height - 1, width - 2, border, alpha)
         self.vline(x, y + 1, height - 2, border, alpha)
