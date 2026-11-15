@@ -39,10 +39,15 @@ from adcode.tui.input import (
 from adcode.tui.markdown import MarkdownRenderer
 from adcode.tui.screen import TerminalScreen
 from adcode.tui.settings import SettingsOverlay
-from adcode.tui.text import Line, Span, add_span, line_width
+from adcode.tui.text import (
+    Line, Span, add_span, line_text_between, line_width, plain_text,
+    split_line_columns,
+)
 from adcode.tui.transcript import LiveRender, TranscriptRenderer
 
 SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+# A column past the end of a line, so a selection can run to its end.
+_ALL_COLUMNS = 1 << 30
 # Fallback frame rate when the configuration carries no value.
 _DEFAULT_FPS = 60
 # How long the event loop sleeps when there is nothing to draw. A keypress
@@ -257,6 +262,14 @@ class AdCodeApp:
         self.last_render = 0.0
         self._prompt_cache: tuple[tuple[Any, ...], tuple[list[Line], int, int]] | None = None
         self._snapshot_cache: AgentSnapshot | None = None
+        # A text selection in the transcript: the anchor and the active end
+        # are transcript coordinates, so the selection survives a scroll.
+        self._select_anchor: tuple[int, int] | None = None
+        self._select_end: tuple[int, int] | None = None
+        self._selecting = False
+        self._view_lines: list[Line] = []
+        self._view_start = 0
+        self._view_top = 0
         self._last_cursor: tuple[int, int] | None = None
         self._cursor_visible: bool | None = None
         self.last_interrupt = 0.0
@@ -764,6 +777,8 @@ class AdCodeApp:
                                   - max(1, self.config.ui.mouse_scroll_lines))
                 self.follow = self.scroll <= 0
                 self.dirty = True
+            elif event.action in ('press', 'move', 'release'):
+                self._handle_selection(event)
             return
         if event.kind == 'paste':
             self.prompt.insert(event.text)
@@ -797,6 +812,8 @@ class AdCodeApp:
             self.open_command_palette()
             return
         if key == 'ctrl+c':
+            if self._copy_selection():
+                return
             if self.prompt.selection()[0] != self.prompt.selection()[1]:
                 copied = self.prompt.copy()
                 if copied and not set_clipboard(copied):
@@ -1143,6 +1160,110 @@ class AdCodeApp:
         total = self._last_total or len(self._transcript_lines())
         return max(0, total - viewport)
 
+    # ── transcript selection ─────────────────────────────────
+    def _content_position(self, x: int, y: int) -> tuple[int, int] | None:
+        """Map a screen cell to a transcript line and a column in it.
+
+        The mouse reports 1-based cells, so the row and the column are moved
+        one to the left before they are used.
+        """
+        row = y - 1 - self._view_top
+        if row < 0 or row >= len(self._view_lines):
+            return None
+        line = self._view_lines[row]
+        column = x - 1 - _row_offset(line)
+        return self._view_start + row, max(0, column)
+
+    def _handle_selection(self, event: KeyEvent) -> None:
+        """Start, extend or end a text selection in the transcript."""
+        if event.action == 'press':
+            if event.button not in (0, -1):
+                return
+            position = self._content_position(event.x, event.y)
+            if position is None:
+                self._clear_selection()
+                self.dirty = True
+                return
+            self._select_anchor = position
+            self._select_end = position
+            self._selecting = True
+            self.dirty = True
+            return
+        if event.action == 'move':
+            if not self._selecting:
+                return
+            position = self._content_position(event.x, event.y)
+            if position is not None:
+                self._select_end = position
+                self.dirty = True
+            return
+        if event.action == 'release':
+            self._selecting = False
+            self.dirty = True
+
+    def _clear_selection(self) -> None:
+        self._select_anchor = None
+        self._select_end = None
+        self._selecting = False
+
+    def _selection_range(self) -> tuple[int, int, int, int] | None:
+        """The selected range as (start line, start column, end line, end column)."""
+        anchor = self._select_anchor
+        end = self._select_end
+        if anchor is None or end is None:
+            return None
+        if anchor == end:
+            return None
+        if anchor <= end:
+            return anchor[0], anchor[1], end[0], end[1]
+        return end[0], end[1], anchor[0], anchor[1]
+
+    def _row_selection(self, index: int) -> tuple[int, int] | None:
+        """The selected column range of one transcript line."""
+        selection = self._selection_range()
+        if selection is None:
+            return None
+        start_line, start_col, end_line, end_col = selection
+        if index < start_line or index > end_line:
+            return None
+        if index == start_line:
+            return start_col, end_col if index == end_line else _ALL_COLUMNS
+        if index == end_line:
+            return 0, end_col
+        return 0, _ALL_COLUMNS
+
+    def _selection_text(self) -> str:
+        """The text the selection covers."""
+        selection = self._selection_range()
+        if selection is None:
+            return ''
+        start_line, start_col, end_line, end_col = selection
+        lines = self._transcript_lines()
+        parts: list[str] = []
+        for index in range(max(0, start_line), min(end_line + 1, len(lines))):
+            line = lines[index]
+            if index == start_line and index == end_line:
+                parts.append(line_text_between(line, start_col, end_col))
+            elif index == start_line:
+                parts.append(line_text_between(line, start_col, _ALL_COLUMNS))
+            elif index == end_line:
+                parts.append(line_text_between(line, 0, end_col))
+            else:
+                parts.append(plain_text(line))
+        return '\n'.join(part.rstrip() for part in parts)
+
+    def _copy_selection(self) -> bool:
+        """Copy the selected transcript text; False when nothing is selected."""
+        text = self._selection_text()
+        if not text.strip():
+            return False
+        if not set_clipboard(text):
+            self.status_hint = 'the clipboard is not available'
+        else:
+            self.status_hint = f'copied {len(text)} characters'
+        self.dirty = True
+        return True
+
     def _prompt_rows(self, columns: int) -> tuple[list[Line], int, int]:
         """Wrap the input, reusing the previous result when nothing changed.
 
@@ -1235,12 +1356,16 @@ class AdCodeApp:
         self.scroll = 0 if self.follow else min(self.scroll, max_scroll)
         start = max(0, min(total - viewport_h - self.scroll, max_scroll))
         visible = lines[start:start + viewport_h]
+        self._view_lines = visible
+        self._view_start = start
+        self._view_top = transcript_top
         for index, line in enumerate(visible):
             # Tool call rows declare a bleed so their accent bar sits flush with
             # the left edge; the gutter inside the row keeps the text aligned.
             x = _row_offset(line)
+            selected = self._row_selection(start + index)
             self._draw_line(x, transcript_top + index, line,
-                            max(1, columns - x - 1))
+                            max(1, columns - x - 1), selected)
         self._draw_scrollbar(columns, transcript_top, viewport_h, total, start)
         self.canvas.hline(0, separator_y, columns, self.palette.border, alpha=110)
         for index, line in enumerate(visible_prompt):
@@ -1278,17 +1403,36 @@ class AdCodeApp:
         if payload or tail:
             self.screen.flush_frame(payload + tail)
 
-    def _draw_line(self, x: int, y: int, line: Line, width: int) -> None:
+    def _draw_line(self, x: int, y: int, line: Line, width: int,
+                   selection: tuple[int, int] | None = None) -> None:
         if not line:
             return
         cursor = x
-        for span in line:
+        if selection is None:
+            for span in line:
+                if cursor - x >= width:
+                    break
+                fg = self._color(span.fg, 'text')
+                bg = self._color(span.bg, None) if span.bg is not None else None
+                available = width - (cursor - x)
+                text = truncate_text(span.text, available)
+                if not text:
+                    continue
+                cursor += self.canvas.draw_text(cursor, y, text, fg, bg,
+                                                span.attrs, span.alpha)
+            return
+        start_col, end_col = selection
+        for piece, span, selected in split_line_columns(line, start_col, end_col):
             if cursor - x >= width:
                 break
-            fg = self._color(span.fg, 'text')
-            bg = self._color(span.bg, None) if span.bg is not None else None
+            if selected:
+                fg = self.palette.selection_fg
+                bg = self.palette.selection_bg
+            else:
+                fg = self._color(span.fg, 'text')
+                bg = self._color(span.bg, None) if span.bg is not None else None
             available = width - (cursor - x)
-            text = truncate_text(span.text, available)
+            text = truncate_text(piece, available)
             if not text:
                 continue
             cursor += self.canvas.draw_text(cursor, y, text, fg, bg,
@@ -1366,6 +1510,10 @@ class AdCodeApp:
             extras.append(f'{len(agents)} agent{"s" if len(agents) > 1 else ""}')
         if self.scroll > 0:
             extras.append(f'↑ {self.scroll} lines')
+        selected = self._selection_range()
+        if selected is not None:
+            length = len(self._selection_text())
+            extras.append(f'{length} selected · ctrl+c copies')
         if extras:
             x += self.canvas.draw_text(x, y, '  ·  ', self.palette.border)
             self.canvas.draw_text(x, y, '  ·  '.join(extras), self.palette.muted)

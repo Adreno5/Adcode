@@ -106,7 +106,7 @@ maximum output, vision support, tool calling, and reasoning efforts.
 | `up` / `down` | Prompt history, or navigate the `/` command palette |
 | `tab` | Complete the selected command |
 | `esc` | Interrupt the current turn, or close the palette/overlay |
-| `ctrl+c` | Copy selection, else clear the input, else interrupt; press twice on an empty prompt to exit |
+| `ctrl+c` | Copy the selected transcript text, else the input selection, else clear the input, else interrupt; press twice on an empty prompt to exit |
 | `ctrl+v`, `shift+insert` | Paste text, or attach a copied screenshot when the clipboard has no text |
 | `alt+v` | Attach the clipboard image, image path, or image URL to the message |
 | `ctrl+a` | Select all |
@@ -116,11 +116,19 @@ maximum output, vision support, tool calling, and reasoning efforts.
 | `ctrl+z` / `ctrl+y` | Undo / redo input edits |
 | `pgup` / `pgdn` | Scroll the transcript |
 | mouse wheel | Scroll the transcript |
+| mouse drag | Select text in the transcript |
 | `home` / `end` | Line start / end |
 | `ctrl+home` / `ctrl+end` | Input start / end |
 | `ctrl+l` | Redraw the screen |
 | `ctrl+p` | Open the command palette (type to filter, enter to run) |
 | `ctrl+q` | Quit |
+
+## Selecting text
+
+Drag with the mouse over the transcript to select text; `ctrl+c` copies the
+selection to the clipboard. The selection follows the content, so scrolling
+does not move it, and the footer shows how much is selected. Clicking outside
+the transcript clears it.
 
 ## Command palette
 

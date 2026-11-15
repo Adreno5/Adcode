@@ -216,8 +216,11 @@ class AppHarness:
                 return False
             if app.loop is None:
                 return not app.dirty
+            # The agent events the app has not picked up yet still change the
+            # screen, so the run is only over once the queue is empty and the
+            # frame that follows has been drawn.
             return (not app.loop.busy and app.loop._work.qsize() == 0
-                    and not app.dirty)
+                    and app.loop._events.empty() and not app.dirty)
 
         return self.wait_until(idle, timeout, 'the agent loop to become idle')
 
@@ -283,6 +286,12 @@ class AppHarness:
     def click(self, x: int = 10, y: int = 10) -> 'AppHarness':
         self._require_live()
         self.input.click(x, y)
+        return self
+
+    def drag(self, x1: int, y1: int, x2: int, y2: int,
+             button: int = 0) -> 'AppHarness':
+        self._require_live()
+        self.input.drag(x1, y1, x2, y2, button)
         return self
 
     def submit(self, text: str, *, expect_requests: int = 1,

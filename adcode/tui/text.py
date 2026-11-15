@@ -64,6 +64,44 @@ def line_width(line: Line) -> int:
     return sum(text_width(span.text) for span in line)
 
 
+def split_line_columns(line: Line, start_col: int, end_col: int
+                       ) -> list[tuple[str, Span, bool]]:
+    """Split a line into pieces and mark the ones inside a column range.
+
+    The columns are relative to the first cell of the line.  A wide glyph
+    covers two cells and is therefore selected as a whole.
+    """
+    pieces: list[tuple[str, Span, bool]] = []
+    column = 0
+    for span in line:
+        if not span.text:
+            continue
+        buffer = ''
+        inside: bool | None = None
+        for ch in span.text:
+            width = char_width(ch)
+            selected = column < end_col and column + width > start_col
+            if inside is None:
+                inside = selected
+                buffer = ch
+            elif selected == inside:
+                buffer += ch
+            else:
+                pieces.append((buffer, span, inside))
+                buffer = ch
+                inside = selected
+            column += width
+        if buffer:
+            pieces.append((buffer, span, bool(inside)))
+    return pieces
+
+
+def line_text_between(line: Line, start_col: int, end_col: int) -> str:
+    """The text of a line between two columns."""
+    return ''.join(piece for piece, _span, selected
+                   in split_line_columns(line, start_col, end_col) if selected)
+
+
 def trim_line(line: Line) -> Line:
     """Drop leading/trailing whitespace spans without touching interior."""
     if not line:

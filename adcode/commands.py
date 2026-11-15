@@ -96,6 +96,7 @@ def cmd_help(app: Any, args: str) -> None:
         'alt+v              attach the clipboard image to the message',
         'ctrl+a select all · ctrl+z undo · ctrl+y redo',
         'pgup / pgdn        scroll the transcript · mouse wheel scrolls too',
+        'mouse drag        select text in the transcript',
         'ctrl+home / end    jump in the input',
         'ctrl+p             open the command palette',
         'ctrl+q             quit',
