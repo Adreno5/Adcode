@@ -1,0 +1,20 @@
+feat: upload pasted images through the Files API
+
+The image part now carries a provider file id instead of the bytes.
+The first request that mentions an image uploads it once with the SDK
+files resource; the id is cached in sessions/images/files.json under
+provider|base_url so every later turn and every sub-agent reuses it.
+
+- responses: input_image with file_id
+- anthropic messages: image block with {"type": "file", "file_id": ...}
+- chat completions has no file id, so it still carries a data URL
+
+An endpoint that rejects the upload (third-party OpenAI-compatible
+servers usually do) is remembered as unsupported for that provider and
+the image is inlined instead, so nothing breaks or retries every turn.
+A 5xx or a network error is not remembered, so the next turn tries
+again. Warnings surface as transcript notices, once per provider.
+
+The test gateway now serves POST /files as multipart and records
+uploads, so both the file-id path and the fallback are covered over
+real HTTP.

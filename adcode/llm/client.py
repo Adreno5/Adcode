@@ -9,15 +9,15 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Generator
+from typing import Any, Callable, Generator
 
 import anthropic
 import openai
 
 from adcode.config import ModelConfig, ProviderConfig
 from adcode.images import (
-    anthropic_source, data_url, has_image_marker, image_marker, iter_segments,
-    resolve_image,
+    FileIdCache, ImageRef, anthropic_source, data_url, has_image_marker,
+    image_marker, iter_segments, resolve_image,
 )
 
 ChatEvent = dict[str, Any]
@@ -86,14 +86,17 @@ def _tool_call_payload(call_id: str, name: str, arguments: str) -> dict[str, Any
     return {'kind': 'tool_call', 'id': call_id, 'name': name, 'args': args}
 
 
-def _image_parts(text: Any, kind: str, base_dir: str = ''
+def _image_parts(text: Any, kind: str, base_dir: str = '',
+                 file_ids: Callable[[ImageRef], str] | None = None
                  ) -> list[dict[str, Any]] | None:
     """Replace ``[image: path]`` markers with native content parts.
 
     ``kind`` selects the wire dialect: ``image_url`` for chat completions,
-    ``input_image`` for the Responses API and ``anthropic`` for Messages.  The
-    bytes are read here, while the request is built, so base64 never enters the
-    stored conversation.
+    ``input_image`` for the Responses API and ``anthropic`` for Messages.
+    ``file_ids`` resolves an image to a Files API id; when it returns one the
+    part only references the id.  Otherwise the image is inlined, and the bytes
+    are read here, while the request is built, so base64 never enters the stored
+    conversation.
     """
     if not isinstance(text, str) or not has_image_marker(text):
         return None
@@ -110,14 +113,23 @@ def _image_parts(text: Any, kind: str, base_dir: str = ''
             # Keep the marker visible instead of silently dropping it.
             parts.append({'type': text_type, 'text': image_marker(chunk)})
             continue
+        file_id = ''
+        # Chat completions has no file id, so never spend an upload on it.
+        if kind != 'image_url' and file_ids is not None and ref.path is not None:
+            file_id = file_ids(ref) or ''
         replaced = True
         if kind == 'image_url':
             parts.append({'type': 'image_url', 'image_url': {'url': data_url(ref)}})
         elif kind == 'input_image':
-            parts.append({'type': 'input_image', 'image_url': data_url(ref),
-                          'detail': 'auto'})
+            if file_id:
+                parts.append({'type': 'input_image', 'file_id': file_id,
+                              'detail': 'auto'})
+            else:
+                parts.append({'type': 'input_image', 'image_url': data_url(ref),
+                              'detail': 'auto'})
         else:
-            parts.append({'type': 'image', 'source': anthropic_source(ref)})
+            parts.append({'type': 'image',
+                          'source': anthropic_source(ref, file_id)})
     return parts if replaced else None
 
 
@@ -130,6 +142,10 @@ class LLMClient:
         self.wire = provider.wire
         # Set by the loop; relative ``[image: ...]`` markers resolve against it.
         self.base_dir = ''
+        # Optional Files API cache and warning sink, also set by the loop.
+        self.file_cache: FileIdCache | None = None
+        self.warn: Callable[[str], None] | None = None
+        self._upload_notes: set[str] = set()
         headers = dict(provider.extra_headers) if provider.extra_headers else None
         if 'openai' in self.wire:
             self._client: Any = openai.OpenAI(
@@ -178,11 +194,93 @@ class LLMClient:
 
     def _responses_content(self, text: str) -> list[dict[str, Any]] | None:
         """Responses user content: ``input_text`` / ``input_image`` parts."""
-        return _image_parts(text, 'input_image', self.base_dir)
+        return _image_parts(text, 'input_image', self.base_dir, self._file_id)
 
     def _anthropic_content(self, text: str) -> list[dict[str, Any]] | None:
         """Messages user content: ``text`` / ``image`` blocks."""
-        return _image_parts(text, 'anthropic', self.base_dir)
+        return _image_parts(text, 'anthropic', self.base_dir, self._file_id)
+
+    # ── Files API ───────────────────────────────────────────
+    def _file_scope(self) -> str:
+        base = str(self.provider.base_url or '').rstrip('/')
+        return f'{self.provider.name}|{base}'
+
+    def _file_key(self, ref: ImageRef) -> str:
+        path = ref.path
+        if path is None:
+            return ''
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        return f'{resolved}|{ref.size}'
+
+    def _file_id(self, ref: ImageRef) -> str:
+        """Return the Files API id for an image, uploading it once.
+
+        An endpoint that rejects the upload is remembered in the cache, so the
+        first failure costs one request rather than one per turn; the caller
+        then falls back to an inline image.
+        """
+        cache = getattr(self, 'file_cache', None)
+        if cache is None or ref.path is None:
+            return ''
+        scope = self._file_scope()
+        key = self._file_key(ref)
+        if not key:
+            return ''
+        cached = cache.get_id(scope, key)
+        if cached:
+            return cached
+        if cache.unsupported(scope):
+            return ''
+        try:
+            file_id = self._upload(ref)
+        except Exception as error:
+            self._upload_failed(scope, error)
+            return ''
+        if not file_id:
+            self._upload_failed(scope, None)
+            return ''
+        cache.set_id(scope, key, file_id)
+        return file_id
+
+    def _upload(self, ref: ImageRef) -> str:
+        """Upload one image with the provider's Files API and return its id."""
+        upload = (ref.path.name, ref.path.read_bytes(), ref.media_type)
+        if self.wire == 'anthropic messages':
+            created = self._client.files.upload(file=upload)
+        else:
+            created = self._client.files.create(file=upload, purpose='vision')
+        return str(getattr(created, 'id', '') or '')
+
+    def _upload_failed(self, scope: str, error: Exception | None) -> None:
+        status = 0
+        if error is not None:
+            status = int(getattr(error, 'status_code', 0)
+                         or getattr(error, 'status', 0) or 0)
+        # Only a definite refusal means the endpoint has no Files API; a
+        # network blip or a 5xx should be retried on the next request.
+        if error is None or status in (400, 401, 403, 404, 405, 415, 501):
+            cache = getattr(self, 'file_cache', None)
+            if cache is not None:
+                cache.mark_unsupported(
+                    scope, str(error) if error is not None else 'upload rejected')
+            self._note(f'Files API unavailable at {scope}; images are sent inline.')
+        else:
+            self._note(f'Image upload failed ({error}); sending the image inline.')
+
+    def _note(self, text: str) -> None:
+        notes = self.__dict__.setdefault('_upload_notes', set())
+        if text in notes:
+            return
+        notes.add(text)
+        warn = getattr(self, 'warn', None)
+        if warn is not None:
+            try:
+                warn(text)
+            except Exception:
+                pass
 
     def _openai_chat_messages(self, messages: list[dict[str, Any]]
                               ) -> list[dict[str, Any]]:
@@ -299,7 +397,8 @@ class LLMClient:
                           effort: str, force: bool) -> Generator[ChatEvent, None, None]:
         kwargs: dict[str, Any] = {
             'model': model.id,
-            'input': self._to_responses_input(messages, self.base_dir),
+            'input': self._to_responses_input(messages, self.base_dir,
+                                              self._file_id),
             'instructions': system or None,
             'max_output_tokens': max_tokens,
             'stream': True,
@@ -426,7 +525,8 @@ class LLMClient:
             yield {'kind': 'finish', 'reason': 'incomplete'}
 
     @staticmethod
-    def _to_responses_input(messages: list[dict[str, Any]], base_dir: str = ''
+    def _to_responses_input(messages: list[dict[str, Any]], base_dir: str = '',
+                            file_ids: Callable[[ImageRef], str] | None = None,
                             ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         for message in messages:
@@ -439,7 +539,7 @@ class LLMClient:
                 })
                 continue
             content = message.get('content')
-            parts = (_image_parts(content, 'input_image', base_dir)
+            parts = (_image_parts(content, 'input_image', base_dir, file_ids)
                      if role == 'user' else None)
             if parts is not None:
                 result.append({'role': role, 'content': parts})
@@ -479,7 +579,8 @@ class LLMClient:
 
     # ── Anthropic messages ──────────────────────────────────
     @staticmethod
-    def _to_anthropic_msgs(messages: list[dict[str, Any]], base_dir: str = ''
+    def _to_anthropic_msgs(messages: list[dict[str, Any]], base_dir: str = '',
+                           file_ids: Callable[[ImageRef], str] | None = None,
                            ) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         pending_tool_results: list[dict[str, Any]] = []
@@ -553,7 +654,8 @@ class LLMClient:
                 merge('assistant', message.get('content'))
             elif role == 'user':
                 merge('user', _image_parts(message.get('content'), 'anthropic',
-                                           base_dir) or message.get('content'))
+                                           base_dir, file_ids)
+                      or message.get('content'))
         flush_tool_results()
         return out
 
@@ -563,7 +665,8 @@ class LLMClient:
                    effort: str, force: bool) -> Generator[ChatEvent, None, None]:
         kwargs: dict[str, Any] = {
             'model': model.id,
-            'messages': self._to_anthropic_msgs(messages, self.base_dir),
+            'messages': self._to_anthropic_msgs(messages, self.base_dir,
+                                                self._file_id),
             'max_tokens': max_tokens,
         }
         if system:

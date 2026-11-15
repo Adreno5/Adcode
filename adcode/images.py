@@ -10,16 +10,19 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import re
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 # The marker is the only thing stored in a message.  It survives sessions,
 # rewind, fork and compaction because it is plain text.
@@ -135,19 +138,89 @@ def data_url(ref: ImageRef) -> str:
     return f'data:{ref.media_type};base64,{encoded}'
 
 
-def anthropic_source(ref: ImageRef) -> dict[str, object]:
+def anthropic_source(ref: ImageRef, file_id: str = '') -> dict[str, object]:
     """Anthropic image source.
 
-    A local file is handed to the SDK as a ``Path``: the SDK reads and encodes
-    the bytes while serializing the request, so AdCode never holds base64.
+    A file uploaded to the Files API is referenced by id, so the request body
+    stays tiny.  Otherwise the SDK is handed the ``Path`` and reads and encodes
+    the bytes while serializing, so AdCode never holds base64 itself.
     """
     if ref.url:
         return {'type': 'url', 'url': ref.url}
+    if file_id:
+        return {'type': 'file', 'file_id': file_id}
     return {
         'type': 'base64',
         'media_type': ref.media_type,
         'data': ref.path,
     }
+
+
+class FileIdCache:
+    """Provider-scoped file ids issued by a provider's Files API.
+
+    Uploading is a network round trip, so ids are remembered on disk keyed by
+    the local image and the provider endpoint.  A provider that rejects the
+    upload is remembered too, so every later request does not retry it.
+    """
+
+    def __init__(self, path: str | os.PathLike[str]) -> None:
+        self.path = Path(path)
+        self._lock = threading.RLock()
+        self._data = self._load()
+
+    def _load(self) -> dict[str, Any]:
+        try:
+            raw = json.loads(self.path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _entry(self, scope: str) -> dict[str, Any]:
+        entry = self._data.get(scope)
+        if not isinstance(entry, dict):
+            entry = {}
+            self._data[scope] = entry
+        files = entry.get('files')
+        if not isinstance(files, dict):
+            entry['files'] = {}
+        return entry
+
+    def get_id(self, scope: str, key: str) -> str:
+        with self._lock:
+            value = self._entry(scope)['files'].get(key)
+            return str(value) if value else ''
+
+    def set_id(self, scope: str, key: str, file_id: str) -> None:
+        if not file_id:
+            return
+        with self._lock:
+            self._entry(scope)['files'][key] = file_id
+            self._save()
+
+    def unsupported(self, scope: str) -> bool:
+        with self._lock:
+            return bool(self._entry(scope).get('unsupported'))
+
+    def mark_unsupported(self, scope: str, reason: str = '') -> None:
+        with self._lock:
+            entry = self._entry(scope)
+            if entry.get('unsupported'):
+                return
+            entry['unsupported'] = True
+            if reason:
+                entry['reason'] = reason[:200]
+            self._save()
+
+    def _save(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temp = self.path.with_name(f'.{self.path.name}.tmp')
+            temp.write_text(json.dumps(self._data, ensure_ascii=False, indent=2),
+                            encoding='utf-8')
+            os.replace(temp, self.path)
+        except OSError:
+            pass
 
 
 class ImageStore:

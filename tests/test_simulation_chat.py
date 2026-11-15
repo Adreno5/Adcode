@@ -93,13 +93,23 @@ def test_alt_v_sends_a_native_image_part(harness_factory, wire):
 
     request = harness.requests[0]
     assert 'what is this?' in request.all_text
-    if wire == 'anthropic messages':
-        assert '"type": "image"' in request.all_text
-        assert '"media_type": "image/png"' in request.all_text
-    else:
+    if wire == 'openai chat completions':
+        # That wire has no file id, so the image is inlined.
+        assert harness.gateway.uploads == []
         assert 'data:image/png;base64,' in request.all_text
+    else:
+        # The image went through the Files API and the request only names it.
+        assert len(harness.gateway.uploads) == 1
+        upload = harness.gateway.uploads[0]
+        assert upload['mime_type'] == 'image/png'
+        assert upload['id'] in request.all_text
+        assert 'base64' not in request.all_text
+        kind = 'input_image' if wire == 'openai responses' else 'image'
+        assert f'"type": "{kind}"' in request.all_text
 
     # The stored history keeps the small marker, never the encoded bytes.
+    harness.wait_until(lambda: bool(harness.workspace.session_payload()),
+                       timeout=10.0, description='the saved session')
     session = harness.workspace.session_payload()
     assert session
     content = session['messages'][0]['content']

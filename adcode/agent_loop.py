@@ -20,7 +20,7 @@ from adcode.agents.manager import AgentManager
 from adcode.config import AppConfig, ModelConfig, ProviderConfig
 from adcode.diff import FileDiff
 from adcode.goals import GoalStore
-from adcode.images import has_image_marker, strip_image_markers
+from adcode.images import FileIdCache, has_image_marker, strip_image_markers
 from adcode.llm.client import LLMClient
 from adcode.llm.context import (
     ConversationContext, StablePrefix, TokenBudgetExceeded, stream_compact,
@@ -86,8 +86,10 @@ class AgentLoop:
         if selected is None:
             raise RuntimeError('no provider/model configured')
         self.provider, self.model = selected
-        self.client = LLMClient(self.provider)
-        self.client.base_dir = self.cwd
+        # Uploaded image ids are shared by the root loop and every sub-agent.
+        self.image_files = FileIdCache(os.path.join(self.cwd, 'sessions',
+                                                    'images', 'files.json'))
+        self.client = self._make_client(self.provider)
 
         self.system = build_system_prompt(config, goals, skills, cwd=self.cwd)
         schemas = registry.schemas(self.provider.wire)
@@ -128,6 +130,7 @@ class AgentLoop:
         self.agents = AgentManager(
             config, self.provider, self.model, self.system, self.context,
             registry, goal_store=goals, cwd=self.cwd,
+            file_cache=self.image_files,
         )
         if config.agents.enabled:
             self.registry.register_many(self.agents.tool_specs())
@@ -135,6 +138,14 @@ class AgentLoop:
 
         self._refresh_prefix(force=True)
         self.agents.update_root(self.context, self.provider, self.model, self.system)
+
+    def _make_client(self, provider: ProviderConfig) -> LLMClient:
+        """Build a client wired to the workspace, image store and UI notices."""
+        client = LLMClient(provider)
+        client.base_dir = self.cwd
+        client.file_cache = self.image_files
+        client.warn = lambda text: self._append_notice(text, level='warning')
+        return client
 
     # ── lifecycle ───────────────────────────────────────────
     def start(self) -> None:
@@ -920,8 +931,7 @@ class AgentLoop:
         with self._lock:
             self.provider = provider
             self.model = model
-            self.client = LLMClient(provider)
-            self.client.base_dir = self.cwd
+            self.client = self._make_client(provider)
             self.config.select(provider.name, model.id)
             self.session_name = payload.name if payload.name != LAST_SESSION else ''
             self.session_title = payload.title
@@ -1038,8 +1048,7 @@ class AgentLoop:
         with self._lock:
             self.provider = provider
             self.model = model
-            self.client = LLMClient(provider)
-            self.client.base_dir = self.cwd
+            self.client = self._make_client(provider)
             self.config.select(provider.name, model.id)
             self.context.stable_prefix = StablePrefix.create(
                 provider=provider.name, endpoint=provider.base_url,

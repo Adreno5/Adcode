@@ -37,8 +37,8 @@ whole screen is written to the terminal in one pass.
 - **Skills** -- scans `~/.agents/skills` (plus project and extra paths), gives
   the model a compact preview, and loads full instructions on demand.
 - **Image attachments** -- `alt+v` pastes a copied screenshot into the
-  message; the vision model receives it as a native image part on all three
-  wires. Images are stored as files, never as base64 in the history.
+  message. The image is uploaded through the provider's Files API once and
+  referenced by id; images are stored as files, never as base64 in the history.
 - **Session toolkit** -- rollback, edit-and-resend, fork, aside questions
   (`/btw`), durable goals, and automatic crash recovery.
 - **Single settings browser** -- `/config` exposes thinking display, tool
@@ -335,22 +335,32 @@ The marker is plain text, so it survives session save/load, rewind, edit and
 fork, and it costs almost nothing in the history.
 
 The marker is expanded into a native image part only while a request is being
-built:
+built, and the image is first uploaded through the provider's Files API:
 
-- **OpenAI Chat Completions** -- a user content array with `text` and
-  `image_url` parts carrying a data URL.
-- **OpenAI Responses** -- `input_text` and `input_image` parts with an
-  `image_url` (the API accepts base64 data URLs or a hosted URL).
-- **Anthropic Messages** -- `text` and `image` blocks. For local files AdCode
-  passes the path itself and the Anthropic SDK reads and base64-encodes it
-  while serializing, so the program never holds the encoded string.
+- **Upload once** -- `POST /files` through the SDK, then the returned id is
+  cached in `sessions/images/files.json` under `provider|base_url`, so the same
+  screenshot is uploaded a single time no matter how many turns mention it.
+- **OpenAI Responses** -- `input_text` and `input_image` parts; the image part
+  carries `file_id`.
+- **Anthropic Messages** -- `text` and `image` blocks with a
+  `{"type": "file", "file_id": ...}` source.
+- **OpenAI Chat Completions** -- this wire has no file id, so the part carries
+  a data URL. That is the only wire where base64 reaches the request body.
+
+An endpoint that rejects the upload (a 400/403/404 and friends, typical of
+third-party OpenAI-compatible servers) is recorded as unsupported and the image
+is inlined instead: `image_url` data URL for Responses, and a `Path` handed to
+the Anthropic SDK so it reads and encodes the bytes while serializing. AdCode
+never builds the base64 string itself. A 5xx or a network error is not
+remembered, so the next turn tries again.
 
 Base64 is therefore transient request data: it is never written to the session
 JSON, never shown in the transcript and never counted as context text. Each
 marker is estimated at about 1,200 tokens for compaction. `http(s)` URLs can be
-used instead of a local file and are passed through as image URLs, which needs
-no encoding at all. Providers that do not accept images will simply reject the
-request; models from models.dev are marked with vision support when known.
+used instead of a local file and are passed straight through as image URLs, with
+no upload and no encoding. Providers that do not accept images will simply
+reject the request; models from models.dev are marked with vision support when
+known.
 
 ## Rendering Architecture
 

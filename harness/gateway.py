@@ -42,6 +42,42 @@ class _Disconnected(Exception):
     """The script asked to drop the connection mid-stream."""
 
 
+def _multipart_file(raw: bytes, content_type: str) -> tuple[str, str, bytes]:
+    """Pull the first file part out of a multipart/form-data body."""
+    marker = 'boundary='
+    index = content_type.find(marker)
+    if index == -1 or not raw:
+        return '', '', raw
+    boundary = content_type[index + len(marker):].split(';')[0].strip().strip('"')
+    if not boundary:
+        return '', '', raw
+    delimiter = b'--' + boundary.encode('ascii', 'replace')
+    filename = ''
+    mime = 'application/octet-stream'
+    for part in raw.split(delimiter):
+        head, separator, body = part.partition(b'\r\n\r\n')
+        if not separator:
+            continue
+        if b'filename=' not in head:
+            continue
+        header_text = head.decode('utf-8', 'replace')
+        for line in header_text.split('\r\n'):
+            name, _, value = line.partition(':')
+            name = name.strip().lower()
+            value = value.strip()
+            if name == 'content-type':
+                mime = value or mime
+            elif name == 'content-disposition':
+                for token in value.split(';'):
+                    token = token.strip()
+                    if token.startswith('filename='):
+                        filename = token[len('filename='):].strip().strip('"')
+        if body.endswith(b'\r\n'):
+            body = body[:-2]
+        return filename, mime, body
+    return filename, mime, b''
+
+
 class _GatewayServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -77,6 +113,9 @@ class _GatewayHandler(BaseHTTPRequestHandler):
     # ── POST ───────────────────────────────────────────────
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         path = urlsplit(self.path).path
+        if path.rstrip('/').endswith('/files'):
+            self.gateway.handle_upload(self)
+            return
         wire = self.gateway.wire_for_path(path)
         if wire is None:
             self._send_json(404, {'error': {'message': f'unknown path {path}'}})
@@ -157,6 +196,9 @@ class FakeLLMGateway:
         self.port = port
         self.model_ids = list(models or ['harness-model', 'harness-model-mini'])
         self.requests: list[ModelRequest] = []
+        self.uploads: list[dict[str, Any]] = []
+        self.upload_attempts = 0
+        self.files_supported = True
         self.fail_next = 0
         self.fail_status = 500
         self._lock = threading.RLock()
@@ -165,6 +207,7 @@ class FakeLLMGateway:
         self._server: _GatewayServer | None = None
         self._thread: threading.Thread | None = None
         self._next_index = 0
+        self._upload_index = 0
 
     # ── lifecycle ──────────────────────────────────────────
     def start(self) -> 'FakeLLMGateway':
@@ -212,7 +255,10 @@ class FakeLLMGateway:
     def reset(self) -> None:
         with self._lock:
             self.requests.clear()
+            self.uploads.clear()
+            self.upload_attempts = 0
             self._next_index = 0
+            self._upload_index = 0
             self._release_pending = False
         if hasattr(self.responder, 'served'):
             self.responder.served = 0  # type: ignore[attr-defined]
@@ -252,6 +298,48 @@ class FakeLLMGateway:
         if path.endswith('/messages'):
             return 'anthropic messages'
         return None
+
+    # ── Files API ───────────────────────────────────────────
+    def handle_upload(self, handler: '_GatewayHandler') -> None:
+        """Accept a multipart upload and answer in the caller's file shape."""
+        try:
+            length = int(handler.headers.get('Content-Length') or 0)
+        except ValueError:
+            length = 0
+        with self._lock:
+            self.upload_attempts += 1
+        try:
+            # Read the body even when refusing, or the client sees a broken
+            # connection instead of the status code.
+            raw = handler.rfile.read(length) if length else b''
+        except OSError:
+            return
+        if not self.files_supported:
+            handler._send_json(404, {'error': {'message': 'files api disabled',
+                                               'type': 'not_found'}})
+            return
+        filename, mime, body = _multipart_file(raw,
+                                               handler.headers.get('Content-Type') or '')
+        with self._lock:
+            self._upload_index += 1
+            file_id = f'file-harness-{self._upload_index}'
+            self.uploads.append({
+                'id': file_id, 'filename': filename, 'mime_type': mime,
+                'data': body, 'bytes': len(body),
+            })
+        anthropic_shape = bool(handler.headers.get('anthropic-version'))
+        if anthropic_shape:
+            handler._send_json(200, {
+                'id': file_id, 'type': 'file', 'filename': filename,
+                'mime_type': mime, 'size_bytes': len(body),
+                'created_at': '2026-01-01T00:00:00Z', 'downloadable': False,
+            })
+        else:
+            handler._send_json(200, {
+                'id': file_id, 'object': 'file', 'bytes': len(body),
+                'created_at': 1767225600, 'filename': filename,
+                'purpose': 'vision',
+            })
 
     def models_payload(self, path: str = '') -> dict[str, Any]:
         # A superset of the OpenAI and Anthropic list shapes: both SDKs read

@@ -167,6 +167,142 @@ def test_url_image_needs_no_local_file(tmp_path):
                                    'url': 'https://example.com/cat.png'}
 
 
+# ── Files API ──────────────────────────────────────────────
+
+
+class FakeFilesClient:
+    """Stands in for the SDK client and its ``files`` resource."""
+
+    def __init__(self, file_id: str = 'file-123', error: Exception | None = None):
+        self.files = self
+        self.file_id = file_id
+        self.error = error
+        self.uploads: list[tuple] = []
+
+    def create(self, *, file, purpose):
+        return self.upload(file=file, purpose=purpose)
+
+    def upload(self, *, file, purpose=''):
+        if self.error is not None:
+            raise self.error
+        self.uploads.append(file)
+        return _FakeFile(self.file_id)
+
+
+class _FakeFile:
+    def __init__(self, file_id: str) -> None:
+        self.id = file_id
+
+
+class _StatusError(Exception):
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f'status {status_code}')
+        self.status_code = status_code
+
+
+def make_client(tmp_path, wire='anthropic messages', sdk=None) -> LLMClient:
+    from adcode.config import ModelConfig, ProviderConfig
+
+    provider = ProviderConfig(
+        name='Files', base_url='http://localhost:9999/v1', api_key='k',
+        wire=wire, models=[ModelConfig(id='harness-model')])
+    client = LLMClient(provider)
+    client.base_dir = str(tmp_path)
+    client.file_cache = images.FileIdCache(tmp_path / 'files.json')
+    client._client = sdk if sdk is not None else FakeFilesClient()
+    return client
+
+
+def test_file_id_cache_roundtrip(tmp_path):
+    cache = images.FileIdCache(tmp_path / 'images' / 'files.json')
+    assert cache.get_id('scope', 'key') == ''
+    cache.set_id('scope', 'key', 'file-1')
+    assert cache.get_id('scope', 'key') == 'file-1'
+    assert not cache.unsupported('scope')
+    cache.mark_unsupported('scope', 'no endpoint')
+    reloaded = images.FileIdCache(tmp_path / 'images' / 'files.json')
+    assert reloaded.get_id('scope', 'key') == 'file-1'
+    assert reloaded.unsupported('scope')
+    assert reloaded.get_id('other', 'key') == ''
+
+
+def test_images_upload_once_and_are_referenced_by_id(tmp_path):
+    store = images.ImageStore(tmp_path / 'images', tmp_path)
+    reference = store.save(sample_png())
+    text = f'look [image: {reference}] please'
+    sdk = FakeFilesClient('file-abc')
+    client = make_client(tmp_path, sdk=sdk)
+
+    first = client._anthropic_content(text)
+    assert first[1]['source'] == {'type': 'file', 'file_id': 'file-abc'}
+    assert 'base64' not in str(first)
+    second = client._anthropic_content(text)
+    assert second[1]['source'] == {'type': 'file', 'file_id': 'file-abc'}
+    assert len(sdk.uploads) == 1, 'the id is cached, not re-uploaded'
+    name, data, mime = sdk.uploads[0]
+    assert name.startswith('paste-') and name.endswith('.png')
+    assert data == sample_png()
+    assert mime == 'image/png'
+
+
+def test_responses_use_file_id_too(tmp_path):
+    store = images.ImageStore(tmp_path / 'images', tmp_path)
+    reference = store.save(sample_png())
+    sdk = FakeFilesClient('file-resp')
+    client = make_client(tmp_path, wire='openai responses', sdk=sdk)
+
+    parts = client._responses_content(f'see [image: {reference}]')
+    assert parts[1] == {'type': 'input_image', 'file_id': 'file-resp',
+                        'detail': 'auto'}
+
+
+def test_chat_completions_never_uses_a_file_id(tmp_path):
+    store = images.ImageStore(tmp_path / 'images', tmp_path)
+    reference = store.save(sample_png())
+    sdk = FakeFilesClient('file-chat')
+    client = make_client(tmp_path, wire='openai chat completions', sdk=sdk)
+
+    parts = client._chat_content(f'see [image: {reference}]')
+    assert parts[1]['image_url']['url'].startswith('data:image/png;base64,')
+    assert sdk.uploads == [], 'chat completions has no file id to send'
+
+
+def test_rejected_upload_falls_back_and_is_not_retried(tmp_path):
+    store = images.ImageStore(tmp_path / 'images', tmp_path)
+    reference = store.save(sample_png())
+    warnings: list[str] = []
+    sdk = FakeFilesClient(error=_StatusError(404))
+    client = make_client(tmp_path, sdk=sdk)
+    client.warn = warnings.append
+
+    first = client._anthropic_content(f'see [image: {reference}]')
+    assert first[1]['source']['type'] == 'base64'
+    assert warnings and 'Files API unavailable' in warnings[0]
+
+    second = client._anthropic_content(f'again [image: {reference}]')
+    assert second[1]['source']['type'] == 'base64'
+    assert len(sdk.uploads) == 0 and sdk.error is not None
+    assert len(warnings) == 1, 'the warning is reported once, not per turn'
+    # The provider stays marked so no later turn probes it again.
+    assert client.file_cache.unsupported(client._file_scope())
+
+
+def test_transient_upload_failure_is_retried(tmp_path):
+    store = images.ImageStore(tmp_path / 'images', tmp_path)
+    reference = store.save(sample_png())
+    sdk = FakeFilesClient(error=_StatusError(503))
+    client = make_client(tmp_path, sdk=sdk)
+    client.warn = lambda text: None
+
+    first = client._anthropic_content(f'see [image: {reference}]')
+    assert first[1]['source']['type'] == 'base64'
+    assert not client.file_cache.unsupported(client._file_scope())
+    sdk.error = None
+    client._client = sdk
+    second = client._anthropic_content(f'see [image: {reference}]')
+    assert second[1]['source'] == {'type': 'file', 'file_id': 'file-123'}
+
+
 def test_token_estimate_counts_images():
     marker = '[image: sessions/images/paste-123.png]'
     with_image = estimate_tokens({'role': 'user', 'content': marker})

@@ -166,6 +166,63 @@ def test_gateway_receives_a_native_image_part(gateway, wire, tmp_path):
         assert base64.b64decode(source['data']) == images.encode_png(1, 1, pixels)
 
 
+@pytest.mark.parametrize('wire', ['openai responses', 'anthropic messages'])
+def test_images_are_uploaded_and_referenced_by_file_id(gateway, wire, tmp_path):
+    gateway.responder = ScriptedResponder([Turn(text='seen')])
+    pixels = bytes([255, 0, 0, 255])
+    payload = images.encode_png(1, 1, pixels)
+    (tmp_path / 'shot.png').write_bytes(payload)
+    client = LLMClient(provider(gateway.base_url, wire))
+    client.base_dir = str(tmp_path)
+    client.file_cache = images.FileIdCache(tmp_path / 'files.json')
+    collect(client, wire, [{'role': 'user',
+                            'content': 'look [image: shot.png] here'}])
+
+    assert len(gateway.uploads) == 1
+    upload = gateway.uploads[0]
+    assert upload['mime_type'] == 'image/png'
+    assert upload['data'] == payload
+    assert upload['id'].startswith('file-harness-')
+
+    body = gateway.requests[0].body
+    assert 'base64' not in json.dumps(body), 'the image is not inlined'
+    if wire == 'openai responses':
+        parts = body['input'][-1]['content']
+        assert parts[1]['type'] == 'input_image'
+        assert parts[1]['file_id'] == upload['id']
+    else:
+        blocks = body['messages'][0]['content']
+        assert blocks[1]['type'] == 'image'
+        assert blocks[1]['source'] == {'type': 'file', 'file_id': upload['id']}
+
+    # A second request reuses the id instead of uploading again.
+    collect(client, wire, [{'role': 'user',
+                            'content': 'and [image: shot.png] again'}])
+    assert gateway.upload_attempts == 1
+
+
+@pytest.mark.parametrize('wire', ['openai responses', 'anthropic messages'])
+def test_a_provider_without_a_files_api_still_gets_the_image(gateway, wire,
+                                                             tmp_path):
+    gateway.responder = ScriptedResponder([Turn(text='seen')])
+    gateway.files_supported = False
+    (tmp_path / 'shot.png').write_bytes(images.encode_png(1, 1, bytes([1, 2, 3, 255])))
+    client = LLMClient(provider(gateway.base_url, wire))
+    client.base_dir = str(tmp_path)
+    client.file_cache = images.FileIdCache(tmp_path / 'files.json')
+    warnings: list[str] = []
+    client.warn = warnings.append
+    collect(client, wire, [{'role': 'user', 'content': 'see [image: shot.png]'}])
+
+    body = json.dumps(gateway.requests[0].body)
+    assert 'base64' in body or wire == 'anthropic messages'
+    assert 'file-harness' not in body
+    assert warnings and 'Files API unavailable' in warnings[0]
+    assert client.file_cache.unsupported(client._file_scope())
+    collect(client, wire, [{'role': 'user', 'content': 'see [image: shot.png]'}])
+    assert gateway.upload_attempts == 1, 'a refused endpoint is not probed again'
+
+
 @pytest.mark.parametrize('wire', WIRES)
 def test_gateway_lists_models(gateway, wire):
     client = LLMClient(provider(gateway.base_url, wire))

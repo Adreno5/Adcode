@@ -25,6 +25,7 @@ from typing import Any, Callable, Iterator
 from adcode.config import AgentTypeConfig, AppConfig, ModelConfig, ProviderConfig
 from adcode.diff import FileDiff
 from adcode.goals import GoalStore
+from adcode.images import FileIdCache
 from adcode.llm.client import LLMClient
 from adcode.llm.context import (
     ConversationContext, StablePrefix, stream_compact,
@@ -108,12 +109,13 @@ class AgentManager:
                  system: str, root_context: ConversationContext,
                  registry: ToolRegistry, *, goal_store: GoalStore | None = None,
                  event_sink: Callable[[AgentEvent], None] | None = None,
-                 cwd: str = '') -> None:
+                 cwd: str = '', file_cache: FileIdCache | None = None) -> None:
         self.config = config
         self.goal_store = goal_store
         self.registry = registry
         self.event_sink = event_sink
         self.cwd = cwd or '.'
+        self.file_cache = file_cache
         self._lock = threading.RLock()
         self._activity = threading.Condition(self._lock)
         self._events: 'queue.SimpleQueue[AgentEvent]' = queue.SimpleQueue()
@@ -746,6 +748,7 @@ class AgentManager:
         context.stage({'role': 'user', 'content': task})
         client = LLMClient(scope.provider)
         client.base_dir = self.cwd
+        client.file_cache = self.file_cache
         last_answer = ''
         answer = ''
         turns = 0
