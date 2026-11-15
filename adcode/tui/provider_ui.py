@@ -9,7 +9,7 @@ from adcode.config import ModelConfig, ProviderConfig
 from adcode.llm.client import fetch_model_ids
 from adcode.models_dev import get_catalog, wait_for_fetch
 from adcode.theme import Palette
-from adcode.tui.canvas import BOLD, Canvas, truncate_text
+from adcode.tui.canvas import BOLD, Canvas, text_width, truncate_text
 from adcode.tui.dialogs import (
     DialogItem, MessageDialog, MultiSelectDialog, Overlay,
     _draw_backdrop, _draw_frame, _draw_hint,
@@ -156,21 +156,23 @@ class ModelEditorOverlay(Overlay):
     def _apply_edit(self) -> None:
         key, _label, kind = self._fields[self.index]
         text = self.edit_text.strip()
-        try:
-            if kind == 'number':
+        if kind == 'number':
+            try:
                 value = int(text)
-                if key == 'context_window':
-                    value = max(1_024, min(10_000_000, value))
-                else:
-                    value = max(256, min(2_000_000, value))
-                setattr(self.model, key, value)
-                self.model.source = 'custom'
-            elif kind == 'list':
-                values = [item.strip() for item in text.split(',') if item.strip()]
-                self.model.reasoning_efforts = values
-                self.model.source = 'custom'
-        except ValueError:
-            self.edit_text = ''
+            except ValueError:
+                # Keep the editor open so the value can be corrected.
+                return
+            if key == 'context_window':
+                value = max(1_024, min(10_000_000, value))
+            else:
+                value = max(256, min(2_000_000, value))
+            setattr(self.model, key, value)
+            self.model.source = 'custom'
+        elif kind == 'list':
+            values = [item.strip() for item in text.split(',') if item.strip()]
+            self.model.reasoning_efforts = values
+            self.model.source = 'custom'
+        self.edit_text = ''
         self.editing = False
 
     def render(self, canvas: Canvas, width: int, height: int,
@@ -194,9 +196,9 @@ class ModelEditorOverlay(Overlay):
             value = self._display(key)
             if self.editing and index == self.index:
                 value = self.edit_text + '█'
-            value_x = x + w - 3 - len(value)
+            value_x = x + w - 3 - text_width(value)
             canvas.draw_text(max(x + 30, value_x), row_y,
-                             truncate_text(value, max(8, x + w - 4 - (x + 30))),
+                             truncate_text(value, max(8, x + w - 4 - max(x + 30, value_x))),
                              palette.subtext, bg)
         _draw_hint(canvas, x, y + h - 2, w,
                    '↑↓ move · enter toggle/edit · ←→ change · ctrl+s save · esc close',
@@ -457,8 +459,16 @@ class ProviderWizard:
             return
         if step == 2:
             def submit(value: str) -> None:
-                if value.strip():
-                    provider.name = value.strip()
+                name = value.strip()
+                if name and name != provider.name:
+                    old_name = provider.name
+                    if self.app.config.provider_by_name(name) is not None:
+                        name = self._unique_name(name)
+                    provider.name = name
+                    # Keep the selection pointing at the renamed provider.
+                    selected = self.app.config.selected_model
+                    if '::' in selected and selected.rsplit('::', 1)[0] == old_name:
+                        self.app.config.select(name, selected.rsplit('::', 1)[1])
                 self._edit_details(provider, 3)
             self.app.open_text_prompt('Edit provider · 3/4', 'Display name',
                                       provider.name, submit)

@@ -137,7 +137,10 @@ def default_skill_roots(settings: SkillsSettings, cwd: str | None = None) -> lis
     unique: list[Path] = []
     seen: set[str] = set()
     for root in roots:
-        key = str(root.resolve()).lower()
+        try:
+            key = str(root.expanduser().resolve()).lower()
+        except (OSError, RuntimeError):
+            key = str(root).lower()
         if key in seen:
             continue
         seen.add(key)

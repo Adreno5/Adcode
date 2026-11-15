@@ -517,6 +517,15 @@ class ConfirmDialog(Overlay):
         self.on_result = on_result
 
     def handle(self, event: KeyEvent) -> bool:
+        # Printable letters arrive as text events; accept y/n there too.
+        if event.kind == 'text':
+            if event.text.lower() == 'y':
+                self.closed = True
+                self.on_result(True)
+            elif event.text.lower() == 'n':
+                self.closed = True
+                self.on_result(False)
+            return True
         if event.kind == 'key':
             if event.key in ('enter', 'y'):
                 self.closed = True

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from adcode.theme import RGB
-from adcode.tui.canvas import char_width, text_width
+from adcode.tui.canvas import char_width, is_control, text_width
 
 
 @dataclass
@@ -91,13 +91,20 @@ def truncate_line(line: Line, width: int, ellipsis: str = '') -> Line:
     for span in line:
         if used >= budget:
             break
-        text = ''
-        for ch in span.text:
-            size = char_width(ch)
-            if used + size > budget:
-                break
-            text += ch
-            used += size
+        source = span.text
+        room = budget - used
+        if source.isascii() and source.isprintable():
+            # One cell per byte: the cut point is an index, not a scan.
+            text = source[:room]
+            used += len(text)
+        else:
+            text = ''
+            for ch in source:
+                size = char_width(ch)
+                if used + size > budget:
+                    break
+                text += ch
+                used += size
         if text:
             add_span(result, Span(text, span.fg, span.bg, span.attrs, span.alpha))
         if used >= budget:
@@ -108,34 +115,85 @@ def truncate_line(line: Line, width: int, ellipsis: str = '') -> Line:
 
 
 def wrap_line(line: Line, width: int, first_width: int | None = None) -> list[Line]:
-    """Wrap a styled line into visual rows of at most ``width`` cells."""
+    """Wrap a styled line into visual rows of at most ``width`` cells.
+
+    Wrapping is cell-exact, not word-aware, so the cost is dominated by the
+    number of glyphs.  Two paths keep that cost off the hot loop:
+
+    * a printable-ASCII span is one cell per byte, so a whole cut is an index
+      arithmetic step and produces at most one span per visual row instead of
+      one span (and one ``add_span`` merge test) per character;
+    * anything else -- CJK, emoji, combining marks, control characters -- runs
+      the glyph-by-glyph path, but collects glyphs in a local buffer so the
+      span is still appended once per row segment rather than once per glyph.
+    """
     width = max(1, width)
     rows: list[Line] = []
     current: Line = []
     current_width = 0
     limit = width if first_width is None else max(1, first_width)
+
     for span in line:
-        for ch in span.text:
+        source = span.text
+        if not source:
+            continue
+        fg, bg, attrs, alpha = span.fg, span.bg, span.attrs, span.alpha
+        if source.isascii() and source.isprintable():
+            # Fast path: every glyph is exactly one cell wide.
+            text = source
+            while text:
+                room = limit - current_width
+                if room <= 0:
+                    rows.append(current)
+                    current = []
+                    current_width = 0
+                    limit = width
+                    continue
+                if len(text) <= room:
+                    add_span(current, Span(text, fg, bg, attrs, alpha))
+                    current_width += len(text)
+                    break
+                add_span(current, Span(text[:room], fg, bg, attrs, alpha))
+                text = text[room:]
+                rows.append(current)
+                current = []
+                current_width = 0
+                limit = width
+            continue
+        buffer = ''
+        for ch in source:
+            if is_control(ch):
+                continue
             size = char_width(ch)
             if size == 0:
                 # Combining marks attach to the last character.
-                if current and current[-1].text:
+                if buffer:
+                    buffer += ch
+                elif current and current[-1].text:
                     current[-1].text += ch
                 elif rows and rows[-1]:
                     rows[-1][-1].text += ch
                 continue
             if current_width and current_width + size > limit:
+                if buffer:
+                    add_span(current, Span(buffer, fg, bg, attrs, alpha))
+                    buffer = ''
                 rows.append(current)
                 current = []
                 current_width = 0
                 limit = width
-            if not current and size > limit:
+            if not current_width and size > limit:
                 # A double-width glyph cannot fit here; place it anyway.
-                add_span(current, Span(ch, span.fg, span.bg, span.attrs, span.alpha))
+                if buffer:
+                    add_span(current, Span(buffer, fg, bg, attrs, alpha))
+                    buffer = ''
+                add_span(current, Span(ch, fg, bg, attrs, alpha))
                 current_width += size
                 continue
-            add_span(current, Span(ch, span.fg, span.bg, span.attrs, span.alpha))
+            buffer += ch
             current_width += size
+        if buffer:
+            add_span(current, Span(buffer, fg, bg, attrs, alpha))
     if current or not rows:
         rows.append(current)
     return rows

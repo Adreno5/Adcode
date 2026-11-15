@@ -7,3 +7,4 @@ sessions/
 config.json
 .ruff_cache/
 .mypy_cache/
+harness-output/

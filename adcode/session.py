@@ -111,8 +111,9 @@ class SessionPayload:
             raw_messages = [raw_messages]
         if not isinstance(raw_messages, list):
             raw_messages = []
+        # A message without a role cannot be sent to any provider.
         messages = [dict(message) for message in raw_messages
-                    if isinstance(message, dict)]
+                    if isinstance(message, dict) and message.get('role')]
         if not items and messages:
             items = _items_from_legacy_messages(messages)
         raw_archive = raw.get('compaction_archive')
@@ -278,10 +279,14 @@ class SessionStore:
         return rows
 
     def latest(self) -> SessionPayload | None:
-        payload = self.load(LAST_SESSION)
-        if payload is not None:
+        checkpoint = self.path_for(LAST_SESSION)
+        if checkpoint.exists():
+            payload = self.load(LAST_SESSION)
             # An explicitly cleared checkpoint must not fall through to an old
-            # named session and resurrect the cleared conversation.
+            # named session and resurrect the cleared conversation, and neither
+            # must a corrupt one.
+            if payload is None:
+                return None
             return payload if payload.messages else None
         rows = self.list()
         if not rows:

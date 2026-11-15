@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 from adcode.diff import FileDiff, format_diff_for_model, make_file_diff, snapshot_file
 from adcode.tools.builtin import builtin_tools
+from adcode.tools.runtime import resolve_path
 
 
 @dataclass(frozen=True)
@@ -104,7 +105,11 @@ class ToolRegistry:
         spec = self.get(name)
         if spec is None:
             return ToolResult(f'Error: unknown tool: {name}', error=True)
-        path = str(args.get('path', '')) if name in {'write', 'edit'} else ''
+        # Snapshot the file the tool will actually touch: paths resolve against
+        # the tool context's working directory, not the process cwd.  The diff
+        # keeps the path the model asked for so prompts stay readable.
+        raw_path = str(args.get('path', '')) if name in {'write', 'edit'} else ''
+        path = resolve_path(raw_path) if raw_path else ''
         before = snapshot_file(path) if path else None
         try:
             text = spec.handler(args)
@@ -113,7 +118,7 @@ class ToolRegistry:
         file_diff = None
         if before is not None and path:
             after = snapshot_file(path)
-            file_diff = make_file_diff(path, before, after)
+            file_diff = make_file_diff(raw_path, before, after)
         if file_diff is not None and not text.startswith('Error:'):
             text += format_diff_for_model(file_diff)
         return ToolResult(text, file_diff, text.startswith('Error:'))

@@ -22,6 +22,14 @@ _HR_RE = re.compile(r'^\s*(?:-{3,}|\*{3,}|_{3,})\s*$')
 _FENCE_RE = re.compile(r'^(`{3,})\s*([^`]*)$')
 _LINK_RE = re.compile(r'!?\[([^\]]*)\]\(([^)\s]+)(?:\s+["\'][^"\']*["\'])?\)')
 _REF_LINK_RE = re.compile(r'!?\[([^\]]+)\]\[([^\]]*)\]')
+# Everything ``_parse_inline`` dispatches on.  Plain prose between two special
+# characters is the overwhelming majority of a markdown stream, so the scanner
+# jumps over it in one slice instead of walking it one character at a time.
+_INLINE_SPECIAL_RE = re.compile(r'[\\`\[<!*_~=$]')
+# First glyph of every block-level construct the renderer recognises: heading,
+# table, fence, bullet/task, horizontal rule, quote, ordered list.  A line that
+# starts with anything else is a plain paragraph.
+_BLOCK_LEAD = frozenset('#|`-+*_>0123456789')
 
 
 def _text_role(role: str | None = 'text') -> str | None:
@@ -29,18 +37,38 @@ def _text_role(role: str | None = 'text') -> str | None:
 
 
 def _parse_inline(text: str, base: str | None = None) -> Line:
-    """Parse emphasis, code, links and math into styled spans."""
+    """Parse emphasis, code, links, HTML-ish tags and math into styled spans."""
     spans: Line = []
     buffer = ''
     index = 0
+    state = {'bold': False, 'italic': False, 'underline': False}
+
+    def current_attrs() -> int:
+        attrs = 0
+        if state['bold']:
+            attrs |= BOLD
+        if state['italic']:
+            attrs |= ITALIC
+        if state['underline']:
+            attrs |= UNDERLINE
+        return attrs
 
     def flush() -> None:
         nonlocal buffer
         if buffer:
-            add_span(spans, Span(buffer, base))
+            add_span(spans, Span(buffer, base, attrs=current_attrs()))
             buffer = ''
 
     while index < len(text):
+        # Jump straight to the next character that can start markup; anything
+        # before it is literal text and can be taken in one slice.
+        special = _INLINE_SPECIAL_RE.search(text, index)
+        if special is None:
+            buffer += text[index:]
+            break
+        if special.start() > index:
+            buffer += text[index:special.start()]
+            index = special.start()
         ch = text[index]
         if ch == '\\' and index + 1 < len(text):
             buffer += text[index + 1]
@@ -79,22 +107,35 @@ def _parse_inline(text: str, base: str | None = None) -> Line:
             end = text.find('>', index + 1)
             if end != -1:
                 tag = text[index + 1:end].strip().lower()
-                if tag in ('br', 'br/'):
+                closing = tag.startswith('/')
+                name = tag.lstrip('/').strip()
+                if name in ('br', 'br/'):
                     flush()
                     buffer += ' '
-                elif tag in ('b', 'strong'):
+                elif name in ('b', 'strong'):
                     flush()
-                    add_span(spans, Span('', attrs=BOLD))
-                elif tag in ('i', 'em'):
+                    state['bold'] = not closing
+                elif name in ('i', 'em'):
                     flush()
-                    add_span(spans, Span('', attrs=ITALIC))
-                elif tag in ('u',):
+                    state['italic'] = not closing
+                elif name in ('u',):
                     flush()
-                    add_span(spans, Span('', attrs=UNDERLINE))
+                    state['underline'] = not closing
                 index = end + 1
                 continue
 
         if ch in '*_~=':
+            triple = ch * 3
+            if ch in '*_' and text.startswith(triple, index):
+                end = text.find(triple, index + 3)
+                if end != -1 and end > index + 3:
+                    flush()
+                    inner = text[index + 3:end]
+                    for span in _parse_inline(inner, base):
+                        span.attrs |= BOLD | ITALIC | current_attrs()
+                        add_span(spans, span)
+                    index = end + 3
+                    continue
             marker = ch * 2
             if text.startswith(marker, index) and ch != '=':
                 end = text.find(marker, index + 2)
@@ -103,7 +144,7 @@ def _parse_inline(text: str, base: str | None = None) -> Line:
                     attrs = STRIKE if ch == '~' else BOLD
                     inner = text[index + 2:end]
                     for span in _parse_inline(inner, base):
-                        span.attrs |= attrs
+                        span.attrs |= attrs | current_attrs()
                         add_span(spans, span)
                     index = end + 2
                     continue
@@ -123,7 +164,7 @@ def _parse_inline(text: str, base: str | None = None) -> Line:
                         flush()
                         inner = text[index + 1:end]
                         for span in _parse_inline(inner, base):
-                            span.attrs |= ITALIC
+                            span.attrs |= ITALIC | current_attrs()
                             add_span(spans, span)
                         index = end + 1
                         continue
@@ -230,14 +271,20 @@ class MarkdownRenderer:
             self._flush_table()
             # fall through to normal processing of this line
 
-        fence = _FENCE_RE.match(line.strip())
-        if fence:
-            self._mode = 'fence'
-            self._fence_ticks = len(fence.group(1))
-            self._fence_lang = fence.group(2).strip()
-            self._fence_lines = []
-            return
-        if _row_cells(line):
+        stripped = line.strip()
+        lead = stripped[:1]
+        # Only a fence or a table row can claim a line before the block pass,
+        # and both announce themselves in the first glyph; skip the regexes
+        # entirely for the ordinary prose that makes up most of a transcript.
+        if lead == '`':
+            fence = _FENCE_RE.match(stripped)
+            if fence:
+                self._mode = 'fence'
+                self._fence_ticks = len(fence.group(1))
+                self._fence_lang = fence.group(2).strip()
+                self._fence_lines = []
+                return
+        elif lead == '|' and _row_cells(line):
             self._mode = 'table'
             self._table_lines = [line]
             return
@@ -272,15 +319,20 @@ class MarkdownRenderer:
         text = raw.expandtabs(4)
         available = max(1, self.width - 2)
         line: Line = [Span('│ ', 'muted')]
-        used = 0
-        pieces: list[tuple[str, int]] = []
-        for ch in text:
-            size = char_width(ch)
-            if used + size > available:
-                break
-            pieces.append((ch, size))
-            used += size
-        chunk = ''.join(ch for ch, _ in pieces)
+        if text.isascii() and text.isprintable():
+            # One cell per byte: no glyph scan needed for the common case.
+            chunk = text[:available]
+            used = len(chunk)
+        else:
+            used = 0
+            pieces: list[str] = []
+            for ch in text:
+                size = char_width(ch)
+                if used + size > available:
+                    break
+                pieces.append(ch)
+                used += size
+            chunk = ''.join(pieces)
         add_span(line, Span(chunk, 'subtext', 'panel'))
         padding = self.width - 2 - used
         if padding > 0:
@@ -290,6 +342,11 @@ class MarkdownRenderer:
     def _render_normal_line(self, line: str, final: bool = True) -> list[Line]:
         if not line.strip():
             return [[]]
+        lead = line.lstrip()[:1]
+        if lead not in _BLOCK_LEAD:
+            # Ordinary prose: no block marker can match, so go straight to the
+            # inline scanner instead of walking six regexes.
+            return [_parse_inline(line)]
         heading = _HEADING_RE.match(line)
         if heading:
             level = len(heading.group(1))

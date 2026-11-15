@@ -80,12 +80,15 @@ class TerminalScreen:
     def size(self) -> TerminalSize:
         if _IS_WIN:
             try:
-                info = _CONSOLE_SCREEN_BUFFER_INFO()
-                _kernel32.GetConsoleScreenBufferInfo(self._out_handle, ctypes.byref(info))
-                columns = max(1, info.srWindow.Right - info.srWindow.Left + 1)
-                rows = max(1, info.srWindow.Bottom - info.srWindow.Top + 1)
-                self._last_size = TerminalSize(columns, rows)
-                return self._last_size
+                handle = self._out_handle
+                if handle:
+                    info = _CONSOLE_SCREEN_BUFFER_INFO()
+                    if _kernel32.GetConsoleScreenBufferInfo(
+                            handle, ctypes.byref(info)):
+                        columns = max(1, info.srWindow.Right - info.srWindow.Left + 1)
+                        rows = max(1, info.srWindow.Bottom - info.srWindow.Top + 1)
+                        self._last_size = TerminalSize(columns, rows)
+                        return self._last_size
             except Exception:
                 pass
         try:
@@ -180,11 +183,14 @@ class TerminalScreen:
             return
         if _IS_WIN:
             try:
+                buffer = ctypes.create_unicode_buffer(text)
+                # WriteConsoleW counts UTF-16 code units, not code points.
+                length = len(text.encode('utf-16-le')) // 2
                 written = wintypes.DWORD()
                 ok = _kernel32.WriteConsoleW(
                     self._out_handle,
-                    ctypes.create_unicode_buffer(text),
-                    len(text),
+                    buffer,
+                    length,
                     ctypes.byref(written),
                     None,
                 )

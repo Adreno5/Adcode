@@ -80,28 +80,52 @@ class ConversationContext:
     committed: list[dict[str, Any]]
     draft: list[dict[str, Any]] = field(default_factory=list)
     archived: list[dict[str, Any]] = field(default_factory=list)
+    _revision: int = 0
+    _token_cache: tuple[int, int] | None = None
+
+    def _touch(self) -> None:
+        self._revision += 1
+        self._token_cache = None
 
     def request_messages(self) -> list[dict[str, Any]]:
         return [*self.committed, *self.draft]
 
     def stage(self, *messages: dict[str, Any]) -> None:
-        self.draft.extend(messages)
+        if messages:
+            self.draft.extend(messages)
+            self._touch()
 
     def commit(self) -> None:
+        if not self.draft:
+            return
         self.committed.extend(self.draft)
         self.draft.clear()
+        self._touch()
 
     def rollback(self) -> None:
-        self.draft.clear()
+        if self.draft:
+            self.draft.clear()
+            self._touch()
 
     def restore(self, archived: Iterable[dict[str, Any]], generation: int) -> None:
         self.draft.clear()
         self.archived[:] = archived
         self.stable_prefix = replace(
             self.stable_prefix, generation=max(1, int(generation)))
+        self._touch()
 
     def estimated_tokens(self) -> int:
-        return estimate_tokens(self.committed) + estimate_tokens(self.draft)
+        # The UI asks for this several times per frame; reuse the last result
+        # until the conversation actually changes.
+        if self._token_cache is not None and self._token_cache[0] == self._revision:
+            return self._token_cache[1]
+        try:
+            total = estimate_tokens(self.committed) + estimate_tokens(self.draft)
+        except (RuntimeError, TypeError, ValueError):
+            # The worker thread may be appending while the UI samples this.
+            return self._token_cache[1] if self._token_cache else 0
+        self._token_cache = (self._revision, total)
+        return total
 
     def needs_compaction(self, budget: TokenBudget, threshold_percent: int = 85) -> bool:
         usable = budget.usable()
@@ -144,7 +168,12 @@ class ConversationContext:
         self.committed[:] = [summary, *plan.kept_messages]
         self.stable_prefix = replace(
             self.stable_prefix, generation=self.stable_prefix.generation + 1)
+        self._touch()
         return len(plan.removed)
+
+    def invalidate(self) -> None:
+        """Drop cached estimates after the message lists were replaced."""
+        self._touch()
 
     def enforce_budget(self, budget: TokenBudget,
                        keep_recent_turns: int = 2) -> dict[str, int | bool]:
@@ -169,6 +198,7 @@ class ConversationContext:
         after = estimate_tokens(self.committed)
         if after > committed_budget:
             _trim_tool_outputs(self.committed, max(256, committed_budget // 2))
+            self._touch()
             after = estimate_tokens(self.committed)
         if after > committed_budget:
             raise TokenBudgetExceeded(

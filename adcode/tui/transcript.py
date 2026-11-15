@@ -217,7 +217,7 @@ class TranscriptRenderer:
                                      palette)
             if not block:
                 continue
-            if output and self._needs_gap(previous, item.kind):
+            if output and output[-1] and self._needs_gap(previous, item.kind):
                 output.append([])
             output.extend(block)
             if item.kind == 'assistant':

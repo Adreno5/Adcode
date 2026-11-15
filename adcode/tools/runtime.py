@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+import os
 import threading
 from dataclasses import dataclass, field
 from typing import Callable
@@ -16,12 +17,21 @@ class ToolContext:
     agent: str = 'root'
 
 
-_CURRENT: contextvars.ContextVar[ToolContext] = contextvars.ContextVar(
-    'adcode_tool_context', default=ToolContext())
+_CURRENT: contextvars.ContextVar[ToolContext | None] = contextvars.ContextVar(
+    'adcode_tool_context', default=None)
 
 
 def current_context() -> ToolContext:
-    return _CURRENT.get()
+    """Return this thread's context, creating one lazily.
+
+    A single shared default instance would let one thread's ``live_sink`` leak
+    into another thread that never pushed a context of its own.
+    """
+    context = _CURRENT.get()
+    if context is None:
+        context = ToolContext()
+        _CURRENT.set(context)
+    return context
 
 
 def push_context(context: ToolContext):
@@ -30,3 +40,14 @@ def push_context(context: ToolContext):
 
 def pop_context(token) -> None:
     _CURRENT.reset(token)
+
+
+def resolve_path(path: str) -> str:
+    """Resolve a tool path against the context's working directory."""
+    base = current_context().cwd or '.'
+    text = os.path.expanduser(str(path)) if path else ''
+    if not text:
+        return base
+    if os.path.isabs(text):
+        return text
+    return os.path.normpath(os.path.join(base, text))

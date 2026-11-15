@@ -202,15 +202,23 @@ def _prompt_layout(text: str, cursor: int, anchor: int | None, width: int
 
 class AdCodeApp:
     def __init__(self, cwd: str | None = None, resume: bool = True,
-                 config_path: str | os.PathLike[str] | None = None) -> None:
+                 config_path: str | os.PathLike[str] | None = None,
+                 screen: TerminalScreen | None = None,
+                 input_queue: 'queue.Queue[KeyEvent] | None' = None,
+                 input_thread: InputThread | None = None) -> None:
         self.cwd = cwd or os.getcwd()
         self.store = ConfigStore(config_path)
         self.config: AppConfig = self.store.load()
-        self.screen = TerminalScreen()
+        # The terminal pieces are injectable so a harness can drive the real
+        # application loop without owning a console (see the test harness).
+        self.screen = screen if screen is not None else TerminalScreen()
         self.palette: Palette = build_palette(self.config.ui.theme, self.config.ui.accent)
         self.canvas = Canvas(*self._screen_size(), self.palette)
-        self.input_queue: 'queue.Queue[KeyEvent]' = queue.Queue()
-        self.input_thread = InputThread(self.input_queue)
+        self.input_queue: 'queue.Queue[KeyEvent]' = (
+            input_queue if input_queue is not None else queue.Queue())
+        self.input_thread = (
+            input_thread if input_thread is not None
+            else InputThread(self.input_queue))
         self.posted: 'queue.Queue[Callable[[], None]]' = queue.Queue()
         self.session_store = SessionStore(os.path.join(self.cwd, 'sessions'))
         self.goals = GoalStore(os.path.join(self.cwd, 'sessions', 'goals.json'))
@@ -231,6 +239,8 @@ class AdCodeApp:
         self.btw_mode = False
         self.exit_armed = False
         self.last_render = 0.0
+        self._last_cursor: tuple[int, int] | None = None
+        self._cursor_visible: bool | None = None
         self.last_interrupt = 0.0
         self.last_width = 0
         self.last_title = ''
@@ -283,7 +293,7 @@ class AdCodeApp:
         provider, model = selected
         self.loop = AgentLoop(
             self.config, self.registry, self.session_store, self.goals,
-            self.skills, emit=self._wake, mcp_manager=self.mcp,
+            self.skills, emit=self._wake, mcp_manager=self.mcp, cwd=self.cwd,
         )
         self.loop.start()
         self._start_mcp_load()
@@ -428,6 +438,7 @@ class AdCodeApp:
 
     def load_session(self, name: str) -> None:
         if self.loop is None:
+            self.notify('No active conversation to load into.', 'warning')
             return
         if self.loop.load_session(name):
             self.transcript.invalidate()
@@ -675,13 +686,9 @@ class AdCodeApp:
             self.dirty = True
             return
         if event.kind == 'text':
-            if self.prompt.selection()[0] != self.prompt.selection()[1]:
-                self.prompt.insert(event.text)
-            else:
-                self.prompt.snapshot()
-                self.prompt.text = (self.prompt.text[:self.prompt.cursor]
-                                    + event.text + self.prompt.text[self.prompt.cursor:])
-                self.prompt.cursor += len(event.text)
+            # Route typing through PromptState so the selection and undo stacks
+            # stay consistent.
+            self.prompt.insert(event.text)
             self.dirty = True
             return
         if event.kind != 'key':
@@ -777,17 +784,17 @@ class AdCodeApp:
                 self._history_move(1)
             self.dirty = True
             return
-        if key == 'left':
+        if key in ('left', 'shift+left'):
             self._move_horizontal(-1, event.shift)
             return
-        if key == 'right':
+        if key in ('right', 'shift+right'):
             self._move_horizontal(1, event.shift)
             return
-        if key == 'home':
-            self._move_line_edge(start=True, whole=(key == 'ctrl+home'))
+        if key in ('home', 'shift+home'):
+            self._move_line_edge(start=True, whole=False, extend=event.shift)
             return
-        if key == 'end':
-            self._move_line_edge(start=False, whole=False)
+        if key in ('end', 'shift+end'):
+            self._move_line_edge(start=False, whole=False, extend=event.shift)
             return
         if key == 'backspace':
             self.prompt.delete_backward()
@@ -815,7 +822,9 @@ class AdCodeApp:
             self.prompt.snapshot()
             self.prompt.text = self.prompt.text[:-1]
             self.prompt.cursor = min(self.prompt.cursor, len(self.prompt.text))
-            self.prompt.insert('\n')
+            # Insert without taking a second undo snapshot for the same edit.
+            self.prompt.text += '\n'
+            self.prompt.cursor = len(self.prompt.text)
             self.dirty = True
             return
         if self._completion_visible():
@@ -865,9 +874,15 @@ class AdCodeApp:
                                         self.prompt.cursor + delta))
         self.dirty = True
 
-    def _move_line_edge(self, start: bool, whole: bool) -> None:
+    def _move_line_edge(self, start: bool, whole: bool,
+                        extend: bool = False) -> None:
         text = self.prompt.text
         cursor = self.prompt.cursor
+        if extend:
+            if self.prompt.anchor is None:
+                self.prompt.anchor = cursor
+        else:
+            self.prompt.anchor = None
         if whole:
             self.prompt.cursor = 0 if start else len(text)
         else:
@@ -877,7 +892,6 @@ class AdCodeApp:
             else:
                 position = text.find('\n', cursor)
                 self.prompt.cursor = len(text) if position == -1 else position
-        self.prompt.anchor = None
         self.dirty = True
 
     def _history_move(self, delta: int) -> None:
@@ -1045,12 +1059,27 @@ class AdCodeApp:
             caret_screen_row = prompt_top + (caret_row - window_start)
             if 0 <= caret_row - window_start < len(visible_prompt):
                 cursor = (min(columns - 1, caret_col), caret_screen_row)
-        frame = self.canvas.render()
-        if cursor is not None and not (self.overlay is not None and cursor is None):
-            frame += f'\x1b[{cursor[1] + 1};{cursor[0] + 1}H\x1b[?25h'
+        # Only the rows whose cells actually changed are written; the caret
+        # escape is appended only when it moved.  A frame that changes nothing
+        # writes nothing at all, which is what keeps an idle UI off the wire.
+        payload = self.canvas.render_diff()
+        if cursor is not None:
+            parts = []
+            if self._cursor_visible is not True:
+                parts.append('\x1b[?25h')
+                self._cursor_visible = True
+            if cursor != self._last_cursor:
+                parts.append(f'\x1b[{cursor[1] + 1};{cursor[0] + 1}H')
+                self._last_cursor = cursor
+            tail = ''.join(parts)
         else:
-            frame += '\x1b[?25l'
-        self.screen.flush_frame(frame)
+            tail = ''
+            if self._cursor_visible is not False:
+                tail = '\x1b[?25l'
+                self._cursor_visible = False
+            self._last_cursor = None
+        if payload or tail:
+            self.screen.flush_frame(payload + tail)
 
     def _draw_line(self, x: int, y: int, line: Line, width: int) -> None:
         if not line:
@@ -1119,7 +1148,7 @@ class AdCodeApp:
         color = {
             'thinking': 'subtext', 'answering': 'text', 'tool': 'accent',
             'compacting': 'info', 'aside': 'accent', 'idle': 'muted',
-        }[phase]
+        }.get(phase, 'muted')
         x = 1
         x += self.canvas.draw_text(x, y, status, self._color(color, 'muted'))
         extras: list[str] = []

@@ -90,11 +90,13 @@ class StdioTransport(MCPTransport):
     name = 'stdio'
 
     def __init__(self, command: str, args: list[str] | None = None,
-                 env: dict[str, str] | None = None) -> None:
+                 env: dict[str, str] | None = None,
+                 cwd: str | None = None) -> None:
         super().__init__()
         self.command = command
         self.args = args or []
         self.env = env or {}
+        self.cwd = cwd
         self._proc: subprocess.Popen[bytes] | None = None
         self._lock = threading.Lock()
         self._pending: dict[int, threading.Event] = {}
@@ -113,7 +115,7 @@ class StdioTransport(MCPTransport):
         self._proc = subprocess.Popen(
             [self.command, *self.args],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=merged_env, creationflags=creationflags,
+            env=merged_env, creationflags=creationflags, cwd=self.cwd,
         )
         self._reader = threading.Thread(target=self._read_loop, daemon=True,
                                         name='mcp-stdio-reader')
@@ -266,9 +268,10 @@ class HttpTransport(MCPTransport):
 
     name = 'http'
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, headers: dict[str, str] | None = None) -> None:
         super().__init__()
         self.url = url
+        self.headers = dict(headers or {})
         self.session_id = ''
         self._next_id = 0
 
@@ -277,6 +280,7 @@ class HttpTransport(MCPTransport):
             'Content-Type': 'application/json',
             'Accept': 'application/json, text/event-stream',
         }
+        headers.update(self.headers)
         if self.session_id:
             headers['Mcp-Session-Id'] = self.session_id
         return headers
@@ -340,9 +344,10 @@ class SseTransport(MCPTransport):
 
     name = 'sse'
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, headers: dict[str, str] | None = None) -> None:
         super().__init__()
         self.url = url
+        self.headers = dict(headers or {})
         self.message_url = ''
         self._next_id = 0
         self._lock = threading.Lock()
@@ -374,6 +379,7 @@ class SseTransport(MCPTransport):
         self._connection = connection
         try:
             connection.request('GET', path, headers={
+                **self.headers,
                 'Accept': 'text/event-stream', 'Cache-Control': 'no-cache',
             })
             self._stream = connection.getresponse()
@@ -445,7 +451,8 @@ class SseTransport(MCPTransport):
                           separators=(',', ':')).encode('utf-8')
         request = urllib.request.Request(
             self.message_url, data=data,
-            headers={'Content-Type': 'application/json'}, method='POST')
+            headers={**self.headers, 'Content-Type': 'application/json'},
+            method='POST')
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 response.read()
@@ -624,16 +631,19 @@ class MCPClient:
 
 def build_transport(config: dict[str, Any]) -> MCPTransport:
     transport = str(config.get('transport', 'stdio')).lower()
+    headers_value = config.get('headers')
+    headers = ({str(key): str(value) for key, value in headers_value.items()}
+               if isinstance(headers_value, dict) else {})
     if transport in ('sse',):
         url = str(config.get('url', ''))
         if not url:
             raise MCPError('missing url')
-        return SseTransport(url)
+        return SseTransport(url, headers)
     if transport in ('http', 'streamable http', 'streamable-http'):
         url = str(config.get('url', ''))
         if not url:
             raise MCPError('missing url')
-        return HttpTransport(url)
+        return HttpTransport(url, headers)
     command = str(config.get('command', ''))
     if not command:
         raise MCPError('missing command')
@@ -641,5 +651,6 @@ def build_transport(config: dict[str, Any]) -> MCPTransport:
     if not isinstance(args, list):
         args = []
     env = config.get('env') if isinstance(config.get('env'), dict) else {}
+    cwd = str(config.get('cwd') or '') or None
     return StdioTransport(command, [str(item) for item in args],
-                          {str(k): str(v) for k, v in env.items()})
+                          {str(k): str(v) for k, v in env.items()}, cwd=cwd)

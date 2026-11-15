@@ -64,6 +64,16 @@ def _str(value: Any, default: str) -> str:
     return value if isinstance(value, str) else default
 
 
+def _list_of_dicts(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
 # ── models and providers ───────────────────────────────────
 
 
@@ -154,10 +164,13 @@ class ProviderConfig:
         if not name or not base_url:
             return None
         models: list[ModelConfig] = []
-        for item in raw.get('models') or []:
-            model = ModelConfig.from_dict(item)
-            if model is not None and not any(existing.id == model.id for existing in models):
-                models.append(model)
+        raw_models = raw.get('models')
+        if isinstance(raw_models, (list, tuple)):
+            for item in raw_models:
+                model = ModelConfig.from_dict(item)
+                if model is not None and not any(
+                        existing.id == model.id for existing in models):
+                    models.append(model)
         if not models:
             models = [ModelConfig(id='default')]
         return cls(
@@ -168,12 +181,9 @@ class ProviderConfig:
             models=models,
             extra_headers={
                 str(key): str(value)
-                for key, value in (raw.get('extra_headers') or {}).items()
+                for key, value in _mapping(raw.get('extra_headers')).items()
             },
-            reasoning_extra_body=(
-                dict(raw['reasoning_extra_body'])
-                if isinstance(raw.get('reasoning_extra_body'), dict) else {}
-            ),
+            reasoning_extra_body=_mapping(raw.get('reasoning_extra_body')),
         )
 
 
@@ -460,7 +470,8 @@ class AppConfig:
 
     def selected(self) -> tuple[ProviderConfig, ModelConfig] | None:
         if self.selected_model and '::' in self.selected_model:
-            provider_name, model_id = self.selected_model.split('::', 1)
+            # Model ids never contain '::', provider names may.
+            provider_name, model_id = self.selected_model.rsplit('::', 1)
             provider = self.provider_by_name(provider_name)
             if provider is not None:
                 model = provider.model(model_id)
@@ -476,26 +487,28 @@ class AppConfig:
 
     def remove_provider(self, name: str) -> None:
         self.providers = [provider for provider in self.providers if provider.name != name]
-        if self.selected_model.startswith(name + '::'):
+        selected = self.selected()
+        if selected is None:
             self.selected_model = ''
-            selected = self.selected()
-            if selected is not None:
-                provider, model = selected
-                self.select(provider.name, model.id)
+            return
+        provider, model = selected
+        self.select(provider.name, model.id)
 
 
 def migrate_legacy(raw: dict[str, Any]) -> AppConfig:
     """Convert an AdCode 1.x config payload into the current schema."""
     config = AppConfig()
     providers: list[ProviderConfig] = []
-    for item in raw.get('providers') or []:
+    for item in _list_of_dicts(raw.get('providers')):
         provider = ProviderConfig.from_dict(item)
         if provider is not None:
             providers.append(provider)
     config.providers = providers
     config.selected_model = _str(raw.get('selected_model'), '')
-    servers = raw.get('mcp_servers')
-    config.mcp_servers = servers if isinstance(servers, list) else []
+    config.mcp_servers = [
+        server for server in _list_of_dicts(raw.get('mcp_servers'))
+        if str(server.get('name') or '').strip()
+    ]
 
     # Older releases stored verbose_mode, reasoning_effort and the raw ANSI
     # theme sequence directly on the config object.
@@ -537,20 +550,29 @@ def migrate_legacy(raw: dict[str, Any]) -> AppConfig:
     return config
 
 
+def _config_version(raw: dict[str, Any]) -> int:
+    try:
+        return int(raw.get('version') or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def config_from_dict(raw: dict[str, Any]) -> AppConfig:
     if not isinstance(raw, dict):
         return AppConfig()
-    if int(raw.get('version') or 0) < CONFIG_VERSION and 'thinking' not in raw:
+    if _config_version(raw) < CONFIG_VERSION and 'thinking' not in raw:
         return migrate_legacy(raw)
     config = AppConfig()
     config.version = CONFIG_VERSION
     config.providers = [
-        provider for item in raw.get('providers') or []
+        provider for item in _list_of_dicts(raw.get('providers'))
         if (provider := ProviderConfig.from_dict(item)) is not None
     ]
     config.selected_model = _str(raw.get('selected_model'), '')
-    servers = raw.get('mcp_servers')
-    config.mcp_servers = servers if isinstance(servers, list) else []
+    config.mcp_servers = [
+        server for server in _list_of_dicts(raw.get('mcp_servers'))
+        if str(server.get('name') or '').strip()
+    ]
     config.thinking = ThinkingDisplay.from_dict(raw.get('thinking'))
     config.tools = ToolDisplay.from_dict(raw.get('tools'))
     config.context = ContextSettings.from_dict(raw.get('context'))

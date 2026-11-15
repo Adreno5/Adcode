@@ -17,7 +17,7 @@ import weakref
 from dataclasses import dataclass, field
 from typing import Any
 
-from adcode.tools.runtime import current_context
+from adcode.tools.runtime import current_context, resolve_path
 
 _GREP_SKIP_DIRS = frozenset({
     '.git', '.hg', '.svn', 'node_modules', '__pycache__', '.venv', 'venv',
@@ -31,32 +31,57 @@ _MAX_OUTPUT_LINES = 5_000
 _rg_path: str | None | bool = False
 
 
+def _base_dir() -> str:
+    """Working directory of the running tool call ('' means the process cwd)."""
+    return current_context().cwd or '.'
+
+
+def _resolve(path: str) -> str:
+    """Resolve a tool path against the tool context's working directory."""
+    return resolve_path(path)
+
+
+def _display_path(path: str) -> str:
+    """Shorten an absolute result path back to a cwd-relative one when possible."""
+    try:
+        relative = os.path.relpath(path, _base_dir())
+    except ValueError:
+        return path
+    if relative.startswith('..'):
+        return path
+    return relative.replace('\\', '/')
+
+
 def _read(args: dict[str, Any]) -> str:
-    path = str(args['path'])
+    raw_path = str(args['path'])
+    path = _resolve(raw_path)
     offset = args.get('offset')
     limit = args.get('limit')
     if not os.path.isfile(path):
-        return f'Error: file not found: {path}'
+        return f'Error: file not found: {raw_path}'
     try:
         with open(path, encoding='utf-8-sig', errors='replace') as stream:
             lines = stream.readlines()
     except Exception as error:
-        return f'Error reading {path}: {error}'
+        return f'Error reading {raw_path}: {error}'
     total = len(lines)
+    start = 0
     if offset is not None:
         start = max(0, int(offset) - 1)
         lines = lines[start:]
     if limit is not None:
         lines = lines[:int(limit)]
-    base = (max(0, int(offset) - 1) if offset is not None else 0) + 1
+    base = start + 1
     out = ''.join(f'{number:6}: {line}' for number, line in enumerate(lines, base))
-    if (offset is not None or limit is not None) and total > len(lines):
+    if (offset is not None or limit is not None) and total > start + len(lines):
         out += f'\n(showing {len(lines)} of {total} lines)'
-    return out or '(empty file)'
+    return out or ('(no lines in range)' if (offset is not None or limit is not None)
+                   else '(empty file)')
 
 
 def _write(args: dict[str, Any]) -> str:
-    path = str(args['path'])
+    raw_path = str(args['path'])
+    path = _resolve(raw_path)
     content = str(args['content'])
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     encoding = 'utf-8'
@@ -68,16 +93,20 @@ def _write(args: dict[str, Any]) -> str:
         with open(path, 'w', encoding=encoding, newline='') as stream:
             stream.write(content)
     except Exception as error:
-        return f'Error writing {path}: {error}'
-    return f'Wrote {len(content.encode("utf-8"))} bytes to {path}'
+        return f'Error writing {raw_path}: {error}'
+    written = len(content.encode('utf-8'))
+    if encoding == 'utf-8-sig':
+        written += 3
+    return f'Wrote {written} bytes to {raw_path}'
 
 
 def _edit(args: dict[str, Any]) -> str:
-    path = str(args['path'])
+    raw_path = str(args['path'])
+    path = _resolve(raw_path)
     old = str(args['old'])
     new = str(args['new'])
     if not os.path.isfile(path):
-        return f'Error: file not found: {path}'
+        return f'Error: file not found: {raw_path}'
     try:
         with open(path, 'rb') as probe:
             has_bom = probe.read(3) == b'\xef\xbb\xbf'
@@ -85,31 +114,33 @@ def _edit(args: dict[str, Any]) -> str:
         with open(path, encoding=encoding) as stream:
             content = stream.read()
     except Exception as error:
-        return f'Error reading {path}: {error}'
+        return f'Error reading {raw_path}: {error}'
     count = content.count(old)
     if count == 0:
-        return f'Error: old_string not found in {path}'
+        return f'Error: old_string not found in {raw_path}'
     if count > 1:
-        return (f'Error: found {count} matches of old_string in {path}; '
+        return (f'Error: found {count} matches of old_string in {raw_path}; '
                 f'provide more context to make it unique')
     new_content = content.replace(old, new, 1)
     try:
         with open(path, 'w', encoding=encoding, newline='') as stream:
             stream.write(new_content)
     except Exception as error:
-        return f'Error writing {path}: {error}'
-    return f'Replaced 1 occurrence in {path}'
+        return f'Error writing {raw_path}: {error}'
+    return f'Replaced 1 occurrence in {raw_path}'
 
 
 def _glob(args: dict[str, Any]) -> str:
     pattern = str(args['pattern'])
+    joined = os.path.join(_base_dir(), os.path.expanduser(pattern))
     try:
-        matches = glob_module.glob(pattern, recursive=True)
+        matches = glob_module.glob(joined, recursive=True)
     except Exception as error:
         return f'Error in glob: {error}'
     if not matches:
         return '(no matches)'
-    return '\n'.join(sorted(matches))
+    relative = sorted(_display_path(match) for match in matches)
+    return '\n'.join(dict.fromkeys(relative))
 
 
 def _find_rg() -> str | None:
@@ -123,7 +154,7 @@ def _find_rg() -> str | None:
 def _grep_include(path: str, include: str) -> bool:
     if fnmatch.fnmatch(os.path.basename(path), include):
         return True
-    relative = os.path.relpath(path).replace('\\', '/')
+    relative = os.path.relpath(path, _base_dir()).replace('\\', '/')
     if fnmatch.fnmatch(relative, include):
         return True
     try:
@@ -140,7 +171,8 @@ def _grep_rg(rg: str, args: dict[str, Any]) -> str | None:
         command += ['-g', str(args['include'])]
     command += ['.']
     try:
-        process = subprocess.run(command, capture_output=True, timeout=30)
+        process = subprocess.run(command, capture_output=True, timeout=30,
+                                 cwd=_base_dir())
     except Exception:
         return None
     if process.returncode == 2:
@@ -154,12 +186,13 @@ def _grep_rg(rg: str, args: dict[str, Any]) -> str | None:
 def _grep_python(args: dict[str, Any]) -> str:
     pattern = str(args['pattern'])
     include = str(args.get('include', '') or '')
+    base = _base_dir()
     try:
         regex = re.compile(pattern)
     except re.error as error:
         return f'Invalid regex: {error}'
     files: list[str] = []
-    for root, dirs, names in os.walk('.'):
+    for root, dirs, names in os.walk(base):
         dirs[:] = [name for name in dirs
                    if not name.startswith('.') and name not in _GREP_SKIP_DIRS]
         for name in names:
@@ -175,6 +208,7 @@ def _grep_python(args: dict[str, Any]) -> str:
 
     def search(path: str) -> list[str]:
         local: list[str] = []
+        display = _display_path(path)
         try:
             with open(path, 'rb') as stream:
                 data = stream.read()
@@ -183,7 +217,7 @@ def _grep_python(args: dict[str, Any]) -> str:
             text = data.decode('utf-8', errors='replace')
             for number, line in enumerate(text.split('\n'), 1):
                 if regex.search(line):
-                    local.append(f'{path}:{number}: {line.rstrip()}')
+                    local.append(f'{display}:{number}: {line.rstrip()}')
                     if len(local) >= _GREP_MAX_RESULTS:
                         break
         except Exception:
@@ -225,6 +259,7 @@ class _BashSession:
     output: list[str] = field(default_factory=list)
     read_pos: int = 0
     workdir: str = '.'
+    reader: threading.Thread | None = None
 
 
 _bash_local = threading.local()
@@ -297,6 +332,8 @@ def _kill_tree(proc: subprocess.Popen[bytes]) -> None:
 
 def _bash_kill(session: _BashSession | None = None) -> None:
     active = session or _bash_session()
+    reader = active.reader
+    active.reader = None
     if active.proc:
         proc = active.proc
         _kill_tree(proc)
@@ -306,6 +343,10 @@ def _bash_kill(session: _BashSession | None = None) -> None:
             pass
         _close_process_pipes(proc)
         active.proc = None
+    if reader is not None and reader is not threading.current_thread():
+        # Reap the old reader before the next command reuses the buffer, so a
+        # killed process cannot append stale lines to the new output.
+        reader.join(timeout=1)
 
 
 def shutdown_shell_sessions() -> None:
@@ -319,7 +360,7 @@ def _bash_execute(args: dict[str, Any]) -> str:
     session = _bash_session()
     _bash_kill(session)
     command = str(args['command'])
-    session.workdir = str(args.get('workdir', '.') or '.')
+    session.workdir = _resolve(str(args.get('workdir', '') or '.'))
     try:
         timeout = float(args.get('timeout', 48))
     except (TypeError, ValueError):
@@ -359,8 +400,10 @@ def _bash_execute(args: dict[str, Any]) -> str:
                 pass
 
     thread = threading.Thread(target=reader, daemon=True)
+    session.reader = thread
     thread.start()
     interrupted = False
+    timed_out = False
     deadline = time.monotonic() + max(0.1, timeout)
     while True:
         try:
@@ -371,18 +414,28 @@ def _bash_execute(args: dict[str, Any]) -> str:
                 interrupted = True
                 break
             if time.monotonic() >= deadline:
-                session.output.append(
-                    '<bash_tool_metadata>command execution timed out</bash_tool_metadata>')
-                _kill_tree(proc)
+                timed_out = True
                 break
-    thread.join(timeout=1)
-    if interrupted:
+    if interrupted or timed_out:
         _kill_tree(proc)
+        # Reap the dead process before reporting: otherwise the pipes stay open
+        # and every later read claims the command is still running.
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+    thread.join(timeout=1)
+    if timed_out:
+        session.output.append(
+            '<bash_tool_metadata>command execution timed out</bash_tool_metadata>')
+    if interrupted:
         session.output.append('<bash_tool_metadata>command interrupted</bash_tool_metadata>')
     if proc.poll() is not None:
         _close_process_pipes(proc)
         if session.proc is proc:
             session.proc = None
+    if session.reader is thread:
+        session.reader = None
     return _bash_read(args)
 
 
@@ -464,18 +517,19 @@ def _fetch(args: dict[str, Any]) -> str:
 
 def _diff(args: dict[str, Any]) -> str:
     from adcode.diff import git_worktree_diff
-    file_diff = git_worktree_diff('.', str(args.get('path', '') or ''))
+    file_diff = git_worktree_diff(_base_dir(), str(args.get('path', '') or ''))
     if file_diff is None:
         return '(no working-tree changes)'
     return file_diff.unified or '(no textual diff)'
 
 
 def _ls(args: dict[str, Any]) -> str:
-    path = str(args.get('path', '.') or '.')
+    raw_path = str(args.get('path', '') or '.')
+    path = _resolve(raw_path)
     try:
         entries = sorted(os.listdir(path))
     except Exception as error:
-        return f'Error listing {path}: {error}'
+        return f'Error listing {raw_path}: {error}'
     if not entries:
         return '(empty directory)'
     lines = []

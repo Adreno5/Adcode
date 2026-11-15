@@ -102,6 +102,8 @@ maximum output, vision support, tool calling, and reasoning efforts.
 | `ctrl+c` | Copy selection, else clear the input, else interrupt; press twice on an empty prompt to exit |
 | `ctrl+v` | Paste (bracketed paste is supported) |
 | `ctrl+a` | Select all |
+| `shift+left` / `shift+right` | Extend the selection by one character |
+| `shift+home` / `shift+end` | Extend the selection to the line edge |
 | `ctrl+x` | Cut selection |
 | `ctrl+z` / `ctrl+y` | Undo / redo input edits |
 | `pgup` / `pgdn` | Scroll the transcript |
@@ -408,6 +410,67 @@ The test suite covers canvas compositing, wrapping and Markdown, config
 migration, models.dev matching, compaction, sessions and rewind, skills, the
 tools, the agent loop, sub-agents, all three MCP transports, commands, input
 parsing, transcript display policies, settings behavior, and prompt layout.
+
+It also contains real controlled-run simulations: the actual application is
+started against a temporary config, a local fake LLM gateway, and scripted
+keyboard/mouse input.  See [Test Harness](#test-harness).
+
+## Test Harness
+
+The harness starts the real `AdCodeApp` loop on a worker thread and replaces
+only the terminal edges:
+
+- **Temporary config and workspace** -- every run gets a private
+  `project/` and `home/.adcode/config.json`; the real `~/.adcode` is never
+  read or written.
+- **Fake local LLM gateway** -- a real HTTP server that speaks OpenAI Chat
+  Completions, OpenAI Responses and Anthropic Messages over SSE.  The
+  production `LLMClient` and the official SDKs make the request, accumulate
+  tool-call deltas and parse usage exactly as they do in production.
+- **Scripted input** -- raw arrow/control/paste/SGR-mouse sequences are fed
+  through AdCode's own `KeyParser`, so the app's real key handlers run.
+- **Recorded frames** -- a fake screen snapshots every composited frame,
+  replays the serialized ANSI through a small VT emulator and exposes the
+  text, cells, colours and cursor.
+
+Automated simulations live in `tests/test_simulation_*.py`:
+
+```bash
+python -m pytest tests/test_simulation_chat.py tests/test_simulation_input.py \
+                 tests/test_simulation_config.py tests/test_simulation_gateway.py
+```
+
+The manual toolkit produces screenshots and run data:
+
+```bash
+python -m harness list                 # scenarios
+python -m harness run chat             # one scenario
+python -m harness run all              # every scenario
+python -m harness run commands --width 120 --height 40 --out out/
+```
+
+Each run writes:
+
+```
+out/
+├── report.md               # human-readable summary with images
+├── manifest.json           # environment, state, frame index, warnings
+├── transcript.json         # every TranscriptItem
+├── gateway_requests.json   # exact request bodies the app sent
+├── config.json             # the temporary config that was used
+├── session.json            # persisted session payload
+├── workspace/              # copy of the simulated project and sessions
+└── screens/
+    ├── 001-idle.json       # full cell dump
+    ├── 001-idle.svg        # dependency-free vector screenshot
+    ├── 001-idle.png        # raster screenshot (Pillow)
+    └── 001-idle.txt        # plain text as the terminal would show it
+```
+
+SVG screenshots always work.  PNG needs Pillow; if the app virtualenv does not
+have it, the harness automatically looks for an interpreter that does
+(`ADCODE_RASTER_PYTHON`, then `python`/`python3`/`py`).  Scenarios: `chat`,
+`tool-call`, `keyboard`, `commands`, `scroll`, `resize`, `interrupt`.
 
 ## Dependencies
 

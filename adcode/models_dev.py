@@ -76,9 +76,15 @@ def parse_catalog(raw: dict[str, Any]) -> list[CatalogModel]:
         for model_id, model in models.items():
             if not isinstance(model, dict):
                 continue
-            modalities = model.get('modalities') or {}
-            inputs = modalities.get('input') or []
-            reasoning_options = model.get('reasoning_options') or []
+            modalities = model.get('modalities')
+            if not isinstance(modalities, dict):
+                modalities = {}
+            inputs = modalities.get('input')
+            if not isinstance(inputs, list):
+                inputs = []
+            reasoning_options = model.get('reasoning_options')
+            if not isinstance(reasoning_options, list):
+                reasoning_options = []
             style = 'none'
             efforts: tuple[str, ...] = ()
             if model.get('reasoning'):
@@ -88,12 +94,16 @@ def parse_catalog(raw: dict[str, Any]) -> list[CatalogModel]:
                         continue
                     if option.get('type') == 'effort':
                         style = 'effort'
-                        values = option.get('values') or []
+                        values = option.get('values')
+                        if not isinstance(values, list):
+                            values = []
                         efforts = tuple(str(value) for value in values if value)
                         break
                 if style == 'toggle' and not efforts:
                     efforts = ('low', 'high')
-            limits = model.get('limit') or {}
+            limits = model.get('limit')
+            if not isinstance(limits, dict):
+                limits = {}
             result.append(CatalogModel(
                 id=str(model.get('id') or model_id),
                 name=str(model.get('name') or model_id),
@@ -192,25 +202,32 @@ class ModelCatalog:
 
     @classmethod
     def from_json(cls, raw: dict[str, Any]) -> 'ModelCatalog':
+        if not isinstance(raw, dict):
+            return cls([])
+        items = raw.get('models')
+        if not isinstance(items, list):
+            return cls([])
         models = []
-        for item in raw.get('models', []):
+        for item in items:
             if not isinstance(item, dict):
                 continue
             try:
                 models.append(CatalogModel(
-                    id=item['id'], name=item.get('name', ''),
-                    provider_id=item.get('provider_id', ''),
-                    provider_name=item.get('provider_name', ''),
+                    id=str(item['id']), name=str(item.get('name', '')),
+                    provider_id=str(item.get('provider_id', '')),
+                    provider_name=str(item.get('provider_name', '')),
                     vision=bool(item.get('vision')),
                     context_window=int(item.get('context_window', 128_000)),
                     max_output_tokens=int(item.get('max_output_tokens', 8_192)),
                     reasoning=bool(item.get('reasoning')),
-                    reasoning_style=item.get('reasoning_style', 'none'),
-                    reasoning_efforts=tuple(item.get('reasoning_efforts', ())),
+                    reasoning_style=str(item.get('reasoning_style') or 'none'),
+                    reasoning_efforts=tuple(str(value) for value in
+                                            item.get('reasoning_efforts') or ()
+                                            if isinstance(value, str)),
                     tool_call=bool(item.get('tool_call', True)),
                     temperature=bool(item.get('temperature', True)),
-                    canonical_id=item.get('canonical_id', ''),
-                    release_date=item.get('release_date', ''),
+                    canonical_id=str(item.get('canonical_id') or ''),
+                    release_date=str(item.get('release_date') or ''),
                 ))
             except (KeyError, TypeError, ValueError):
                 continue
@@ -234,10 +251,15 @@ def _read_cache() -> tuple[ModelCatalog | None, float]:
         raw = json.loads(path.read_text(encoding='utf-8'))
     except (OSError, ValueError):
         return None, 0.0
+    if not isinstance(raw, dict):
+        return None, 0.0
     try:
         fetched_at = float(raw.get('fetched_at', 0))
-        catalog = ModelCatalog.from_json(raw)
     except (TypeError, ValueError):
+        fetched_at = 0.0
+    try:
+        catalog = ModelCatalog.from_json(raw)
+    except (TypeError, ValueError, AttributeError):
         return None, 0.0
     return catalog, fetched_at
 
@@ -297,23 +319,28 @@ def get_catalog(wait: bool = False) -> ModelCatalog:
     """Return the shared catalogue, loading cache first and fetching if stale."""
     global _catalog, _fetch_thread
     with _lock:
-        if _catalog is not None:
+        if _catalog is not None and _catalog.models:
             return _catalog
         cached, fetched_at = _read_cache()
-        if cached is not None:
+        if cached is not None and cached.models:
             _catalog = cached
-        stale = cached is None or time.time() - fetched_at > CACHE_TTL_SECONDS
-        if stale and _fetch_thread is None:
+        stale = _catalog is None or time.time() - fetched_at > CACHE_TTL_SECONDS
+        if stale and (_fetch_thread is None or not _fetch_thread.is_alive()):
             def _worker() -> None:
-                global _catalog
-                fetched = fetch_catalog()
-                if fetched is not None:
+                global _catalog, _fetch_thread
+                try:
+                    fetched = fetch_catalog()
+                    if fetched is not None:
+                        with _lock:
+                            _catalog = fetched
+                finally:
+                    # Allow a later retry if the download failed.
                     with _lock:
-                        _catalog = fetched
+                        _fetch_thread = None
             _fetch_thread = threading.Thread(target=_worker, name='models-dev',
                                              daemon=True)
             _fetch_thread.start()
-        if wait and _catalog is None:
+        if wait and (_catalog is None or not _catalog.models):
             fetched = fetch_catalog()
             if fetched is not None:
                 _catalog = fetched

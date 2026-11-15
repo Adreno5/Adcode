@@ -107,11 +107,13 @@ class AgentManager:
     def __init__(self, config: AppConfig, provider: ProviderConfig, model: ModelConfig,
                  system: str, root_context: ConversationContext,
                  registry: ToolRegistry, *, goal_store: GoalStore | None = None,
-                 event_sink: Callable[[AgentEvent], None] | None = None) -> None:
+                 event_sink: Callable[[AgentEvent], None] | None = None,
+                 cwd: str = '') -> None:
         self.config = config
         self.goal_store = goal_store
         self.registry = registry
         self.event_sink = event_sink
+        self.cwd = cwd or '.'
         self._lock = threading.RLock()
         self._activity = threading.Condition(self._lock)
         self._events: 'queue.SimpleQueue[AgentEvent]' = queue.SimpleQueue()
@@ -410,8 +412,11 @@ class AgentManager:
                       fork_turns: str) -> tuple[ConversationContext, str, set[str]]:
         fork_turns = (fork_turns or self.config.agents.default_fork_turns).strip().lower()
         history: list[dict[str, Any]] = []
+        # Include the turn that is still in flight: turns commit atomically, so
+        # committed alone would be empty while the parent is working.
+        parent_messages = parent.context.request_messages()
         if fork_turns == 'all':
-            history = _safe_history(parent.context.committed)
+            history = _safe_history(parent_messages)
         elif fork_turns == 'none':
             history = []
         else:
@@ -422,7 +427,7 @@ class AgentManager:
                     from error
             if count <= 0:
                 raise ValueError('fork_turns must be none, all, or a positive integer')
-            groups = _conversation_groups(parent.context.committed)
+            groups = _conversation_groups(parent_messages)
             history = _safe_history(
                 [item for group in groups[-count:] for item in group])
         parts = [parent.system, SUBAGENT_SYSTEM]
@@ -556,6 +561,19 @@ class AgentManager:
             messages = list(record.inbox)
             record.inbox.clear()
             return messages
+
+    def requeue_mailbox(self, messages: list[str], target: str = ROOT_AGENT) -> None:
+        """Put consumed updates back when the receiving turn was rolled back."""
+        if not messages:
+            return
+        with self._lock:
+            record = self._records.get(target)
+            if record is None:
+                return
+            for message in reversed(messages):
+                record.inbox.appendleft(message)
+            record.updated_at = time.time()
+            self._activity.notify_all()
 
     def shutdown(self) -> None:
         changed: list[AgentRecord] = []
@@ -732,7 +750,7 @@ class AgentManager:
         turns = 0
         continuations = 0
         tool_context = ToolContext(
-            cwd='.', interrupt=record.interrupt, agent=scope.name)
+            cwd=self.cwd, interrupt=record.interrupt, agent=scope.name)
         token = push_context(tool_context)
         try:
             while True:
@@ -813,8 +831,9 @@ class AgentManager:
                 for event in client.chat(
                     context.request_messages(), scope.model,
                     system=scope.system,
-                    max_tokens=min(self.config.max_output_tokens,
-                                   scope.model.max_output_tokens),
+                    max_tokens=max(256, min(self.config.max_output_tokens,
+                                            scope.model.max_output_tokens,
+                                            budget.reserved_output)),
                     tools=tools,
                     prompt_cache_key=prefix.fingerprint,
                     effort=self.config.reasoning.effort,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shlex
 import threading
 from dataclasses import dataclass, field
@@ -182,9 +183,10 @@ def cmd_provider(app: Any, args: str) -> None:
         wizard.run_remove()
         return
     lines = []
+    selected = app.config.selected()
+    selected_name = selected[0].name if selected is not None else ''
     for provider in app.config.providers:
-        marker = '· selected' if provider.name == app.config.selected_model.split(
-            '::')[0] else ''
+        marker = '· selected' if provider.name == selected_name else ''
         lines.append(f'**{provider.name}**  ({provider.wire})  '
                      f'{len(provider.models)} models {marker}')
     app.open_message('Providers', '\n'.join(lines) or 'No providers configured.')
@@ -389,7 +391,8 @@ def cmd_goal(app: Any, args: str) -> None:
         return
     status = {'pause': 'paused', 'complete': 'completed',
               'blocked': 'blocked', 'cancel': 'cancelled'}[sub]
-    store.update(goal, status=status, result=value.strip())  # type: ignore[arg-type]
+    store.update(goal, status=status,  # type: ignore[arg-type]
+                 result=value.strip() or None)
     app.notify(f'Goal {goal.id}: {status}', 'success')
 
 
@@ -601,7 +604,8 @@ def _mcp_add_transport(app: Any, transport: str) -> None:
 
                 def ask_args(args_text: str) -> None:
                     try:
-                        arguments = shlex.split(args_text)
+                        # POSIX mode strips Windows backslashes from paths.
+                        arguments = shlex.split(args_text, posix=os.name != 'nt')
                     except ValueError:
                         arguments = args_text.split()
                     config = {'name': name.strip(), 'transport': 'stdio',
@@ -785,7 +789,7 @@ def cmd_btw(app: Any, args: str) -> None:
 
 @command('/diff', 'Show the Git working-tree diff', usage='/diff [path]')
 def cmd_diff(app: Any, args: str) -> None:
-    file_diff = git_worktree_diff('.', args.strip())
+    file_diff = git_worktree_diff(getattr(app, 'cwd', '.') or '.', args.strip())
     if app.loop is not None:
         app.loop.add_diff_item(f'git diff {args.strip()}'.strip(), file_diff)
     else:

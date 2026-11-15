@@ -9,6 +9,7 @@ UI observes it through a thread-safe event queue and a locked snapshot.
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 import time
@@ -68,7 +69,7 @@ class AgentLoop:
     def __init__(self, config: AppConfig, registry: ToolRegistry,
                  store: SessionStore, goals: GoalStore, skills: SkillRegistry,
                  emit: Callable[[str, dict[str, Any]], None],
-                 mcp_manager: Any = None) -> None:
+                 mcp_manager: Any = None, cwd: str = '') -> None:
         self.config = config
         self.registry = registry
         self.store = store
@@ -76,6 +77,9 @@ class AgentLoop:
         self.skills = skills
         self.emit = emit
         self.mcp_manager = mcp_manager
+        # Tools and project instructions resolve against this directory, which
+        # may differ from the process cwd when the app is started with --cwd.
+        self.cwd = cwd or os.getcwd()
 
         selected = config.selected()
         if selected is None:
@@ -83,7 +87,7 @@ class AgentLoop:
         self.provider, self.model = selected
         self.client = LLMClient(self.provider)
 
-        self.system = build_system_prompt(config, goals, skills)
+        self.system = build_system_prompt(config, goals, skills, cwd=self.cwd)
         schemas = registry.schemas(self.provider.wire)
         self.context = ConversationContext(
             StablePrefix.create(
@@ -121,7 +125,7 @@ class AgentLoop:
         self.registry.unregister_source('skill')
         self.agents = AgentManager(
             config, self.provider, self.model, self.system, self.context,
-            registry, goal_store=goals,
+            registry, goal_store=goals, cwd=self.cwd,
         )
         if config.agents.enabled:
             self.registry.register_many(self.agents.tool_specs())
@@ -154,9 +158,10 @@ class AgentLoop:
         text = text.strip()
         if not text:
             return False
-        # A queued request starts clean: an interrupt issued for the previous
-        # turn must not cancel this one before it begins.
-        self._interrupt.clear()
+        if not self.busy:
+            # A new turn starts clean; while a turn is running the pending
+            # interrupt must survive (the user pressed Esc for that turn).
+            self._interrupt.clear()
         self._work.put((mode, text))
         self._emit('queued', text=text, mode=mode,
                    position=self._work.qsize())
@@ -196,7 +201,8 @@ class AgentLoop:
         self._emit('diff_added')
 
     def request_compact(self) -> None:
-        self._interrupt.clear()
+        if not self.busy:
+            self._interrupt.clear()
         self._work.put(('compact', ''))
 
     # ── event delivery ──────────────────────────────────────
@@ -303,11 +309,13 @@ class AgentLoop:
         self._emit('status', status='thinking')
         context = self.context
         context.stage({'role': 'user', 'content': text})
-        tool_context = ToolContext(cwd='.', interrupt=self._interrupt, agent='root')
+        tool_context = ToolContext(cwd=self.cwd, interrupt=self._interrupt,
+                                   agent='root')
         token = push_context(tool_context)
         committed = False
         interrupted = False
         continuations = 0
+        pending_mailbox: list[str] = []
         try:
             with self.agents.root_scope():
                 # The turn runs until the model answers without tool calls; the
@@ -319,7 +327,7 @@ class AgentLoop:
                     if self._interrupt.is_set():
                         interrupted = True
                         break
-                    self._stage_mailbox(context)
+                    pending_mailbox.extend(self._stage_mailbox(context))
                     self._refresh_system_and_prefix()
                     thinking, full, tool_calls, finish_reason = self._stream_request(
                         turn, context)
@@ -350,6 +358,10 @@ class AgentLoop:
                         continuation = _continuation_prompt(thinking, full)
                         context.stage({'role': 'assistant', 'content': continuation})
                         continue
+                    if finish_reason == 'incomplete':
+                        self._append_notice(
+                            'The response ended without a finish signal; the answer '
+                            'may be truncated.', level='warning')
                     if full:
                         context.stage({
                             'role': 'assistant', 'content': full,
@@ -371,10 +383,13 @@ class AgentLoop:
         finally:
             pop_context(token)
             with self._lock:
-                self.turn_out = int(self.turn_out)
                 self.status = 'idle'
-            if interrupted:
+            if not committed:
+                # The whole turn is atomic: restore the consumed mailbox so the
+                # next turn still sees sub-agent results that were never sent.
                 context.rollback()
+                self.agents.requeue_mailbox(pending_mailbox)
+            if interrupted:
                 self._append_notice('[interrupted]', level='warning')
                 self._emit('interrupted')
             self._emit('turn_end', turn=turn, status='interrupted' if interrupted else 'done',
@@ -406,7 +421,8 @@ class AgentLoop:
         self._refresh_prefix(force=False)
         prefix = context.stable_prefix
         max_tokens = max(256, min(self.config.max_output_tokens,
-                                  self.model.max_output_tokens))
+                                  self.model.max_output_tokens,
+                                  budget.reserved_output))
         thinking = ''
         full = ''
         tool_calls: list[dict[str, Any]] = []
@@ -523,7 +539,7 @@ class AgentLoop:
             def sink(line: str, _call_id: str = call_id) -> None:
                 self._emit('tool_output', call_id=_call_id, text=line)
 
-            tool_context = ToolContext(cwd='.', interrupt=self._interrupt,
+            tool_context = ToolContext(cwd=self.cwd, interrupt=self._interrupt,
                                        agent='root', live_sink=sink)
             token = push_context(tool_context)
             try:
@@ -652,7 +668,8 @@ class AgentLoop:
             for event in self.client.chat(
                 messages, self.model,
                 system=f'{self.system}\n\n{ASIDE_SYSTEM}',
-                max_tokens=min(4096, self.config.max_output_tokens),
+                max_tokens=max(256, min(4096, self.config.max_output_tokens,
+                                        self.model.max_output_tokens)),
                 tools=None,
                 effort='low',
                 force_reasoning=self.config.reasoning.force,
@@ -708,7 +725,7 @@ class AgentLoop:
                                              text=text, level=level))
         self._emit('notice', text=text, level=level)
 
-    def _stage_mailbox(self, context: ConversationContext) -> None:
+    def _stage_mailbox(self, context: ConversationContext) -> list[str]:
         mailbox = self.agents.consume_mailbox()
         if mailbox:
             context.stage({
@@ -718,6 +735,7 @@ class AgentLoop:
             })
             self._emit('notice', text=f'Received {len(mailbox)} sub-agent update(s).',
                        level='info')
+        return mailbox
 
     def _display_tool(self, name: str) -> str:
         if self.mcp_manager is not None and name.startswith('mcp__'):
@@ -742,6 +760,18 @@ class AgentLoop:
                     live['text'] = (live.get('text', '') + event.content)[-4000:]
                     continue
                 if event.kind == 'usage':
+                    # Sub-agent tokens are real spending; fold them into the
+                    # session totals instead of dropping the event.
+                    try:
+                        usage = json.loads(event.content or '{}')
+                    except ValueError:
+                        continue
+                    if not isinstance(usage, dict):
+                        continue
+                    with self._lock:
+                        self.total_in += int(usage.get('input_tokens') or 0)
+                        self.total_out += int(usage.get('output_tokens') or 0)
+                    self._emit('usage', **usage)
                     continue
                 if event.kind == 'status':
                     self.agent_live.pop(event.agent_name, None)
@@ -779,7 +809,8 @@ class AgentLoop:
 
     # ── system/prefix management ────────────────────────────
     def _refresh_system_and_prefix(self, force: bool = False) -> None:
-        system = build_system_prompt(self.config, self.goals, self.skills)
+        system = build_system_prompt(self.config, self.goals, self.skills,
+                                     cwd=self.cwd)
         if force or system != self.context.stable_prefix.system:
             if system != self.context.stable_prefix.system:
                 with self._lock:
@@ -897,7 +928,9 @@ class AgentLoop:
             self.context.committed[:] = payload.messages
             self.context.draft.clear()
             self.context.archived[:] = payload.compaction_archive
-            self.system = build_system_prompt(self.config, self.goals, self.skills)
+            self.context.invalidate()
+            self.system = build_system_prompt(self.config, self.goals, self.skills,
+                                              cwd=self.cwd)
             prefix = StablePrefix.create(
                 provider=provider.name, endpoint=provider.base_url,
                 model=model.id, system=self.system,
@@ -918,6 +951,7 @@ class AgentLoop:
             self.context.committed.clear()
             self.context.draft.clear()
             self.context.archived.clear()
+            self.context.invalidate()
             self.items.clear()
             self.turn = 0
             self.session_name = ''
@@ -952,6 +986,10 @@ class AgentLoop:
             turn_ids = sorted({item.turn for item in self.items
                                if item.kind == 'user' and item.turn > 0})
             index = len(starts) - sum(1 for value in turn_ids if value >= turn)
+            if index < 0:
+                # The requested turn was archived by compaction; roll back to
+                # the oldest retained turn instead of wiping the whole context.
+                index = 0
             text = ''
             if 0 <= index < len(starts):
                 cut = starts[index]
@@ -964,6 +1002,7 @@ class AgentLoop:
             else:
                 self.context.committed.clear()
             self.context.draft.clear()
+            self.context.invalidate()
             self.items = [item for item in self.items if item.turn < turn]
             self.turn = max(0, turn - 1)
             self.status = 'idle'

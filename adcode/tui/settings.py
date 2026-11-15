@@ -18,7 +18,7 @@ from adcode.config import (
     REASONING_EFFORTS, AppConfig, get_by_path, set_by_path,
 )
 from adcode.theme import ACCENT_PRESETS, Palette
-from adcode.tui.canvas import BOLD, DIM, Canvas, truncate_text
+from adcode.tui.canvas import BOLD, DIM, Canvas, text_width, truncate_text
 from adcode.tui.dialogs import Overlay, _draw_backdrop, _draw_frame, _draw_hint, _panel_geometry
 from adcode.tui.input import KeyEvent
 
@@ -85,9 +85,9 @@ def _partial_children(prefix: str, from_path: str, to_path: str,
     style = _choice(f'{prefix}.style', 'Display style', style_path, [
         SettingChoice('normal', 'Normal', 'Markdown text at full opacity'),
         SettingChoice('gradient', 'Gradient fade', 'Fade the top rows',
-                      [ _number(f'{prefix}.gradient', 'Top row alpha',
-                                gradient_path, 0, 255,
-                                '0 = invisible top row, 255 = no fade') ]),
+                      [_number(f'{prefix}.gradient', 'Top row alpha',
+                               gradient_path, 0, 255,
+                               '0 = invisible top row, 255 = no fade')]),
     ])
     ellipsis = _choice(f'{prefix}.ellipsis', 'Omitted content', ellipsis_path, [
         SettingChoice('none', 'No marker', 'Truncate silently'),
@@ -511,11 +511,15 @@ class SettingsOverlay(Overlay):
     def _handle_edit(self, event: KeyEvent) -> bool:
         node = self._find_node(self.edit_key)
         if event.kind == 'paste':
-            self.edit_value = event.text.replace('\n', ' ')
-            self.edit_select_all = False
+            text = event.text.replace('\n', ' ')
+            if self.edit_select_all:
+                self.edit_value = text
+                self.edit_select_all = False
+            else:
+                self.edit_value += text
             return True
         if event.kind == 'text':
-            if getattr(self, 'edit_select_all', False):
+            if self.edit_select_all:
                 self.edit_value = ''
                 self.edit_select_all = False
             self.edit_value += event.text
@@ -527,7 +531,7 @@ class SettingsOverlay(Overlay):
             self.edit_error = ''
             return True
         if event.key == 'backspace':
-            if getattr(self, 'edit_select_all', False):
+            if self.edit_select_all:
                 self.edit_value = ''
                 self.edit_select_all = False
             else:
@@ -639,8 +643,9 @@ class SettingsOverlay(Overlay):
                 canvas.draw_text(x + indent, row_y, truncate_text(label, w // 2),
                                  palette.subtext, bg)
                 value = row.node.value_text(self.config) if row.node.value_text else ''
-                canvas.draw_text(x + indent + len(label) + 1, row_y,
-                                 truncate_text(value, max(1, w - indent - len(label) - 3)),
+                label_width = text_width(label)
+                canvas.draw_text(x + indent + label_width + 1, row_y,
+                                 truncate_text(value, max(1, w - indent - label_width - 3)),
                                  palette.muted, bg, DIM)
             elif row.kind == 'setting':
                 expanded = row.node.key in self.expanded
@@ -653,8 +658,9 @@ class SettingsOverlay(Overlay):
                                  palette.text, bg, BOLD if selected else 0)
                 value = self._display_value(row.node)
                 if value:
-                    value_x = x + w - 3 - len(value)
-                    if value_x > x + indent + 4 + len(label):
+                    value_width = text_width(value)
+                    value_x = x + w - 3 - value_width
+                    if value_x > x + indent + 4 + text_width(label):
                         canvas.draw_text(value_x, row_y, value,
                                          palette.subtext, bg)
             elif row.kind == 'option':
@@ -667,7 +673,7 @@ class SettingsOverlay(Overlay):
                                  truncate_text(row.option.label, w - indent - 6),
                                  palette.text, bg, BOLD if selected else 0)
                 if row.option.description:
-                    desc_x = x + indent + 3 + len(row.option.label)
+                    desc_x = x + indent + 3 + text_width(row.option.label)
                     if desc_x < x + w - 4:
                         canvas.draw_text(desc_x, row_y, truncate_text(
                             row.option.description, x + w - 4 - desc_x),

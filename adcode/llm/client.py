@@ -158,7 +158,14 @@ class LLMClient:
                 kwargs['extra_body'] = extra_body
 
         def factory() -> Generator[ChatEvent, None, None]:
-            stream = self._client.chat.completions.create(**kwargs)
+            try:
+                stream = self._client.chat.completions.create(**kwargs)
+            except openai.APIStatusError as error:
+                # Several OpenAI-compatible servers reject stream_options.
+                if error.status_code != 400 or 'stream_options' not in kwargs:
+                    raise
+                kwargs.pop('stream_options', None)
+                stream = self._client.chat.completions.create(**kwargs)
             yield from self._consume_openai_chat(stream)
 
         yield from _retry_generator(factory)
@@ -209,6 +216,11 @@ class LLMClient:
                                          call['arguments'])
         if finish_reason:
             yield {'kind': 'finish', 'reason': finish_reason}
+        else:
+            # The stream ended without a finish signal: a dropped connection or
+            # a proxy that omits finish_reason.  The caller warns instead of
+            # treating a possibly truncated answer as complete.
+            yield {'kind': 'finish', 'reason': 'incomplete'}
 
     # ── OpenAI responses ────────────────────────────────────
     def _openai_responses(self, messages: list[dict[str, Any]], model: ModelConfig,
@@ -244,6 +256,7 @@ class LLMClient:
         summary_had_delta = False
         summary_stage_open = False
         summary_stage_closed = False
+        finished = False
         for event in stream:
             etype = getattr(event, 'type', '')
             if etype == 'response.output_text.delta':
@@ -334,9 +347,14 @@ class LLMClient:
                                'reason': 'length' if reason == 'max_output_tokens' else 'incomplete'}
                     else:
                         yield {'kind': 'finish', 'reason': 'stop'}
+                else:
+                    yield {'kind': 'finish', 'reason': 'stop'}
+                finished = True
         for call in call_buf.values():
             if call['name']:
                 yield _tool_call_payload(call['id'], call['name'], call['arguments'])
+        if not finished:
+            yield {'kind': 'finish', 'reason': 'incomplete'}
 
     @staticmethod
     def _to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -390,42 +408,77 @@ class LLMClient:
     def _to_anthropic_msgs(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         pending_tool_results: list[dict[str, Any]] = []
+
+        def merge(role: str, content: Any) -> None:
+            """Append a message, merging consecutive same-role turns.
+
+            The Messages API requires alternating roles; AdCode injects extra
+            user blocks (sub-agent updates, summaries) that would otherwise
+            produce two user messages in a row and a 400 response.
+            """
+            if isinstance(content, str) and not content.strip():
+                return
+            if isinstance(content, list) and not content:
+                return
+            if out and out[-1]['role'] == role:
+                previous = out[-1]['content']
+                if isinstance(previous, str) and isinstance(content, str):
+                    out[-1]['content'] = f'{previous}\n\n{content}'
+                else:
+                    if isinstance(previous, str):
+                        previous = ([{'type': 'text', 'text': previous}]
+                                    if previous else [])
+                    else:
+                        previous = list(previous)
+                    if isinstance(content, str):
+                        content = [{'type': 'text', 'text': content}]
+                    out[-1]['content'] = [*previous, *content]
+                return
+            out.append({'role': role, 'content': content})
+
+        def flush_tool_results() -> None:
+            if pending_tool_results:
+                merge('user', list(pending_tool_results))
+                pending_tool_results.clear()
+
         for message in messages:
+            if not isinstance(message, dict):
+                continue
             role = message.get('role', '')
             if role == 'system':
                 continue
             if role == 'tool':
                 pending_tool_results.append({
                     'type': 'tool_result',
-                    'tool_use_id': message.get('tool_call_id', ''),
-                    'content': message.get('content', ''),
+                    'tool_use_id': str(message.get('tool_call_id') or ''),
+                    'content': str(message.get('content') or ''),
                 })
                 continue
-            if pending_tool_results:
-                out.append({'role': 'user', 'content': pending_tool_results})
-                pending_tool_results = []
+            flush_tool_results()
             if role == 'assistant' and message.get('tool_calls'):
                 blocks: list[dict[str, Any]] = []
                 if message.get('content'):
                     blocks.append({'type': 'text', 'text': message['content']})
-                for call in message['tool_calls']:
+                for call in message['tool_calls'] or []:
+                    if not isinstance(call, dict):
+                        continue
+                    function = call.get('function') or {}
                     try:
-                        args = json.loads(call['function']['arguments'])
+                        args = json.loads(function.get('arguments') or '{}')
                     except Exception:
                         args = {}
+                    if not isinstance(args, dict):
+                        args = {'value': args}
                     blocks.append({
-                        'type': 'tool_use', 'id': call['id'],
-                        'name': call['function']['name'], 'input': args,
+                        'type': 'tool_use', 'id': str(call.get('id') or ''),
+                        'name': str(function.get('name') or ''), 'input': args,
                     })
-                out.append({'role': 'assistant', 'content': blocks})
+                merge('assistant', blocks)
             elif role == 'assistant':
-                if message.get('content'):
-                    out.append({'role': 'assistant', 'content': message['content']})
+                merge('assistant', message.get('content'))
             elif role == 'user':
-                if message.get('content'):
-                    out.append({'role': 'user', 'content': message['content']})
-        if pending_tool_results:
-            out.append({'role': 'user', 'content': pending_tool_results})
+                merge('user', message.get('content'))
+        flush_tool_results()
         return out
 
     def _anthropic(self, messages: list[dict[str, Any]], model: ModelConfig,
@@ -512,16 +565,40 @@ class LLMClient:
 
     # ── model discovery ─────────────────────────────────────
     def list_models(self) -> list[str]:
+        models: list[str] = []
         if 'openai' in self.wire:
-            result = self._client.models.list()
+            page = self._client.models.list()
+            for item in getattr(page, 'data', page) or []:
+                model_id = getattr(item, 'id', None) or (
+                    item.get('id') if isinstance(item, dict) else None)
+                if model_id:
+                    models.append(str(model_id))
         else:
-            result = self._client.models.list()
-        data = getattr(result, 'data', result)
-        models = []
-        for item in data:
-            model_id = getattr(item, 'id', None) or (item.get('id') if isinstance(item, dict) else None)
-            if model_id:
-                models.append(str(model_id))
+            # The Anthropic SDK paginates; a single page hides most models.
+            after_id: str | None = None
+            for _ in range(50):
+                kwargs: dict[str, Any] = {'limit': 1000}
+                if after_id:
+                    kwargs['after_id'] = after_id
+                try:
+                    page = self._client.models.list(**kwargs)
+                except TypeError:
+                    page = self._client.models.list()
+                data = getattr(page, 'data', None)
+                if data is None and isinstance(page, list):
+                    data = page
+                data = list(data or [])
+                for item in data:
+                    model_id = getattr(item, 'id', None) or (
+                        item.get('id') if isinstance(item, dict) else None)
+                    if model_id:
+                        models.append(str(model_id))
+                if not getattr(page, 'has_more', False) or not data:
+                    break
+                after_id = getattr(page, 'last_id', None) or getattr(
+                    data[-1], 'id', None)
+                if not after_id:
+                    break
         return sorted(dict.fromkeys(models))
 
 
