@@ -44,6 +44,9 @@ from adcode.tui.transcript import LiveRender, TranscriptRenderer
 
 SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 _RENDER_INTERVAL = 1 / 30
+# Upper bound on the events handled per frame, so a flooded queue cannot starve
+# rendering (a paste arrives as one event, so this only caps bursts).
+_MAX_INPUT_BATCH = 128
 
 
 class PromptState:
@@ -371,6 +374,30 @@ class AdCodeApp:
         self.overlay = overlay
         self.dirty = True
 
+    def dismiss_overlay(self, overlay: Overlay | None = None,
+                        *, drop_input: bool = False) -> None:
+        """Close the current modal.
+
+        ``drop_input`` is for dismissals the user did not perform -- a spinner
+        that closes itself, for example.  Keys typed at that spinner must not
+        survive into the prompt underneath it.  A close the user asked for with
+        Esc or Enter keeps the queue intact: keys pressed after that are meant
+        for the prompt, and the input batch is handled in arrival order.
+        """
+        if overlay is not None and self.overlay is not overlay:
+            return
+        self.overlay = None
+        if drop_input:
+            self._drop_pending_input()
+        self.dirty = True
+
+    def _drop_pending_input(self) -> None:
+        while True:
+            try:
+                self.input_queue.get_nowait()
+            except queue.Empty:
+                return
+
     # ── notifications ───────────────────────────────────────
     def notify(self, text: str, level: str = 'info') -> None:
         if self.loop is not None:
@@ -503,8 +530,7 @@ class AdCodeApp:
                 if self.loop is not None:
                     self.loop.pump_agent_events()
                     self._apply_loop_events()
-                if event is not None:
-                    self._handle_event(event)
+                self._dispatch_input(event)
                 self._check_resize()
                 self._tick_animation()
                 self._render_if_due()
@@ -514,6 +540,24 @@ class AdCodeApp:
                     self.notify(f'UI error: {error}', 'error')
                 except Exception:
                     pass
+
+    def _dispatch_input(self, first: KeyEvent | None) -> None:
+        """Handle the queued input batch before painting the next frame.
+
+        Reading one event per frame builds a backlog while a frame is painted,
+        and a backlog outlives the surface it was typed for: keys typed at a
+        dialog would still be queued when the dialog closed and then land in
+        the prompt behind it.  Draining the batch in arrival order applies each
+        key to the screen state the user was actually looking at.
+        """
+        if first is not None:
+            self._handle_event(first)
+        for _ in range(_MAX_INPUT_BATCH):
+            try:
+                queued = self.input_queue.get_nowait()
+            except queue.Empty:
+                return
+            self._handle_event(queued)
 
     def _process_posted(self) -> None:
         while True:
@@ -671,6 +715,16 @@ class AdCodeApp:
 
     # ── input ───────────────────────────────────────────────
     def _handle_event(self, event: KeyEvent) -> None:
+        if self.overlay is not None:
+            # A modal owns every event while it is open.  Keys, pastes and the
+            # wheel used to fall through to the transcript and the prompt,
+            # because the mouse branch ran before this check and stopped there.
+            overlay = self.overlay
+            overlay.handle(event)
+            if overlay.closed and self.overlay is overlay:
+                self.dismiss_overlay(overlay)
+            self.dirty = True
+            return
         if event.kind == 'mouse':
             if event.action == 'wheel_up':
                 self.follow = False
@@ -682,13 +736,6 @@ class AdCodeApp:
                                   - max(1, self.config.ui.mouse_scroll_lines))
                 self.follow = self.scroll <= 0
                 self.dirty = True
-            return
-        if self.overlay is not None:
-            overlay = self.overlay
-            overlay.handle(event)
-            if overlay.closed and self.overlay is overlay:
-                self.overlay = None
-            self.dirty = True
             return
         if event.kind == 'paste':
             self.prompt.insert(event.text)
@@ -1327,8 +1374,7 @@ class AdCodeApp:
     def set_prompt(self, text: str, submit: bool = False) -> None:
         self.prompt.set_text(text)
         self.prompt.cursor = len(text)
-        self.overlay = None
-        self.dirty = True
+        self.dismiss_overlay()
         if submit:
             self.submit(text.strip())
 

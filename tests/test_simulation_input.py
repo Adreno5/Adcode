@@ -184,3 +184,46 @@ def test_multiline_input_paste_and_the_portable_newline_gesture(harness):
     harness.wait_idle(20.0)
     assert harness.requests[0].last_user_text() == \
         'line1\nline2\npasted'
+
+
+def test_modal_dialogs_own_the_wheel_and_the_keyboard(harness):
+    """A floating dialog must not leak events to the page underneath it."""
+    harness.gateway.responder = ScriptedResponder([
+        Turn(thinking='A long answer fills the viewport.', text=LONG_ANSWER),
+    ])
+    harness.submit('render a long answer', timeout=25.0)
+    harness.wait_for_text('80. streamed transcript row')
+    assert harness.app is not None
+    assert harness.app.scroll == 0 and harness.app.follow
+
+    harness.run_command('/context')
+    harness.wait_until(lambda: harness.app is not None
+                       and harness.app.overlay is not None, timeout=10.0,
+                       description='the context dialog')
+    harness.wait_rendered()
+
+    # The wheel over a dialog must not scroll the transcript behind it.
+    harness.wheel('wheel_up')
+    harness.wheel('wheel_up')
+    harness.wheel('wheel_down')
+    harness.wait_rendered()
+    assert harness.app.scroll == 0
+    assert harness.app.follow
+
+    # Nor may keys reach the prompt; they belong to the dialog.
+    harness.type_text('leaked')
+    harness.press('pgup')
+    harness.wait_rendered()
+    assert harness.app.prompt.text == ''
+    assert harness.app.scroll == 0
+    assert harness.app.overlay is not None
+
+    # Closing the dialog must not submit anything that was typed at it.
+    harness.press('enter')
+    harness.wait_until(lambda: harness.app is not None
+                       and harness.app.overlay is None, timeout=10.0,
+                       description='the context dialog to close')
+    harness.wait_rendered()
+    assert harness.app.prompt.text == ''
+    assert harness.app.scroll == 0 and harness.app.follow
+    assert len(harness.requests) == 1

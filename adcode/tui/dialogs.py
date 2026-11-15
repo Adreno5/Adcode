@@ -20,6 +20,17 @@ class DialogItem:
     selected: bool = False
 
 
+def wheel_step(event: KeyEvent) -> int:
+    """Direction of a mouse-wheel event: -1 up, 1 down, 0 for anything else."""
+    if event.kind != 'mouse':
+        return 0
+    if event.action == 'wheel_up':
+        return -1
+    if event.action == 'wheel_down':
+        return 1
+    return 0
+
+
 class Overlay:
     title = ''
 
@@ -150,6 +161,10 @@ class SelectDialog(Overlay):
                 self.index = 0
             return True
         if event.kind != 'key':
+            step = wheel_step(event)
+            visible = self._visible_items()
+            if step and visible:
+                self.index = (self.index + step) % len(visible)
             return True
         key = event.key
         visible = self._visible_items()
@@ -319,6 +334,11 @@ class MultiSelectDialog(Overlay):
             if self.allow_filter:
                 self.filter += event.text.replace('\r', '').replace('\n', ' ')
                 self.index = 0
+            return True
+        if event.kind == 'mouse':
+            step = wheel_step(event)
+            if step and visible:
+                self.index = (self.index + step) % len(visible)
             return True
         if event.kind == 'key':
             key = event.key

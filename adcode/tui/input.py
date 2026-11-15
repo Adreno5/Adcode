@@ -195,6 +195,11 @@ _LEGACY_WIN_KEYS = {
     'C': '\x1b[20~', 'D': '\x1b[21~', 'E': '\x1b[23~', 'F': '\x1b[24~',
 }
 
+# Bytes that can appear inside the parameters of a control sequence (SGR mouse
+# reports, modified keys, terminal replies).  A run of these after a committed
+# Esc is the tail of a report that was split across two reads.
+_REPORT_PARAMETERS = frozenset('0123456789;:<=>?')
+
 
 def _modified_key(name: str, mods: int) -> tuple[str, bool, bool, bool]:
     """Map an xterm modifier parameter (1 + bitmask) onto our flags."""
@@ -231,6 +236,7 @@ class KeyParser:
         self._esc_at = 0.0
         self._started = 0.0
         self._tail_until = 0.0
+        self._tail_final = False
 
     def feed(self, chunk: str, now: float | None = None) -> list[KeyEvent]:
         now = time.monotonic() if now is None else now
@@ -282,6 +288,7 @@ class KeyParser:
             return 0
         # The remaining bytes of this report may still arrive; swallow them.
         self._tail_until = now + self._TAIL_WINDOW
+        self._tail_final = False
         return len(buffer)
 
     def _parse(self, now: float, final: bool) -> list[KeyEvent]:
@@ -307,6 +314,10 @@ class KeyParser:
                 if consumed:
                     self._buffer = self._buffer[consumed:]
                     continue
+            elif self._tail_until:
+                # The tail window has passed; later bytes are ordinary typing.
+                self._tail_until = 0.0
+                self._tail_final = False
             ch = self._buffer[0]
             self._buffer = self._buffer[1:]
             events.append(self._plain_char(ch))
@@ -316,23 +327,31 @@ class KeyParser:
         """Consume the parameter/final bytes of an abandoned report.
 
         Used when a report was cut short mid-parameters and its tail arrives
-        after the parser stopped waiting for it.  A tail that does not start
-        with a parameter byte is ordinary typing and is left alone.
+        after the parser stopped waiting for it.  Only a report-shaped tail is
+        swallowed: a lone printable typed after Esc -- ``/`` right after closing
+        a dialog, say -- is ordinary typing and must reach the prompt.
         """
-        if not self._buffer or not 0x20 <= ord(self._buffer[0]) <= 0x3F:
-            self._tail_until = 0.0
-            return 0
-        index = 0
-        while index < len(self._buffer):
-            code = ord(self._buffer[index])
-            if 0x20 <= code <= 0x3F:
-                index += 1
-                continue
-            if 0x40 <= code <= 0x7E:
+        buffer = self._buffer
+        if self._tail_final:
+            # The parameters were swallowed on an earlier read; this is the
+            # final byte that closes the report.
+            self._tail_final = False
+            if 0x40 <= ord(buffer[0]) <= 0x7E:
                 self._tail_until = 0.0
-                return index + 1
-            break
-        return index
+                return 1
+        index = 0
+        while index < len(buffer) and buffer[index] in _REPORT_PARAMETERS:
+            index += 1
+        if 0 < index < len(buffer) and 0x40 <= ord(buffer[index]) <= 0x7E:
+            self._tail_until = 0.0
+            return index + 1
+        if index >= 2 and index == len(buffer):
+            # A numeric run with no final byte yet: keep waiting for the rest.
+            self._tail_final = True
+            return index
+        # Anything shorter is a keypress, not the tail of a report.
+        self._tail_until = 0.0
+        return 0
 
     @staticmethod
     def _looks_like_sequence_tail(buffer: str) -> bool:
