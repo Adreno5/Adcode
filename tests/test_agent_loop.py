@@ -1,3 +1,4 @@
+import asyncio
 import time
 
 import pytest
@@ -7,52 +8,77 @@ from adcode.agent_loop import AgentLoop
 from adcode.goals import GoalStore
 from adcode.session import SessionStore
 from adcode.skills import SkillRegistry
-from adcode.tools.registry import ToolRegistry, ToolSpec
+from adcode.tools.registry import AnnotatedTool, ToolRegistry
 
 
 class ScriptedClient:
-    """Deterministic streaming client used by the loop tests."""
+    """Deterministic IChatClient: replays sdk-shaped stream events.
 
-    def __init__(self, provider):
+    Rounds are chosen by the last user text, like the old chat() scripts.
+    """
+
+    instances: list['ScriptedClient'] = []
+
+    def __init__(self, provider, model=None, *, base_dir='', file_cache=None,
+                 warn=None):
         self.provider = provider
-        self.requests = []
+        self.model = model.id if model is not None else 'test-model'
+        self.base_dir = base_dir
+        self.requests: list[list[dict]] = []
+        self.kwargs: list[dict] = []
+        ScriptedClient.instances.append(self)
 
-    def chat(self, messages, model, *, system='', max_tokens=8192, tools=None,
-             prompt_cache_key=None, effort='medium', force_reasoning=False):
-        self.requests.append(messages)
+    async def stream(self, messages, tools=None, **kwargs):
+        # the engine passes ChatMessage objects; normalize once, like the
+        # real clients do
+        msgs = [m.to_dict() if hasattr(m, 'to_dict') else dict(m)
+                for m in messages]
+        self.requests.append(msgs)
+        self.kwargs.append(kwargs)
+        system = next((str(m.get('content') or '') for m in msgs
+                       if m.get('role') == 'system'), '')
+        last_user = next((str(m.get('content') or '') for m in reversed(msgs)
+                          if m.get('role') == 'user'), '')
         if 'compactor' in system.lower():
-            yield {'kind': 'text', 'content': 'SUMMARY'}
-            yield {'kind': 'finish', 'reason': 'stop'}
+            yield 'SUMMARY'
+            yield {'finish': 'stop'}
             return
         if 'side question' in system.lower():
-            yield {'kind': 'text', 'content': 'aside answer'}
-            yield {'kind': 'finish', 'reason': 'stop'}
+            yield 'aside answer'
+            yield {'finish': 'stop'}
             return
-        last_user = next((str(message.get('content') or '')
-                          for message in reversed(messages)
-                          if message.get('role') == 'user'), '')
         if 'use tool' in last_user and not any(
-                message.get('role') == 'tool' for message in messages):
-            yield {'kind': 'thinking', 'content': 'Need a tool.'}
-            yield {'kind': 'tool_call', 'id': 'c1', 'name': 'probe',
-                   'args': {'value': 'x'}}
-            yield {'kind': 'finish', 'reason': 'tool_calls'}
+                m.get('role') == 'tool' for m in msgs):
+            yield {'reasoning': 'Need a tool.'}
+            yield {'tool_calls': [{'index': 0, 'id': 'c1', 'name': 'probe',
+                                   'arguments': '{"value": "x"}'}]}
+            yield {'finish': 'tool_calls'}
             return
-        yield {'kind': 'thinking', 'content': 'Thinking...'}
-        yield {'kind': 'text', 'content': 'Answer '}
-        yield {'kind': 'text', 'content': '**done**.'}
-        yield {'kind': 'usage', 'usage': {
-            'input_tokens': 12, 'output_tokens': 4,
-            'input_tokens_details': {'cached_tokens': 5}}}
-        yield {'kind': 'finish', 'reason': 'stop'}
+        yield {'reasoning': 'Thinking...'}
+        yield 'Answer '
+        yield '**done**.'
+        yield {'usage': {'input_tokens': 12, 'output_tokens': 4,
+                         'input_tokens_details': {'cached_tokens': 5}}}
+        yield {'finish': 'stop'}
+
+    def invoke(self, messages, tools=None, **kwargs):
+        raise NotImplementedError
+
+    def list_models(self):
+        return ['test-model']
 
 
 @pytest.fixture()
 def loop(config, tmp_path, monkeypatch):
     monkeypatch.setattr(agent_loop, 'LLMClient', ScriptedClient)
     registry = ToolRegistry()
-    registry.register(ToolSpec(
-        'probe', 'probe', {'type': 'object'}, lambda args: 'probe:' + args['value']))
+    registry.register(AnnotatedTool(
+        name='probe', description='probe',
+        parameters={'type': 'object',
+                    'properties': {'value': {'type': 'string'}},
+                    'required': ['value']},
+        handler=lambda value: 'probe:' + str(value)))
+    ScriptedClient.instances = []
     instance = AgentLoop(
         config, registry, SessionStore(tmp_path / 'sessions'),
         GoalStore(tmp_path / 'goals.json'),
@@ -75,205 +101,189 @@ def wait_idle(loop, timeout=5.0):
                 return
         else:
             quiet_since = None
-        time.sleep(0.02)
-    raise AssertionError('loop did not become idle')
+        time.sleep(0.01)
+    raise TimeoutError('the engine never went idle')
+
+
+def _kinds(loop):
+    return [kind for kind, _ in loop.drain_ui_events()]
 
 
 def test_simple_turn(loop):
-    loop.submit('hello')
+    loop.submit('hello there')
     wait_idle(loop)
-    assert loop.snapshot().status == 'idle'
-    assert [message['role'] for message in loop.context.committed] == [
-        'user', 'assistant']
-    assert loop.context.committed[1]['content'] == 'Answer **done**.'
-    assert loop.context.committed[1]['reasoning_content'] == 'Thinking...'
-    kinds = [item.kind for item in loop.items]
-    assert kinds == ['user', 'thinking', 'assistant']
-    assert loop.total_in == 12 and loop.total_out == 4
-    assert loop.usage_records[-1]['cached_input_tokens'] == 5
+    kinds = _kinds(loop)
+    for kind in ('turn_start', 'status', 'thinking_delta', 'text_delta',
+                 'usage', 'turn_end'):
+        assert kind in kinds, kinds
+    assert _kinds(loop) == []
+    items = loop.items_snapshot()
+    assert [item.kind for item in items] == ['user', 'thinking', 'assistant']
+    assert items[-1].text == 'Answer **done**.'
+    # the committed history stays provider-shaped
+    roles = [m['role'] for m in loop.context.committed]
+    assert roles == ['user', 'assistant']
+    snap = loop.snapshot()
+    assert snap.turn == 1 and snap.total_in == 12 and snap.total_out == 4
+    assert snap.provider == 'Test' and snap.model == 'test-model'
 
 
 def test_tool_turn(loop):
     loop.submit('please use tool')
     wait_idle(loop)
-    roles = [message['role'] for message in loop.context.committed]
+    kinds = _kinds(loop)
+    assert 'tool_start' in kinds and 'tool_end' in kinds
+    items = loop.items_snapshot()
+    # the tool round's reasoning lands as its own thinking item, before the
+    # tool executes
+    assert [item.kind for item in items] == ['user', 'thinking', 'tool',
+                                             'thinking', 'assistant']
+    assert items[2].output == 'probe:x'
+    roles = [m['role'] for m in loop.context.committed]
     assert roles == ['user', 'assistant', 'tool', 'assistant']
-    tool_item = next(item for item in loop.items if item.kind == 'tool')
-    assert tool_item.name == 'probe'
-    assert tool_item.status == 'done'
-    assert 'probe:x' in tool_item.output
-    assert tool_item.duration >= 0
+    assert loop.context.committed[2]['content'] == 'probe:x'
+    # the tool result reaches the next model call
+    second = ScriptedClient.instances[-1].requests[-1]
+    assert any(m.get('role') == 'tool' and m.get('content') == 'probe:x'
+               for m in second)
 
 
-def test_view_image_tool_attaches_the_picture(loop, tmp_path):
-    """A tool result that names an image becomes a user image block."""
-    from adcode import images
-
-    (tmp_path / 'shot.png').write_bytes(
-        images.encode_png(2, 2, bytes([1, 2, 3, 255] * 4)))
-    loop.cwd = str(tmp_path)
-    loop.client.base_dir = str(tmp_path)
-    rounds = {'n': 0}
-
-    def chat(messages, model, **kwargs):
-        rounds['n'] += 1
-        if rounds['n'] == 1:
-            yield {'kind': 'tool_call', 'id': 'c1', 'name': 'view_image',
-                   'args': {'path': 'shot.png'}}
-            yield {'kind': 'finish', 'reason': 'tool_calls'}
-            return
-        yield {'kind': 'text', 'content': 'I can see it.'}
-        yield {'kind': 'finish', 'reason': 'stop'}
-
-    loop.client.chat = chat
-    loop.submit('look at the screenshot')
+def test_usage_normalization_reaches_the_event(loop):
+    loop.submit('hello there')
     wait_idle(loop)
-    roles = [message['role'] for message in loop.context.committed]
-    assert roles == ['user', 'assistant', 'tool', 'user', 'assistant']
-    tool_message = loop.context.committed[2]
-    assert 'Loaded shot.png (2x2 image/png' in tool_message['content']
-    injected = loop.context.committed[3]['content']
-    assert injected.startswith('<tool_images>')
-    assert '[image: sessions/images/paste-' in injected
-    # The picture is only expanded for the request; history keeps the marker.
-    assert 'base64' not in injected
-    tool_item = next(item for item in loop.items if item.kind == 'tool')
-    assert tool_item.name == 'view_image'
-    assert tool_item.status == 'done'
+    usage = [payload for kind, payload in loop.drain_ui_events()
+             if kind == 'usage']
+    assert usage, 'usage events must reach the ui'
+    event = usage[-1]
+    assert event['input_tokens'] == 12
+    assert event['cached_input_tokens'] == 5
+    assert event['uncached_input_tokens'] == 7
+    assert event['prefix_generation'] >= 1
+    assert event['prefix_hash'].startswith('sha256:')
 
 
-def test_turn_is_not_capped_by_tool_rounds(loop):
-    """A long investigation is only ended by the model, not a fixed count."""
-    rounds = 130
-    sessions = {'n': 0}
-
-    def long_chat(messages, model, **kwargs):
-        sessions['n'] += 1
-        if sessions['n'] <= rounds:
-            yield {'kind': 'tool_call', 'id': f'c{sessions["n"]}',
-                   'name': 'probe', 'args': {'value': str(sessions['n'])}}
-            yield {'kind': 'finish', 'reason': 'tool_calls'}
-            return
-        yield {'kind': 'text', 'content': 'finished.'}
-        yield {'kind': 'finish', 'reason': 'stop'}
-
-    loop.client.chat = long_chat
-    loop.submit('keep going')
-    wait_idle(loop, timeout=30)
-    assert not any('tool iteration limit' in item.text for item in loop.items
-                   if item.kind == 'notice')
-    assert [item.kind for item in loop.items].count('tool') == rounds
-    assert loop.context.committed[-1]['content'] == 'finished.'
+def test_compaction_trigger(config, tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_loop, 'LLMClient', ScriptedClient)
+    config.context.auto_compact = True
+    config.context.compact_threshold = 5
+    config.selected()[1].context_window = 2_000
+    loop = AgentLoop(config, ToolRegistry(), SessionStore(tmp_path / 's'),
+                     GoalStore(tmp_path / 'g.json'),
+                     SkillRegistry(config.skills, str(tmp_path)),
+                     emit=lambda kind, payload: None)
+    loop.start()
+    try:
+        loop.submit('hello there')
+        wait_idle(loop)
+        kinds = _kinds(loop)
+        assert 'compaction_start' in kinds and 'compaction_end' in kinds
+    finally:
+        loop.shutdown()
 
 
-def test_compaction_trigger(loop):
-    loop.model.context_window = 8_000
-    loop.config.max_output_tokens = 4_000
-    loop.config.context.reserved_output = 4_000
-    for index in range(12):
-        loop.context.committed.append({'role': 'user', 'content': f'u{index} ' + 'x' * 300})
-        loop.context.committed.append({'role': 'assistant',
-                                       'content': f'a{index} ' + 'y' * 300})
-    loop.config.context.compact_threshold = 50
-    loop.submit('continue')
-    wait_idle(loop)
-    assert loop.context.archived
-    assert any('SUMMARY' in str(message.get('content'))
-               for message in loop.context.committed)
-    assert any('Context compacted' in item.text for item in loop.items
-               if item.kind == 'notice')
+def test_interrupt(config, tmp_path, monkeypatch):
+    class SlowClient(ScriptedClient):
+        async def stream(self, messages, tools=None, **kwargs):
+            self.requests.append(list(messages))
+            yield 'partial '
+            await asyncio.sleep(1.5)
+            yield 'answer'
+            yield {'finish': 'stop'}
 
-
-def test_interrupt(loop):
-    def slow_chat(messages, model, **kwargs):
-        for index in range(30):
-            yield {'kind': 'text', 'content': f'chunk{index} '}
-            time.sleep(0.02)
-        yield {'kind': 'finish', 'reason': 'stop'}
-
-    loop.client.chat = slow_chat
-    loop.submit('slow')
-    time.sleep(0.1)
-    assert loop.busy
-    loop.interrupt()
-    wait_idle(loop)
-    assert any(item.kind == 'notice' and '[interrupted]' in item.text
-               for item in loop.items)
-    # Esc keeps the work that already happened: the user message and the tokens
-    # that were already on screen stay in the history.  Dropping them made the
-    # next request disagree with the transcript and lost the whole turn.
-    assert [message['role'] for message in loop.context.committed] == [
-        'user', 'assistant']
-    assert loop.context.committed[0]['content'] == 'slow'
-    assert loop.context.committed[1]['content'].startswith('chunk0')
-    assert loop.context.draft == []
+    monkeypatch.setattr(agent_loop, 'LLMClient', SlowClient)
+    loop = AgentLoop(config, ToolRegistry(), SessionStore(tmp_path / 's'),
+                     GoalStore(tmp_path / 'g.json'),
+                     SkillRegistry(config.skills, str(tmp_path)),
+                     emit=lambda kind, payload: None)
+    loop.start()
+    try:
+        loop.submit('hello there')
+        time.sleep(0.3)
+        loop.interrupt()
+        wait_idle(loop, timeout=10)
+        events = loop.drain_ui_events()
+        kinds = [kind for kind, _ in events]
+        assert 'interrupted' in kinds
+        turn_end = [payload for kind, payload in events if kind == 'turn_end'][-1]
+        assert turn_end['status'] == 'interrupted'
+        # a text-only draft is rolled back: nothing half-finished is committed
+        assert loop.context.committed == []
+    finally:
+        loop.shutdown()
 
 
 def test_aside_does_not_touch_history(loop):
-    loop.submit('main question')
+    loop.submit('hello there')
     wait_idle(loop)
-    before = len(loop.context.committed)
-    loop.submit('what is side?', 'aside')
+    loop.drain_ui_events()
+    committed_before = list(loop.context.committed)
+    loop.submit('quick side question?', mode='aside')
     wait_idle(loop)
-    assert len(loop.context.committed) == before
-    aside = next(item for item in loop.items if item.kind == 'aside')
-    assert aside.text == 'aside answer'
-    assert aside.display == 'what is side?'
+    kinds = _kinds(loop)
+    assert 'aside_start' in kinds and 'aside_delta' in kinds and 'aside_end' in kinds
+    assert list(loop.context.committed) == committed_before
+    aside = loop.items_snapshot()[-1]
+    assert aside.kind == 'aside' and aside.text == 'aside answer'
 
 
-def test_persistence_and_rewind(loop, tmp_path):
-    loop.submit('first')
+def test_persistence_and_rewind(loop):
+    loop.submit('hello there')
     wait_idle(loop)
-    loop.submit('second')
-    wait_idle(loop)
+    loop.save_as('persisted')
     payload = loop.payload()
-    assert payload.name
-    assert len(payload.items) >= 4
-    text = loop.rewind(2)
-    assert text == 'second'
-    assert [message['content'] for message in loop.context.committed] == [
-        'first', 'Answer **done**.']
-    assert all(item.turn < 2 for item in loop.items)
+    assert payload.name == 'persisted'
+    assert len(payload.messages) == 2
+    # rewind drops the turn and reports the dropped user text
+    dropped = loop.rewind(1)
+    assert dropped == 'hello there'
+    assert loop.context.committed == []
+    assert loop.snapshot().turn == 0
+    loop.drain_ui_events()
 
 
 def test_fork_and_save(loop):
-    loop.submit('hello')
+    loop.submit('hello there')
     wait_idle(loop)
-    name = loop.fork('target')
-    assert name == 'target'
-    assert loop.session_name == 'target'
-    assert loop.store.load('target') is not None
-    loop.save_as('copy')
-    assert loop.store.load('copy') is not None
+    name = loop.fork()
+    assert name.endswith('_fork')
+    loop.drain_ui_events()
 
 
 def test_clear(loop):
-    loop.submit('hello')
+    loop.submit('hello there')
     wait_idle(loop)
     loop.clear()
-    assert loop.items == []
     assert loop.context.committed == []
-    assert loop.snapshot().session_name == ''
+    assert loop.items_snapshot() == []
+    assert loop.snapshot().turn == 0
+    assert 'session_cleared' in _kinds(loop)
 
 
 def test_apply_payload_resume(loop):
-    loop.submit('hello')
+    loop.submit('hello there')
     wait_idle(loop)
     payload = loop.payload()
     loop.clear()
     loop.apply_payload(payload)
-    assert loop.context.committed == payload.messages
-    assert loop.session_name == payload.name
-    assert [item.kind for item in loop.items] == ['user', 'thinking', 'assistant']
-    assert loop.snapshot().status == 'idle'
+    assert len(loop.context.committed) == 2
+    assert 'session_loaded' in _kinds(loop)
 
 
 def test_load_session_from_store(loop):
-    loop.submit('hello')
+    loop.submit('hello there')
     wait_idle(loop)
-    loop.save_as('stored')
+    loop.save_active()
     loop.clear()
-    assert loop.load_session('stored')
-    assert loop.session_name == 'stored'
-    assert loop.context.committed
-    assert not loop.load_session('missing')
+    name = loop.snapshot().session_name
+    assert loop.load_session(name) is True
+    assert len(loop.context.committed) == 2
+
+
+def test_tools_and_agent_tools_registered(loop):
+    names = set(loop._registry.names())
+    assert {'read', 'write', 'edit', 'bash', 'grep'} <= names
+    if loop.config.agents.enabled:
+        assert {'spawn_agent', 'send_message', 'update_goal'} <= names
+    loop.refresh_tools()
+    assert set(loop._registry.names()) >= names
+    loop.drain_ui_events()

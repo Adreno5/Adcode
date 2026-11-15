@@ -1,139 +1,303 @@
+"""Sub-agent collaboration tests for the sdk-backed AgentManager wrapper."""
+
+from __future__ import annotations
+
+import asyncio
+import json
 import time
+from typing import Any
 
 import pytest
 
-import adcode.agents.manager as manager_module
-from adcode.agents.manager import AgentManager, AgentStatus
-from adcode.llm.context import ConversationContext, StablePrefix
-from adcode.tools.registry import ToolRegistry
+from adcode.agents.manager import AgentEvent, AgentManager, AgentStatus
+from adcode.config import AgentsSettings, ModelConfig, ProviderConfig
+from adcode.goals import GoalStore
+from harness.agent import ConversationEngine, EngineConfig, ModelInfo
+from harness.tools.registry import AnnotatedTool, ManagedToolRegistry
 
 
-class AgentClient:
-    def __init__(self, provider):
+class ScriptedClient:
+    """Shared IChatClient stub; replies scripted per call."""
+
+    instances: list['ScriptedClient'] = []
+
+    def __init__(self, provider=None, model=None, *, base_dir='', file_cache=None,
+                 warn=None):
         self.provider = provider
+        self.rounds: list[list[str]] = [['child result']]
+        self.calls = 0
+        self.prompts: list[list[str]] = []
+        ScriptedClient.instances.append(self)
 
-    def chat(self, messages, model, *, system='', max_tokens=8192, tools=None,
-             prompt_cache_key=None, effort='medium', force_reasoning=False):
-        if 'slow' in str(messages[-1].get('content', '')):
-            for index in range(50):
-                yield {'kind': 'text', 'content': 'tick '}
-                time.sleep(0.01)
-            yield {'kind': 'finish', 'reason': 'stop'}
-            return
-        yield {'kind': 'text', 'content': 'child result'}
-        yield {'kind': 'finish', 'reason': 'stop'}
+    async def stream(self, messages, tools=None, **kwargs):
+        # the engine passes ChatMessage objects; normalize once
+        msgs = [m.to_dict() if hasattr(m, 'to_dict') else dict(m)
+                for m in messages]
+        self.prompts.append([str(m.get('content', ''))[:40] for m in msgs])
+        index = min(self.calls, len(self.rounds) - 1)
+        self.calls += 1
+        last_user = next((str(m.get('content') or '') for m in reversed(msgs)
+                          if m.get('role') == 'user'), '')
+        if 'slowly' in last_user:
+            await asyncio.sleep(1.0)
+        for piece in self.rounds[index]:
+            yield piece
+        yield {'finish': 'stop'}
 
-
-@pytest.fixture()
-def manager(config, tmp_path, monkeypatch):
-    monkeypatch.setattr(manager_module, 'LLMClient', AgentClient)
-    prefix = StablePrefix.create(
-        provider='Test', endpoint='http://x', model='test-model',
-        system='root system', tools=[])
-    context = ConversationContext(prefix, [
-        {'role': 'user', 'content': 'root question'},
-        {'role': 'assistant', 'content': 'root answer'},
-    ])
-    instance = AgentManager(config, config.providers[0], config.providers[0].models[0],
-                            'root system', context, ToolRegistry())
-    yield instance
-    instance.shutdown()
+    def invoke(self, messages, tools=None, **kwargs):
+        raise NotImplementedError
 
 
-def wait_for(manager, name, statuses=('completed',), timeout=4.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        record = manager._records.get(name)
-        if record is not None and record.status in statuses:
-            return record
-        time.sleep(0.02)
-    raise AssertionError(f'{name} did not reach {statuses}; '
-                         f'last={manager._records.get(name).status if manager._records.get(name) else None}')
+def _config() -> Any:
+    from adcode.config import AppConfig
+
+    cfg = AppConfig()
+    provider = ProviderConfig(name='Test', base_url='http://localhost:9/v1',
+                              api_key='k', wire='openai chat completions',
+                              models=[ModelConfig(id='test-model')])
+    other = ProviderConfig(name='Other', base_url='http://localhost:10/v1',
+                           api_key='k', wire='openai chat completions',
+                           models=[ModelConfig(id='other-model')])
+    cfg.providers = [provider, other]
+    cfg.select('Test', 'test-model')
+    agent_type = type(cfg.agent_types['general'])
+    cfg.agent_types['scout'] = agent_type(
+        name='scout', description='scouts ahead', system='be brief',
+        model='Test::test-model', tools=['read'], max_turns=6)
+    cfg.agent_types['remote'] = agent_type(
+        name='remote', description='runs elsewhere', system='be remote',
+        model='Other::other-model', tools=[], max_turns=6)
+    cfg.agents.enabled = True
+    return cfg
 
 
-def test_spawn_and_mailbox(manager):
-    with manager.root_scope():
-        record = manager.spawn_agent('child', 'do the work', 'general', 'none')
-    assert record.scope.name == 'root/child'
-    wait_for(manager, 'root/child')
-    rows = manager.list_agents()
-    assert any(row['agent_name'] == 'root/child' for row in rows)
-    mailbox = manager.consume_mailbox('root')
-    assert any('subagent_update' in message for message in mailbox)
-    events = manager.drain_events()
-    assert any(event.kind == 'status' for event in events)
+def _registry() -> ManagedToolRegistry:
+    registry = ManagedToolRegistry()
+    registry.register(AnnotatedTool(
+        name='read', description='read', read_only=True,
+        parameters={'type': 'object',
+                    'properties': {'path': {'type': 'string'}},
+                    'required': ['path']},
+        handler=lambda path: 'file body'), source='builtin')
+    return registry
 
 
-def test_safe_history_fork_turns(manager):
-    with manager.root_scope():
-        record = manager.spawn_agent('child', 'work', 'general', 'all')
-    assert record.scope.context.committed[0]['content'] == 'root question'
-    with manager.root_scope():
-        none = manager.spawn_agent('empty', 'work', 'general', 'none')
-    assert none.scope.context.committed == []
+def _model_info() -> ModelInfo:
+    return ModelInfo(id='test-model', provider='Test',
+                     endpoint='http://localhost:9/v1', wire='chat',
+                     context_window=32_000, max_output_tokens=2_048)
 
 
-def test_limits_and_duplicates(manager):
-    manager.config.agents.max_depth = 1
-    with manager.root_scope():
-        manager.spawn_agent('child', 'work', 'general', 'none')
+def _setup(tmp_path, rounds: list[str] | None = None):
+    """Build (root engine, manager, client) under a running loop."""
+    cfg = _config()
+    client = ScriptedClient()
+    if rounds:
+        client.rounds = rounds
+    registry = _registry()
+    root = ConversationEngine(
+        client=client, registry=registry, store=None, cwd=str(tmp_path),
+        model=_model_info(),
+        config=EngineConfig(agents=AgentsSettings(max_concurrent=4)),
+        system_provider=lambda: 'root system')
+    manager = AgentManager(
+        cfg, cfg.agents, registry, client, _model_info(),
+        goal_store=GoalStore(tmp_path / 'goals.json'),
+        client_factory=lambda provider, model: ScriptedClient(provider, model),
+        cwd=str(tmp_path))
+    manager._provider = cfg.providers[0]
+    manager._model_config = cfg.providers[0].models[0]
+    manager.attach(root)
+    return root, manager, client
+
+
+async def _wait_child(manager, name: str, timeout: float = 5.0) -> None:
+    async def poll():
+        while manager._agents[name].status not in (
+                'completed', 'errored', 'interrupted'):
+            await asyncio.sleep(0.02)
+    await asyncio.wait_for(poll(), timeout)
+
+
+def test_spawn_delivers_update_to_parent_mailbox(tmp_path):
+    async def main():
+        root, manager, client = _setup(tmp_path)
+        record = await manager.spawn('scout', 'scout the area')
+        assert record.name == 'scout'
+        await _wait_child(manager, 'scout')
+        updates = manager.consume_mailbox(root)
+        assert len(updates) == 1
+        assert '<subagent_update agent="scout" status="completed">' in updates[0]
+        assert 'child result' in updates[0]
+        rows = manager.agents_snapshot()
+        assert any(row['name'] == 'scout' and row['status'] == 'completed'
+                   for row in rows)
+
+    asyncio.run(main())
+
+
+def test_agent_type_resolves_model_and_tools(tmp_path):
+    created: list[tuple[str, str]] = []
+
+    async def main():
+        cfg = _config()
+        client = ScriptedClient()
+        registry = _registry()
+        root = ConversationEngine(
+            client=client, registry=registry, cwd=str(tmp_path),
+            model=_model_info(), system_provider=lambda: 'root system')
+        manager = AgentManager(
+            cfg, cfg.agents, registry, client, _model_info(),
+            client_factory=lambda provider, model:
+                created.append((provider.name, model.id))
+                or ScriptedClient(provider, model),
+            cwd=str(tmp_path))
+        manager._provider = cfg.providers[0]
+        manager._model_config = cfg.providers[0].models[0]
+        manager.attach(root)
+        # 'scout' pins the caller's model: the shared client is reused
+        record = await manager.spawn('scout', 'go', agent_type='scout')
+        assert record.engine._model.id == 'test-model'
+        assert created == []
+        assert record.engine._allowed_tools == {'read'}
+        # 'remote' pins a cross-provider model: a dedicated client is built;
+        # an empty tools list means no allowlist, like the reference engine
+        record = await manager.spawn('remote', 'go', agent_type='remote')
+        assert record.engine._model.id == 'other-model'
+        assert created == [('Other', 'other-model')]
+        assert record.engine._allowed_tools is None
+        await _wait_child(manager, 'remote')
+
+    asyncio.run(main())
+
+
+def test_fork_turns_shapes_child_history(tmp_path):
+    async def main():
+        root, manager, client = _setup(tmp_path)
+        root.conversation.committed.extend([
+            {'role': 'user', 'content': 'first question'},
+            {'role': 'assistant', 'content': 'first answer'},
+            {'role': 'user', 'content': 'second question'},
+            {'role': 'assistant', 'content': 'second answer'},
+        ])
+        record = await manager.spawn('all_child', 'go', fork_turns='all')
+        assert [m['content'] for m in record.engine.conversation.committed] == [
+            'first question', 'first answer', 'second question', 'second answer']
+        record = await manager.spawn('none_child', 'go', fork_turns='none')
+        assert record.engine.conversation.committed == []
+        record = await manager.spawn('one_child', 'go', fork_turns=1)
+        assert [m['content'] for m in record.engine.conversation.committed] == [
+            'second question', 'second answer']
+        await _wait_child(manager, 'all_child')
+
+    asyncio.run(main())
+
+
+def test_spawn_validates_input(tmp_path):
+    async def main():
+        root, manager, client = _setup(tmp_path)
         with pytest.raises(ValueError):
-            manager.spawn_agent('child', 'work', 'general', 'none')
-    child_scope = manager._records['root/child'].scope
-    with manager.scope(child_scope):
-        with pytest.raises(RuntimeError):
-            manager.spawn_agent('grandchild', 'work', 'general', 'none')
+            await manager.spawn('Bad Name!', 'task')
+        with pytest.raises(ValueError):
+            await manager.spawn('worker', '   ')
+        await manager.spawn('worker', 'task')
+        with pytest.raises(ValueError):
+            await manager.spawn('worker', 'again')
+
+    asyncio.run(main())
 
 
-def test_disabled_agents(config, monkeypatch):
-    monkeypatch.setattr(manager_module, 'LLMClient', AgentClient)
-    config.agents.enabled = False
-    prefix = StablePrefix.create(provider='P', endpoint='http://x', model='m',
-                                 system='s', tools=[])
-    manager = AgentManager(config, config.providers[0],
-                           config.providers[0].models[0], 's',
-                           ConversationContext(prefix, []), ToolRegistry())
-    with manager.root_scope():
-        with pytest.raises(RuntimeError):
-            manager.spawn_agent('child', 'work', 'general', 'none')
-    manager.shutdown()
+def test_send_message_and_followup(tmp_path):
+    async def main():
+        root, manager, client = _setup(tmp_path)
+        record = await manager.spawn('helper', 'stand by')
+        result = manager.send_message('helper', 'hello there')
+        assert result == {'delivered': True, 'turn_triggered': False}
+        assert manager.consume_mailbox(record.engine) == ['From root: hello there']
+        assert manager.send_message('ghost', 'x')['delivered'] is False
+        result = manager.send_message('helper', 'go again', trigger=True)
+        assert result['turn_triggered'] is True
+        await _wait_child(manager, 'helper')
+
+    asyncio.run(main())
 
 
-def test_team_spawn(manager):
-    with manager.root_scope():
-        records = manager.spawn_team('build', 'build it', 'none')
-    assert len(records) == len(manager.config.agent_teams['build'])
-    for record in records:
-        wait_for(manager, record.scope.name)
-    rows = manager.list_agents('root/build')
-    assert len(rows) == len(records)
+def test_agent_and_goal_tools_registered(tmp_path):
+    async def main():
+        root, manager, client = _setup(tmp_path)
+        names = set(manager._registry.names())
+        assert {'spawn_agent', 'send_message', 'followup_task', 'list_agents',
+                'wait_agent', 'interrupt_agent', 'update_goal'} <= names
+        sources = {name: manager._registry.source_of(name) for name in
+                   ('spawn_agent', 'update_goal')}
+        assert set(sources.values()) == {'agent'}
+        # the goal tool talks to the GoalStore
+        goal_tool = next(tool for tool in manager._registry.tools()
+                         if tool.name == 'update_goal')
+        assert 'no active goal' in goal_tool.handler(status='completed')
+        goal = manager.goal_store.create('ship it')
+        payload = json.loads(goal_tool.handler(status='blocked',
+                                               result='waiting'))
+        assert payload['goal_id'] == goal.id and payload['status'] == 'blocked'
+        assert manager.goal_store.get(goal.id).status == 'blocked'
+
+    asyncio.run(main())
 
 
-def test_interrupt_agent(manager):
-    with manager.root_scope():
-        record = manager.spawn_agent('slow', 'slow work', 'general', 'none')
-    time.sleep(0.1)
-    with manager.root_scope():
-        previous = manager.interrupt_agent('slow')
-    assert previous in ('pending_init', 'running')
-    wait_for(manager, 'root/slow', statuses=(AgentStatus.INTERRUPTED,))
-    assert record.interrupt.is_set()
+def test_drain_agent_events_maps_child_stream(tmp_path):
+    async def main():
+        root, manager, client = _setup(tmp_path)
+        await manager.spawn('scout', 'go')
+        await _wait_child(manager, 'scout')
+        events = manager.drain_agent_events()
+        kinds = {(event.agent_name, event.kind) for event in events}
+        assert ('scout', 'status') in kinds
+        lifecycle = [event for event in events
+                     if event.agent_name == 'scout'
+                     and event.status == 'completed']
+        assert lifecycle and 'child result' in lifecycle[0].content
+        # drain empties the queue
+        assert manager.drain_agent_events() == []
+
+    asyncio.run(main())
 
 
-def test_send_message_and_followup(manager):
-    with manager.root_scope():
-        manager.spawn_agent('child', 'work', 'general', 'none')
-    wait_for(manager, 'root/child')
-    with manager.root_scope():
-        manager.send_message('child', 'a note')
-        manager.send_message('child', 'more work', trigger=True)
-    time.sleep(0.1)
-    wait_for(manager, 'root/child', statuses=(AgentStatus.COMPLETED, AgentStatus.RUNNING))
-    record = manager._records['root/child']
-    assert record.inbox or record.pending_turns or record.status == AgentStatus.COMPLETED
+def test_drain_events_is_inert_for_the_engine(tmp_path):
+    async def main():
+        root, manager, client = _setup(tmp_path)
+        # the engine's per-round pump must never consume child activity; the
+        # facade owns it (see pump_agent_events)
+        assert manager.drain_events() == []
+        manager._agent_events.append(('agent_event', {'agent': 'x'}))
+        assert manager.drain_events() == []
+        assert len(manager.drain_agent_events()) == 1
+
+    asyncio.run(main())
 
 
-def test_agent_tool_specs(manager):
-    names = {spec.name for spec in manager.tool_specs()}
-    assert {'spawn_agent', 'spawn_team', 'send_message', 'followup_task',
-            'list_agents', 'wait_agent', 'interrupt_agent', 'update_goal'} == names
+def test_wait_agent_reports_activity(tmp_path):
+    async def main():
+        root, manager, client = _setup(tmp_path)
+        record = await manager.spawn('busy', 'work')
+        waiter = asyncio.create_task(manager.wait_for_activity(1_000))
+        await asyncio.sleep(0.05)
+        manager._touch(record)
+        result = await waiter
+        assert result['timed_out'] is False
+        stale = await manager.wait_for_activity(50)
+        assert stale['timed_out'] is True
+
+    asyncio.run(main())
+
+
+def test_interrupt_agent(tmp_path):
+    async def main():
+        root, manager, client = _setup(tmp_path)
+        record = await manager.spawn('slowpoke', 'work slowly')
+        await asyncio.sleep(0.1)
+        result = manager.interrupt_agent('slowpoke')
+        assert 'previous_status' in result
+        await _wait_child(manager, 'slowpoke')
+        assert manager._agents['slowpoke'].status == AgentStatus.INTERRUPTED
+
+    asyncio.run(main())

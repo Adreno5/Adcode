@@ -1,1228 +1,565 @@
-"""The main streaming ReAct agent loop.
+"""The conversation engine facade.
 
-The loop runs on a worker thread so the UI can render and accept input while
-tokens stream in.  It owns the conversation context, executes tools, performs
-automatic compaction, drains sub-agent mailboxes, and persists sessions.  The
-UI observes it through a thread-safe event queue and a locked snapshot.
+The engine itself (turn queue, status machine, compaction, sessions,
+collaboration) lives in the sdk: ``harness.agent.ConversationEngine``.  This
+module is the adapter the TUI talks to.  It keeps the historical contract:
+
+- the engine runs on a worker thread with its own event loop; the UI thread
+  calls the control plane and drains ``(kind, payload)`` events, whose
+  vocabulary is unchanged;
+- ``submit``/``request_compact`` are thread-safe; loop-affine operations
+  (sessions, model changes, tool refreshes) hop onto the engine loop and
+  surface their exceptions to the caller;
+- sub-agent activity reaches the UI through ``pump_agent_events`` exactly as
+  before, converted from the collab manager's event stream.
 """
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import json
 import os
-import queue
 import threading
 import time
-from dataclasses import dataclass
+from collections import deque
 from typing import Any, Callable
 
-from adcode.agents.manager import AgentManager
+from harness.agent import ConversationEngine, EngineConfig, EngineSnapshot
+from harness.agent.engine_config import (
+    AgentSettings, ContextSettings, ModelInfo, ReasoningSettings,
+    ThinkingSettings,
+)
+from harness.agent.events import EventSink
+from harness.images import FileIdCache
+from harness.transcript import SessionPayload, SessionStore
+
+from adcode.agents.manager import AgentManager, AgentStatus
 from adcode.config import AppConfig, ModelConfig, ProviderConfig
-from adcode.diff import FileDiff
-from adcode.goals import GoalStore
-from adcode.images import (
-    MARKER_RE as IMAGE_MARKER_RE, FileIdCache, has_image_marker, image_marker,
-    strip_image_markers,
-)
 from adcode.llm.client import LLMClient
-from adcode.llm.context import (
-    ConversationContext, StablePrefix, TokenBudgetExceeded, messages_need_repair,
-    repair_messages, stream_compact,
-)
-from adcode.llm.usage import (
-    TokenBudget, effective_reserved, estimate_tokens, merge_usage,
-    normalize_tool_result, normalize_usage,
-)
-from adcode.session import (
-    LAST_SESSION, SessionPayload, SessionStore, TranscriptItem, new_session_name,
-)
-from adcode.skills import SkillRegistry
 from adcode.system_prompt import build_system_prompt
-from adcode.tools.registry import ToolRegistry
-from adcode.tools.runtime import ToolContext, pop_context, push_context
+from adcode.tools.builtin import install_coding_tools, shutdown_shell_sessions
 
-MAX_CONTINUATIONS = 3
-CHECKPOINT_INTERVAL = 30.0
+# The snapshot the TUI renders is the engine's own dataclass; the fields are
+# identical (status, turn, token counters, context window, session identity,
+# queued depth, agent rows).
+AgentSnapshot = EngineSnapshot
 
-ASIDE_SYSTEM = (
-    'Answer this side question as a brief, self-contained aside. Use the current '
-    'conversation as context but do not continue the main task, do not call tools, '
-    'and keep the answer short. Do not use emoji.'
-)
+_MODEL_WIRES = {
+    'openai chat completions': 'chat',
+    'openai responses': 'responses',
+    'anthropic messages': 'anthropic',
+}
 
 
-@dataclass
-class AgentSnapshot:
-    status: str = 'idle'
-    turn: int = 0
-    turn_in: int = 0
-    turn_out: int = 0
-    total_in: int = 0
-    total_out: int = 0
-    context_tokens: int = 0
-    context_window: int = 0
-    provider: str = ''
-    model: str = ''
-    effort: str = 'medium'
-    session_name: str = ''
-    session_title: str = ''
-    queued: int = 0
-    agents: list[dict[str, Any]] | None = None
+class _WorkQueue:
+    """A minimal FIFO with exact ``qsize`` semantics for the bench.
+
+    An item stays queued until the pump has actually handed it to the engine
+    *and* the engine turned busy, so ``qsize()`` never drops a pending turn
+    from under ``wait_idle``.
+    """
+
+    def __init__(self) -> None:
+        self._items: deque[tuple[str, str]] = deque()
+        self._condition = threading.Condition()
+        self._stop_requested = False
+
+    def put(self, item: tuple[str, str]) -> None:
+        with self._condition:
+            self._items.append(item)
+            self._condition.notify_all()
+
+    def qsize(self) -> int:
+        with self._condition:
+            return len(self._items)
+
+    def empty(self) -> bool:
+        return self.qsize() == 0
+
+    def peek(self) -> tuple[str, str] | None:
+        with self._condition:
+            return self._items[0] if self._items else None
+
+    def pop(self) -> None:
+        with self._condition:
+            if self._items:
+                self._items.popleft()
+
+    def get(self, timeout: float = 0.2) -> tuple[str, str] | None:
+        """Blocking pop; None on timeout or shutdown."""
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while not self._items:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or self._stop_requested:
+                    return None
+                self._condition.wait(remaining)
+            return self._items.popleft()
 
 
 class AgentLoop:
-    def __init__(self, config: AppConfig, registry: ToolRegistry,
-                 store: SessionStore, goals: GoalStore, skills: SkillRegistry,
-                 emit: Callable[[str, dict[str, Any]], None],
+    """Owns the sdk engine behind a thread-safe, event-driven facade."""
+
+    def __init__(self, config: AppConfig, registry, store: SessionStore,
+                 goals, skills, emit: Callable[[str, dict[str, Any]], None] | None = None,
                  mcp_manager: Any = None, cwd: str = '') -> None:
         self.config = config
-        self.registry = registry
-        self.store = store
+        self.mcp = mcp_manager
+        self.cwd = cwd
         self.goals = goals
         self.skills = skills
-        self.emit = emit
-        self.mcp_manager = mcp_manager
-        # Tools and project instructions resolve against this directory, which
-        # may differ from the process cwd when the app is started with --cwd.
-        self.cwd = cwd or os.getcwd()
+        self._registry = registry
+        self._store = store
+        self._wake = emit or (lambda kind, payload: None)
+        self._stop = False
+        self._work = _WorkQueue()
+        self._sink = EventSink(emit=lambda kind, payload: self._wake(kind, payload))
+        # The bench's wait_idle samples these; both are plain queues.
+        self._events = self._sink._events
 
-        selected = config.selected()
-        if selected is None:
+        self._selected = config.selected()
+        if self._selected is None:
             raise RuntimeError('no provider/model configured')
-        self.provider, self.model = selected
-        # Uploaded image ids are shared by the root loop and every sub-agent.
-        self.image_files = FileIdCache(os.path.join(self.cwd, 'sessions',
-                                                    'images', 'files.json'))
-        self.client = self._make_client(self.provider)
+        self.provider, self.model = self._selected
+        self._file_cache = FileIdCache(
+            os.path.join(cwd or '.', 'sessions', 'images', 'files.json'))
+        self.client = self._make_client(self.provider, self.model)
 
-        self.system = build_system_prompt(config, goals, skills, cwd=self.cwd,
-                                          vision=self.model.vision)
-        schemas = registry.schemas(self.provider.wire, vision=self.model.vision)
-        self.context = ConversationContext(
-            StablePrefix.create(
-                provider=self.provider.name, endpoint=self.provider.base_url,
-                model=self.model.id, system=self.system, tools=schemas,
-                generation=1, wire=self.provider.wire,
-            ),
-            [],
-        )
-        self.items: list[TranscriptItem] = []
-        self.turn = 0
-        self.session_name = ''
-        self.session_title = ''
-        self.session_created = ''
-        self.total_in = 0
-        self.total_out = 0
-        self.turn_in = 0
-        self.turn_out = 0
-        self.usage_records: list[dict[str, Any]] = []
-        self.status = 'idle'
+        # The app hands us an empty registry; the built-in suite is installed
+        # here, and the agent / skill sources follow the engine's lifecycle.
+        install_coding_tools(registry)
+        registry.unregister_source('agent')
+        registry.unregister_source('skill')
+
         self.agent_live: dict[str, dict[str, str]] = {}
-
-        self._lock = threading.RLock()
-        self._events: 'queue.Queue[tuple[str, dict[str, Any]]]' = queue.Queue()
-        self._work: 'queue.Queue[tuple[str, str] | None]' = queue.Queue()
-        self._stop = threading.Event()
-        self._interrupt = threading.Event()
+        self._engine: ConversationEngine | None = None
+        self.agents: AgentManager | None = None
         self._thread: threading.Thread | None = None
-        self._last_checkpoint = 0.0
-        self._turn_started = 0.0
+        self._pump: threading.Thread | None = None
+        self._ready = threading.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
 
-        # Collaboration and skill tools live in the shared registry so root and
-        # sub-agents see exactly the same surface.
-        self.registry.unregister_source('agent')
-        self.registry.unregister_source('skill')
-        self.agents = AgentManager(
-            config, self.provider, self.model, self.system, self.context,
-            registry, goal_store=goals, cwd=self.cwd,
-            file_cache=self.image_files,
+    # ── construction helpers ────────────────────────────────
+    def _make_client(self, provider: ProviderConfig, model: ModelConfig) -> LLMClient:
+        return LLMClient(provider, model, base_dir=self.cwd or '.',
+                         file_cache=self._file_cache, warn=self._warn)
+
+    def _warn(self, text: str) -> None:
+        engine = self._engine
+        if engine is not None:
+            engine.add_notice(text, 'warning')
+
+    def _model_info(self, provider: ProviderConfig, model: ModelConfig) -> ModelInfo:
+        wire = _MODEL_WIRES.get(provider.wire, 'chat')
+        return ModelInfo(
+            id=model.id, provider=provider.name, endpoint=provider.base_url,
+            wire=wire, context_window=model.context_window,
+            max_output_tokens=model.max_output_tokens, vision=model.vision,
+            reasoning_style=model.reasoning_style,
+            reasoning_efforts=tuple(model.reasoning_efforts or ()),
+            reasoning=bool(model.reasoning),
         )
-        if config.agents.enabled:
-            self.registry.register_many(self.agents.tool_specs())
-        self.registry.register_many(self.skills.tool_specs())
 
-        self._refresh_prefix(force=True)
-        self.agents.update_root(self.context, self.provider, self.model, self.system)
+    def _engine_config(self, config: AppConfig) -> EngineConfig:
+        show_completed = (config.thinking.show_completed
+                          and config.thinking.mode != 'hidden')
+        return EngineConfig(
+            context=ContextSettings(
+                auto_compact=config.context.auto_compact,
+                compact_threshold=config.context.compact_threshold,
+                keep_recent_turns=config.context.keep_recent_turns,
+                reserved_output=config.context.reserved_output,
+                compaction_reasoning_effort=config.context.compaction_reasoning_effort,
+            ),
+            reasoning=ReasoningSettings(effort=config.reasoning.effort,
+                                        force=config.reasoning.force),
+            thinking=ThinkingSettings(show_completed=show_completed),
+            agents=AgentSettings(
+                max_concurrent=config.agents.max_concurrent,
+                max_depth=config.agents.max_depth,
+                wait_timeout_ms=config.agents.wait_timeout_ms,
+                default_fork_turns=config.agents.default_fork_turns,
+                show_activity=config.agents.show_activity,
+                show_output=config.agents.show_output,
+                default_type=config.agents.default_type,
+                system_suffix=config.agents.system_suffix,
+            ),
+            max_output_tokens=config.max_output_tokens,
+        )
 
-    def _make_client(self, provider: ProviderConfig) -> LLMClient:
-        """Build a client wired to the workspace, image store and UI notices."""
-        client = LLMClient(provider)
-        client.base_dir = self.cwd
-        client.file_cache = self.image_files
-        client.warn = lambda text: self._append_notice(text, level='warning')
-        return client
+    def _system_provider(self) -> str:
+        return build_system_prompt(self.config, self.goals, self.skills,
+                                   cwd=self.cwd or '.',
+                                   vision=bool(self.model.vision))
 
     # ── lifecycle ───────────────────────────────────────────
     def start(self) -> None:
         if self._thread is not None:
             return
-        self._thread = threading.Thread(target=self._run, name='adcode-agent-loop',
-                                        daemon=True)
+        self._thread = threading.Thread(target=self._loop_thread,
+                                        name='adcode-engine-loop', daemon=True)
+        self._pump = threading.Thread(target=self._pump_thread,
+                                      name='adcode-agent-pump', daemon=True)
         self._thread.start()
+        self._ready.wait(timeout=15)
+        self._pump.start()
 
-    def shutdown(self) -> None:
-        self._stop.set()
-        self._interrupt.set()
-        self._work.put(None)
-        if self._thread is not None:
-            self._thread.join(timeout=2)
-        self.agents.shutdown()
+    def _loop_thread(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+        engine = ConversationEngine(
+            client=self.client, registry=self._registry,
+            store=self._store,
+            sink=self._sink, system_provider=self._system_provider,
+            cwd=self.cwd or '.', model=self._model_info(self.provider, self.model),
+            config=self._engine_config(self.config))
+        self._engine = engine
+        if self.config.agents.enabled:
+            self.agents = AgentManager(
+                self.config, self.config.agents, self._registry,
+                client=self.client,
+                model_info=self._model_info(self.provider, self.model),
+                goal_store=self.goals,
+                client_factory=self._client_for,
+                cwd=self.cwd or '.', store=self._store)
+            self.agents._provider = self.provider
+            self.agents._model_config = self.model
+            self.agents._loop = loop
+            self.agents._condition = asyncio.Condition()
 
-    @property
-    def busy(self) -> bool:
-        return self.status != 'idle'
+        def boot() -> None:
+            # attach and engine.start need a *running* loop, so they run from
+            # the loop's own callback queue right after run_forever begins
+            if self.agents is not None:
+                self.agents.attach(engine)
+            engine.start()
+            self._ready.set()
 
+        loop.call_soon_threadsafe(boot)
+        try:
+            loop.run_forever()
+        finally:
+            loop.close()
+
+    def _client_for(self, provider: ProviderConfig, model: ModelConfig) -> LLMClient:
+        """Build a dedicated client for a child agent's provider::model."""
+        return LLMClient(provider, model, base_dir=self.cwd or '.',
+                         file_cache=self._file_cache, warn=self._warn)
+
+    def _sync_config(self, engine: ConversationEngine) -> None:
+        """Copy the live config knobs into the engine before a turn.
+
+        The engine snapshots settings at construction; commands like /effort
+        mutate the AppConfig afterwards and expect the next request to honor
+        them, exactly like the previous loop read them per request.
+        """
+        engine.config.reasoning.effort = self.config.reasoning.effort
+        engine.config.reasoning.force = self.config.reasoning.force
+        engine.config.max_output_tokens = self.config.max_output_tokens
+        context = engine.config.context
+        context.auto_compact = self.config.context.auto_compact
+        context.compact_threshold = self.config.context.compact_threshold
+        context.keep_recent_turns = self.config.context.keep_recent_turns
+        context.reserved_output = self.config.context.reserved_output
+        context.compaction_reasoning_effort = \
+            self.config.context.compaction_reasoning_effort
+
+    def _submit_now(self, mode: str, text: str) -> None:
+        # Bypass engine.submit's own queued event: the facade emitted one with
+        # the facade-side queue position already.
+        engine = self._engine
+        if engine is None:
+            return
+        self._sync_config(engine)
+        engine._work.put_nowait((mode, text))
+
+    def _pump_thread(self) -> None:
+        """Hand queued turns to the engine, in order.
+
+        The engine's own work queue serializes turns (its _run loop pops one
+        turn at a time), so the pump only ferries items across the thread
+        boundary; qsize() is the honest not-yet-submitted count.
+        """
+        while not self._stop:
+            item = self._work.get(timeout=0.2)
+            if item is None or self._stop:
+                continue
+            mode, text = item
+            try:
+                self._call(lambda: self._submit_now(mode, text))
+            except RuntimeError:
+                continue
+
+    def _call(self, fn: Callable[[], Any]) -> Any:
+        """Run a callable on the engine loop and wait for it."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return fn()
+        future: concurrent.futures.Future = concurrent.futures.Future()
+
+        def runner() -> None:
+            try:
+                future.set_result(fn())
+            except BaseException as error:    # noqa: BLE001 - propagate to caller
+                future.set_exception(error)
+
+        loop.call_soon_threadsafe(runner)
+        return future.result(timeout=30)
+
+    # ── control plane (thread-safe) ─────────────────────────
     def submit(self, text: str, mode: str = 'chat') -> bool:
-        text = text.strip()
-        if not text:
+        if not text.strip():
             return False
-        if not self.busy:
-            # A new turn starts clean; while a turn is running the pending
-            # interrupt must survive (the user pressed Esc for that turn).
-            self._interrupt.clear()
+        engine = self._engine
+        if engine is not None and not engine.busy():
+            engine._interrupt.clear()
         self._work.put((mode, text))
         self._emit('queued', text=text, mode=mode,
                    position=self._work.qsize())
         return True
 
     def interrupt(self) -> None:
-        self._interrupt.set()
+        engine = self._engine
+        if engine is not None:
+            engine.interrupt()
 
-    def stop_turn(self) -> None:
-        self._interrupt.set()
-
-    def _quiesce(self, timeout: float = 2.0) -> bool:
-        """Interrupt the active turn and wait until the worker is idle."""
-        if not self.busy:
-            return True
-        self._interrupt.set()
-        deadline = time.monotonic() + timeout
-        while self.busy and time.monotonic() < deadline:
-            time.sleep(0.01)
-        return not self.busy
-
-    def _require_idle(self, action: str) -> None:
-        if not self._quiesce():
-            raise RuntimeError(f'{action} while a turn is still running')
-
-    def add_notice(self, text: str, level: str = 'info') -> None:
-        self._append_notice(text, level)
-
-    def add_diff_item(self, display: str, file_diff: FileDiff | None) -> None:
-        if file_diff is None:
-            self._append_notice('No working-tree changes.', 'info')
-            return
-        with self._lock:
-            self.items.append(TranscriptItem(
-                kind='tool', turn=self.turn, name='diff', display=display,
-                status='done', diff=_diff_dict(file_diff)))
-        self._emit('diff_added')
+    stop_turn = interrupt
 
     def request_compact(self) -> None:
-        if not self.busy:
-            self._interrupt.clear()
+        engine = self._engine
+        if engine is not None and not engine.busy():
+            engine._interrupt.clear()
         self._work.put(('compact', ''))
 
-    # ── event delivery ──────────────────────────────────────
-    def _emit(self, kind: str, **payload: Any) -> None:
-        self._events.put((kind, payload))
-        try:
-            self.emit(kind, payload)
-        except Exception:
-            pass
+    def add_notice(self, text: str, level: str = 'info') -> None:
+        engine = self._engine
+        if engine is not None:
+            engine.add_notice(text, level)
+        else:
+            self._emit('notice', text=text, level=level)
 
-    def drain_ui_events(self, limit: int = 2_000) -> list[tuple[str, dict[str, Any]]]:
-        events: list[tuple[str, dict[str, Any]]] = []
-        while len(events) < limit:
-            try:
-                events.append(self._events.get_nowait())
-            except queue.Empty:
-                break
-        return events
+    def add_diff_item(self, display: str, file_diff: Any | None) -> None:
+        engine = self._engine
+        if engine is not None:
+            engine.add_diff_item(display, file_diff)
+        else:
+            self._emit('notice', text='No working-tree changes.')
 
-    # ── snapshots for the UI ────────────────────────────────
-    def snapshot(self) -> AgentSnapshot:
-        with self._lock:
-            context_tokens = self.context.estimated_tokens()
-            return AgentSnapshot(
-                status=self.status,
-                turn=self.turn,
-                turn_in=self.turn_in,
-                turn_out=self.turn_out,
-                total_in=self.total_in,
-                total_out=self.total_out,
-                context_tokens=context_tokens,
-                context_window=self.model.context_window,
-                provider=self.provider.name,
-                model=self.model.id,
-                effort=self.config.reasoning.effort,
-                session_name=self.session_name,
-                session_title=self.session_title,
-                queued=self._work.qsize(),
-                agents=self._agent_rows(),
-            )
-
-    def _agent_rows(self) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        for row in self.agents.list_agents():
-            name = row['agent_name']
-            if name == 'root':
-                continue
-            live = self.agent_live.get(name, {})
-            rows.append({
-                'name': name,
-                'type': row.get('agent_type', ''),
-                'status': row.get('agent_status'),
-                'live': live.get('text', ''),
-                'mode': live.get('mode', ''),
-            })
-        return rows
-
-    def items_snapshot(self) -> list[TranscriptItem]:
-        with self._lock:
-            return list(self.items)
-
-    # ── worker ──────────────────────────────────────────────
-    def _run(self) -> None:
-        while not self._stop.is_set():
-            task = self._work.get()
-            if task is None or self._stop.is_set():
-                break
-            mode, text = task
-            try:
-                if mode == 'aside':
-                    self._run_aside(text)
-                elif mode == 'compact':
-                    self._run_compact()
-                else:
-                    self._run_chat(text)
-            except Exception as error:
-                self._append_notice(f'Request failed: {error}', level='error')
-                self._emit('error', text=str(error))
-            finally:
-                with self._lock:
-                    if self.status != 'idle':
-                        self.status = 'idle'
-                        self._emit('status', status='idle')
-                self._interrupt.clear()
-        with self._lock:
-            self.status = 'idle'
-
-    # ── main chat turn ──────────────────────────────────────
-    def _run_chat(self, text: str) -> None:
-        with self._lock:
-            self.turn += 1
-            turn = self.turn
-            if not self.session_name:
-                self.session_name = self.store.unique_name(new_session_name())
-                self.session_created = time.strftime('%Y-%m-%d %H:%M')
-            if not self.session_title:
-                self.session_title = _title_from(text)
-            self.turn_in = 0
-            self.turn_out = 0
-            self._turn_started = time.time()
-            self.items.append(TranscriptItem(kind='user', turn=turn, text=text))
-            self.status = 'connecting'
-        self._emit('turn_start', turn=turn, text=text)
-        self._emit('status', status='connecting')
-        context = self.context
-        context.stage({'role': 'user', 'content': text})
-        tool_context = ToolContext(cwd=self.cwd, interrupt=self._interrupt,
-                                   agent='root')
-        token = push_context(tool_context)
-        committed = False
-        interrupted = False
-        continuations = 0
-        pending_mailbox: list[str] = []
-        try:
-            with self.agents.root_scope():
-                # The turn runs until the model answers without tool calls; the
-                # user's interrupt and the token budget are the only ways out,
-                # so long investigations are not cut off at an arbitrary count.
-                while True:
-                    if self._stop.is_set():
-                        break
-                    if self._interrupt.is_set():
-                        interrupted = True
-                        break
-                    pending_mailbox.extend(self._stage_mailbox(context))
-                    self._refresh_system_and_prefix()
-                    thinking, full, tool_calls, finish_reason = self._stream_request(
-                        turn, context)
-                    if self._interrupt.is_set():
-                        interrupted = True
-                        break
-                    if tool_calls:
-                        if not self._execute_tools(turn, context, tool_calls,
-                                                   thinking, full):
-                            interrupted = True
-                            break
-                        self._checkpoint()
-                        continue
-                    if finish_reason == 'length':
-                        if continuations >= MAX_CONTINUATIONS:
-                            self._append_notice(
-                                'Output token limit reached; continuation stopped.',
-                                level='warning')
-                            if full:
-                                context.stage({
-                                    'role': 'assistant', 'content': full,
-                                    'reasoning_content': thinking,
-                                })
-                            context.commit()
-                            committed = True
-                            break
-                        continuations += 1
-                        continuation = _continuation_prompt(thinking, full)
-                        context.stage({'role': 'assistant', 'content': continuation})
-                        continue
-                    if finish_reason == 'incomplete':
-                        self._append_notice(
-                            'The response ended without a finish signal; the answer '
-                            'may be truncated.', level='warning')
-                    if full:
-                        context.stage({
-                            'role': 'assistant', 'content': full,
-                            'reasoning_content': thinking,
-                        })
-                    context.commit()
-                    committed = True
-                    break
-                if not committed and not interrupted and self._interrupt.is_set():
-                    interrupted = True
-        except TokenBudgetExceeded as error:
-            # Nothing in this turn can be sent: the history does not fit even
-            # after compaction, so keeping the draft would break every later
-            # request.  The already committed rounds stay.
-            context.rollback()
-            self._append_notice(f'Token budget exceeded: {error}', level='error')
-            self._emit('error', text=str(error))
-        except Exception as error:
-            # A failed request is not a reason to forget the work that already
-            # happened; keep the user message and every completed tool round.
-            self._append_notice(f'Request failed: {error}', level='error')
-            self._emit('error', text=str(error))
-        finally:
-            pop_context(token)
-            with self._lock:
-                self.status = 'idle'
-            if not committed:
-                # Money in the transcript -- tool calls that ran, an answer that
-                # was already streaming -- must survive the turn.  Dropping the
-                # whole draft on Esc used to erase minutes of investigation.
-                if not self._commit_partial(context):
-                    # Nothing survived (for example the budget check refused the
-                    # request before it was sent): restore the consumed mailbox
-                    # so the next turn still sees sub-agent results.
-                    context.rollback()
-                    self.agents.requeue_mailbox(pending_mailbox)
-            if interrupted:
-                self._append_notice('[interrupted]', level='warning')
-                self._emit('interrupted')
-            self._emit('turn_end', turn=turn, status='interrupted' if interrupted else 'done',
-                       stats={
-                           'input_tokens': self.turn_in,
-                           'output_tokens': self.turn_out,
-                           'duration': round(time.time() - self._turn_started, 2),
-                       })
-            self.save_active()
-
-    def _stream_request(self, turn: int, context: ConversationContext
-                        ) -> tuple[str, str, list[dict[str, Any]], str]:
-        """Run one streamed model request and return its accumulated pieces."""
-        budget = TokenBudget(
-            context_window=self.model.context_window,
-            reserved_output=effective_reserved(
-                self.model.context_window, self.config.context.reserved_output,
-                self.model.max_output_tokens),
-            stable_tokens=estimate_tokens({
-                'system': context.stable_prefix.system,
-                'tools': context.stable_prefix.tools,
-            }),
-        )
-        if (self.config.context.auto_compact
-                and context.needs_compaction(
-                    budget, self.config.context.compact_threshold)):
-            self._compact(context, budget)
-        context.enforce_budget(budget, self.config.context.keep_recent_turns)
-        self._refresh_prefix(force=False)
-        prefix = context.stable_prefix
-        max_tokens = max(256, min(self.config.max_output_tokens,
-                                  self.model.max_output_tokens,
-                                  budget.reserved_output))
-        thinking = ''
-        full = ''
-        tool_calls: list[dict[str, Any]] = []
-        finish_reason = ''
-        request_usage: dict[str, Any] | None = None
-        thinking_started = time.time()
-        thinking_closed = False
-        text_started = 0.0
-
-        def close_thinking() -> None:
-            nonlocal thinking_closed
-            if thinking_closed:
-                return
-            thinking_closed = True
-            if thinking:
-                self._append_thinking(turn, thinking,
-                                      time.time() - thinking_started)
-                self._emit('thinking_end', text=thinking,
-                           duration=round(time.time() - thinking_started, 2))
-
-        # Nothing is on the wire yet: the request is only sent when the
-        # generator below is first advanced, and the provider can take a while
-        # to produce its first byte (DNS, TLS, proxy, a cold or queued model).
-        # That wait is a phase of its own -- ``connecting`` -- and it ends when
-        # real model output arrives, not when the turn is scheduled.
-        connecting = True
-
-        def enter_connecting(retrying: bool = False) -> None:
-            nonlocal connecting
-            connecting = True
-            with self._lock:
-                self.status = 'connecting'
-            self._emit('status', status='connecting', retrying=retrying)
-
-        def start_streaming() -> None:
-            nonlocal connecting
-            if not connecting:
-                return
-            connecting = False
-            with self._lock:
-                self.status = 'thinking'
-            self._emit('status', status='thinking')
-
-        enter_connecting()
-        stream_started = time.perf_counter()
-        for event in self.client.chat(
-            context.request_messages(), self.model,
-            system=prefix.system,
-            max_tokens=max_tokens,
-            tools=list(prefix.tools),
-            prompt_cache_key=prefix.fingerprint,
-            effort=self.config.reasoning.effort,
-            force_reasoning=self.config.reasoning.force,
-        ):
-            if self._interrupt.is_set() or self._stop.is_set():
-                break
-            kind = event.get('kind', '')
-            if kind == 'retry':
-                # The attempt failed before anything streamed, so the next one
-                # is still a connection attempt, not model output.
-                enter_connecting(retrying=True)
-                self._append_notice(
-                    f'Reconnecting ({event.get("attempt", 1)}): '
-                    f'{str(event.get("content", ""))[:160]}', level='warning')
-                continue
-            start_streaming()
-            if kind == 'thinking':
-                delta = str(event.get('content', ''))
-                if delta:
-                    thinking += delta
-                    with self._lock:
-                        self.status = 'thinking'
-                    self._emit('thinking_delta', text=delta)
-            elif kind == 'text':
-                delta = str(event.get('content', ''))
-                if delta:
-                    close_thinking()
-                    if not full:
-                        text_started = time.time()
-                    full += delta
-                    with self._lock:
-                        self.status = 'answering'
-                    self._emit('text_delta', text=delta)
-            elif kind == 'tool_call':
-                tool_calls.append(event)
-            elif kind == 'usage':
-                normalized = normalize_usage(event.get('usage'))
-                if (normalized.get('input_tokens') is not None
-                        or normalized.get('output_tokens') is not None):
-                    request_usage = merge_usage(request_usage, normalized)
-            elif kind == 'finish':
-                finish_reason = str(event.get('reason', ''))
-        close_thinking()
-        if full:
-            self._append_assistant(turn, full)
-            self._emit('text_end', text=full,
-                       duration=round(time.time() - text_started, 2))
-        if request_usage is not None:
-            request_usage.update({
-                'prefix_generation': prefix.generation,
-                'prefix_hash': prefix.fingerprint,
-                'provider': prefix.provider,
-                'model': prefix.model,
-                'latency_ms': round((time.perf_counter() - stream_started) * 1000),
-            })
-            self._record_usage(request_usage)
-        return thinking, full, tool_calls, finish_reason
-
-    def _execute_tools(self, turn: int, context: ConversationContext,
-                       tool_calls: list[dict[str, Any]], thinking: str = '',
-                       full: str = '') -> bool:
-        """Execute a tool batch; returns False when the turn was interrupted."""
-        draft: list[dict[str, Any]] = []
-        image_markers: list[str] = []
-        # Providers occasionally omit call ids; the assistant message and every
-        # matching tool result must agree on the same fallback id.
-        stamp = int(time.time() * 1000)
-        call_ids = [
-            str(call.get('id') or f'call_{stamp}_{index}')
-            for index, call in enumerate(tool_calls)
-        ]
-        with self._lock:
-            self.status = 'tool'
-        self._emit('status', status='tool')
-        for index, call in enumerate(tool_calls):
-            if self._interrupt.is_set() or self._stop.is_set():
-                return False
-            name = str(call.get('name', ''))
-            args = call.get('args', {}) if isinstance(call.get('args'), dict) else {}
-            call_id = call_ids[index]
-            display = self._display_tool(name)
-            item = TranscriptItem(kind='tool', turn=turn, call_id=call_id,
-                                  name=name, display=display, args=args,
-                                  status='running')
-            with self._lock:
-                self.items.append(item)
-            self._emit('tool_start', turn=turn, call_id=call_id, name=name,
-                       display=display, args=args)
-            started = time.time()
-
-            def sink(line: str, _call_id: str = call_id) -> None:
-                self._emit('tool_output', call_id=_call_id, text=line)
-
-            tool_context = ToolContext(cwd=self.cwd, interrupt=self._interrupt,
-                                       agent='root', live_sink=sink)
-            token = push_context(tool_context)
-            try:
-                result = self.registry.execute(name, args)
-            finally:
-                pop_context(token)
-            duration = time.time() - started
-            item.status = 'error' if result.error else 'done'
-            item.output = result.text
-            item.duration = duration
-            item.diff = _diff_dict(result.file_diff)
-            self._emit('tool_end', turn=turn, call_id=call_id, name=name,
-                       display=display, output=result.text,
-                       diff=item.diff, duration=round(duration, 2),
-                       error=result.error)
-            normalized = normalize_tool_result(name, result.text)['text']
-            draft.append({
-                'role': 'tool', 'tool_call_id': call_id, 'content': normalized,
-            })
-            for reference in IMAGE_MARKER_RE.findall(normalized):
-                marker = image_marker(reference)
-                if marker not in image_markers:
-                    image_markers.append(marker)
-            if name == 'update_goal':
-                self._refresh_system_and_prefix(force=True)
-            if self._interrupt.is_set() or self._stop.is_set():
-                # Persist the calls that did run before the interrupt, so the
-                # model does not have to repeat them next turn.
-                self._stage_tool_round(context, tool_calls[:index + 1],
-                                       call_ids[:index + 1], draft, thinking,
-                                       full, image_markers)
-                return False
-
-        # Persist the assistant tool-call message together with its results.
-        self._stage_tool_round(context, tool_calls, call_ids, draft, thinking,
-                               full, image_markers)
-        with self._lock:
-            self.status = 'connecting'
-        self._emit('status', status='connecting')
-        return True
-
-    def _stage_tool_round(self, context: ConversationContext,
-                          tool_calls: list[dict[str, Any]],
-                          call_ids: list[str], results: list[dict[str, Any]],
-                          thinking: str, full: str,
-                          image_markers: list[str]) -> None:
-        """Stage one assistant tool-call message and its results."""
-        assistant_message: dict[str, Any] = {
-            'role': 'assistant',
-            'content': full or None,
-            'reasoning_content': thinking,
-            'tool_calls': [{
-                'id': call_ids[index], 'type': 'function',
-                'function': {
-                    'name': str(call.get('name', '')),
-                    'arguments': json.dumps(call.get('args', {}), ensure_ascii=False),
-                },
-            } for index, call in enumerate(tool_calls)],
-        }
-        context.stage(assistant_message)
-        context.stage(*results)
-        if image_markers:
-            # Tool results are plain text on every wire, so the picture travels
-            # in its own user block right after them.  The leading tag keeps
-            # turn_starts() from treating it as a user turn.
-            context.stage({
-                'role': 'user',
-                'content': '<tool_images>\n' + '\n'.join(image_markers)
-                           + '\n</tool_images>',
-            })
-
-    # ── partial turns ───────────────────────────────────────
-    def _commit_partial(self, context: ConversationContext) -> bool:
-        """Commit the completed part of a turn that never reached its answer.
-
-        A turn that ran tools and then failed or was interrupted used to be
-        rolled back whole: the model lost every file it had read, every command
-        it had run and every result it had seen, so it started the next turn
-        from scratch (and often repeated the same work).  Only *complete* tool
-        rounds survive -- a half-streamed reply or a call that never ran is
-        dropped, because neither can be sent to a provider as-is.
-
-        Returns False when nothing worth keeping was staged.
-        """
-        draft = context.draft
-        if not draft:
-            return False
-        # Keep the longest prefix that ends with a tool result: that is exactly
-        # the part where every tool call has an answer.
-        cut = -1
-        for index, message in enumerate(draft):
-            if message.get('role') == 'tool':
-                cut = index
-        if cut < 0:
-            return False
-        kept = draft[:cut + 1]
-        repaired, changed = repair_messages(kept)
-        if changed:
-            # A batch that was cut in half leaves calls without results; the
-            # synthetic result keeps the history sendable.
-            self._append_notice(
-                f'Kept {len(kept)} message(s) of the interrupted turn; '
-                f'{changed} unfinished step(s) were closed.', level='warning')
-        draft[:] = repaired
-        context.commit()
-        return True
-
-    # ── compaction ──────────────────────────────────────────
-    def _compact(self, context: ConversationContext, budget: TokenBudget) -> None:
-        self._emit('compaction_start')
-        with self._lock:
-            self.status = 'compacting'
-        self._emit('status', status='compacting')
-        parts: list[str] = []
-        usage: dict[str, Any] | None = None
-
-        def emit_delta(delta: str) -> None:
-            parts.append(delta)
-            self._emit('compaction_delta', text=delta)
-
-        def compact_stream(messages: list[dict[str, Any]], **kwargs: Any):
-            nonlocal usage
-            for event in self.client.chat(
-                messages, self.model,
-                effort=self.config.context.compaction_reasoning_effort,
-                **kwargs,
-            ):
-                if event.get('kind') == 'usage':
-                    normalized = normalize_usage(event.get('usage'))
-                    if (normalized.get('input_tokens') is not None
-                            or normalized.get('output_tokens') is not None):
-                        usage = merge_usage(usage, normalized)
-                if self._interrupt.is_set() or self._stop.is_set():
-                    # stream_compact catches this and falls back to the
-                    # deterministic summary instead of keeping partial text.
-                    raise RuntimeError('compaction interrupted')
-                yield event
-
-        removed = stream_compact(
-            context, max(1024, budget.usable() - estimate_tokens(context.draft)),
-            compact_stream, emit_delta, self.config.context.keep_recent_turns,
-        )
-        if usage is not None:
-            usage.update({'provider': self.provider.name, 'model': self.model.id,
-                          'prefix_generation': context.stable_prefix.generation})
-            self._record_usage(usage)
-        text = ''.join(parts).strip()
-        summary = text or '(deterministic summary)'
-        self._append_notice(
-            f'Context compacted: {removed} messages summarized.', level='info')
-        self._emit('compaction_end', text=summary, removed=removed)
-        self._refresh_prefix(force=True)
-        # The follow-up request has not been sent yet, so the turn returns to
-        # the connection phase rather than to "thinking".
-        with self._lock:
-            self.status = 'connecting'
-        self._emit('status', status='connecting')
-
-    def _run_compact(self) -> None:
-        if self._interrupt.is_set() or self._stop.is_set():
-            self._append_notice('Compaction cancelled.', level='info')
-            return
-        budget = TokenBudget(
-            context_window=self.model.context_window,
-            reserved_output=effective_reserved(
-                self.model.context_window, self.config.context.reserved_output,
-                self.model.max_output_tokens),
-            stable_tokens=estimate_tokens({
-                'system': self.context.stable_prefix.system,
-                'tools': self.context.stable_prefix.tools,
-            }),
-        )
-        self._compact(self.context, budget)
-        self._append_notice('Manual compaction finished.', level='info')
-
-    # ── aside questions ─────────────────────────────────────
-    def _run_aside(self, question: str) -> None:
-        if self._interrupt.is_set() or self._stop.is_set():
-            return
-        with self._lock:
-            self.status = 'aside'
-        self._emit('aside_start', question=question)
-        self._emit('status', status='aside')
-        messages = list(self.context.committed) + [
-            {'role': 'user', 'content': question},
-        ]
-        parts: list[str] = []
-        usage: dict[str, Any] | None = None
-        started = time.time()
-        try:
-            for event in self.client.chat(
-                messages, self.model,
-                system=f'{self.system}\n\n{ASIDE_SYSTEM}',
-                max_tokens=max(256, min(4096, self.config.max_output_tokens,
-                                        self.model.max_output_tokens)),
-                tools=None,
-                effort='low',
-                force_reasoning=self.config.reasoning.force,
-            ):
-                if self._interrupt.is_set() or self._stop.is_set():
-                    break
-                kind = event.get('kind')
-                if kind == 'text':
-                    delta = str(event.get('content', ''))
-                    parts.append(delta)
-                    self._emit('aside_delta', text=delta)
-                elif kind == 'usage':
-                    normalized = normalize_usage(event.get('usage'))
-                    if (normalized.get('input_tokens') is not None
-                            or normalized.get('output_tokens') is not None):
-                        usage = merge_usage(usage, normalized)
-        except Exception as error:
-            self._emit('error', text=str(error))
-        if usage is not None:
-            usage.update({
-                'provider': self.provider.name, 'model': self.model.id,
-                'prefix_generation': self.context.stable_prefix.generation,
-                'latency_ms': round((time.time() - started) * 1000),
-            })
-            self._record_usage(usage)
-        answer = ''.join(parts).strip()
-        with self._lock:
-            self.items.append(TranscriptItem(kind='aside', turn=self.turn,
-                                             text=answer, display=question))
-            self.status = 'idle'
-        self._emit('aside_end', question=question, answer=answer)
-        self._emit('status', status='idle')
-        self.save_active()
-
-    # ── transcript helpers ──────────────────────────────────
-    def _append_thinking(self, turn: int, text: str, duration: float) -> None:
-        mode = self.config.thinking.mode
-        if not self.config.thinking.show_completed or mode == 'hidden':
-            return
-        with self._lock:
-            self.items.append(TranscriptItem(
-                kind='thinking', turn=turn, text=text, duration=round(duration, 2)))
-
-    def _append_assistant(self, turn: int, text: str) -> None:
-        if not text:
-            return
-        with self._lock:
-            self.items.append(TranscriptItem(kind='assistant', turn=turn, text=text))
-
-    def _append_notice(self, text: str, level: str = 'info') -> None:
-        with self._lock:
-            self.items.append(TranscriptItem(kind='notice', turn=self.turn,
-                                             text=text, level=level))
-        self._emit('notice', text=text, level=level)
-
-    def _stage_mailbox(self, context: ConversationContext) -> list[str]:
-        mailbox = self.agents.consume_mailbox()
-        if mailbox:
-            context.stage({
-                'role': 'user',
-                'content': '<subagent_updates>\n' + '\n'.join(mailbox)
-                           + '\n</subagent_updates>',
-            })
-            self._emit('notice', text=f'Received {len(mailbox)} sub-agent update(s).',
-                       level='info')
-        return mailbox
-
-    def _display_tool(self, name: str) -> str:
-        if self.mcp_manager is not None and name.startswith('mcp__'):
-            return self.mcp_manager.tool_display(name)
-        return name
-
-    # ── sub-agent events ────────────────────────────────────
-    def pump_agent_events(self) -> None:
-        """Drain sub-agent events into the transcript and live status."""
-        settings = self.config.agents
-        drained = self.agents.drain_events()
-        for event in drained:
-            try:
-                if event.kind in ('thinking_delta', 'text_delta', 'compaction_delta'):
-                    live = self.agent_live.setdefault(event.agent_name, {})
-                    mode = {'thinking_delta': 'thinking',
-                            'text_delta': 'answer',
-                            'compaction_delta': 'compacting'}[event.kind]
-                    if live.get('mode') != mode:
-                        live['mode'] = mode
-                        live['text'] = ''
-                    live['text'] = (live.get('text', '') + event.content)[-4000:]
-                    continue
-                if event.kind == 'usage':
-                    # Sub-agent tokens are real spending; fold them into the
-                    # session totals instead of dropping the event.
-                    try:
-                        usage = json.loads(event.content or '{}')
-                    except ValueError:
-                        continue
-                    if not isinstance(usage, dict):
-                        continue
-                    with self._lock:
-                        self.total_in += int(usage.get('input_tokens') or 0)
-                        self.total_out += int(usage.get('output_tokens') or 0)
-                    self._emit('usage', **usage)
-                    continue
-                if event.kind == 'status':
-                    self.agent_live.pop(event.agent_name, None)
-                    if event.status in ('pending_init', 'running'):
-                        if event.status == 'pending_init' and settings.show_activity:
-                            self._append_agent_item(event.agent_name, 'started')
-                        continue
-                    if settings.show_activity:
-                        detail = event.content.strip() if event.content else event.status
-                        self._append_agent_item(event.agent_name,
-                                                f'{event.status} · {detail[:300]}'
-                                                if event.status not in ('completed',)
-                                                else f'completed · {detail[:300]}')
-                    self._emit('agent_event', agent=event.agent_name,
-                               status=event.status, content=event.content)
-                elif event.kind == 'tool_start' and settings.show_activity:
-                    self._append_agent_item(
-                        event.agent_name,
-                        f'{event.tool_name} {_tool_brief(event.tool_args)}'.strip())
-                elif event.kind == 'tool_result' and settings.show_output:
-                    self._append_agent_item(
-                        event.agent_name, event.content[:500])
-                elif event.kind == 'tool_output_line' and settings.show_output:
-                    self.agent_live.setdefault(event.agent_name, {})
-                    self.agent_live[event.agent_name]['text'] = event.content[-500:]
-            except Exception:
-                continue
-        if drained:
-            self._emit('agents_refresh')
-
-    def _append_agent_item(self, agent: str, text: str) -> None:
-        with self._lock:
-            self.items.append(TranscriptItem(kind='agent', turn=self.turn,
-                                             agent=agent, text=text))
-
-    # ── system/prefix management ────────────────────────────
-    def _refresh_system_and_prefix(self, force: bool = False) -> None:
-        system = build_system_prompt(self.config, self.goals, self.skills,
-                                     cwd=self.cwd,
-                                     vision=self.model.vision)
-        if force or system != self.context.stable_prefix.system:
-            if system != self.context.stable_prefix.system:
-                with self._lock:
-                    self.system = system
-            self._refresh_prefix(force=True)
-            self.agents.update_root(self.context, self.provider, self.model, self.system)
-
-    def _refresh_prefix(self, force: bool = False) -> None:
-        schemas = self.registry.schemas(self.provider.wire,
-                                        vision=self.model.vision)
-        current = self.context.stable_prefix
-        # ``self.system`` is authoritative: ``_refresh_system_and_prefix`` has
-        # already folded new goals, instructions or skills into it.  Using the
-        # old prefix text here silently discarded those updates.
-        system = self.system
-        candidate = StablePrefix.create(
-            provider=self.provider.name, endpoint=self.provider.base_url,
-            model=self.model.id, system=system, tools=schemas,
-            generation=current.generation, wire=self.provider.wire,
-        )
-        if force or candidate.fingerprint != current.fingerprint:
-            self.context.stable_prefix = StablePrefix.create(
-                provider=self.provider.name, endpoint=self.provider.base_url,
-                model=self.model.id, system=system, tools=schemas,
-                generation=current.generation + 1, wire=self.provider.wire,
-            )
-        self.agents.update_root(self.context, self.provider, self.model, self.system)
-
-    # ── usage ───────────────────────────────────────────────
-    def _record_usage(self, usage: dict[str, Any]) -> None:
-        with self._lock:
-            input_tokens = usage.get('input_tokens') or 0
-            output_tokens = usage.get('output_tokens') or 0
-            self.turn_in += input_tokens
-            self.turn_out += output_tokens
-            self.total_in += input_tokens
-            self.total_out += output_tokens
-            self.usage_records.append(dict(usage))
-            del self.usage_records[:-200]
-        self._emit('usage', **usage)
-
-    # ── persistence ─────────────────────────────────────────
-    def payload(self) -> SessionPayload:
-        with self._lock:
-            context = self.context
-            # Include the in-flight turn so a crash during a long autonomous
-            # run loses at most one checkpoint interval, not the whole turn.
-            messages = [dict(message) for message in context.committed]
-            messages.extend(dict(message) for message in context.draft)
-            return SessionPayload(
-                name=self.session_name,
-                title=self.session_title,
-                created=self.session_created,
-                provider=self.provider.name,
-                model=self.model.id,
-                turn=self.turn,
-                prefix_generation=context.stable_prefix.generation,
-                messages=messages,
-                compaction_archive=list(context.archived),
-                items=list(self.items),
-            )
-
-    def save_active(self) -> None:
-        payload = self.payload()
-        if not payload.items and not payload.messages:
-            return
-        try:
-            if payload.name:
-                self.store.save(payload)
-            self.store.save(payload, LAST_SESSION)
-        except Exception:
-            pass
-
-    def _checkpoint(self) -> None:
-        now = time.time()
-        if now - self._last_checkpoint < CHECKPOINT_INTERVAL:
-            return
-        self._last_checkpoint = now
-        self.save_active()
-
-    def save_as(self, name: str) -> None:
-        name = name.strip()
-        if not name:
-            raise ValueError('session name must not be empty')
-        with self._lock:
-            previous = self.session_name
-            self.session_name = name
-        payload = self.payload()
-        self.store.save(payload)
-        self.store.save(payload, LAST_SESSION)
-        if previous and previous != name:
-            self._append_notice(f'Session saved as {name}.', level='info')
-
-    def load_session(self, name: str) -> bool:
-        payload = self.store.load(name)
-        if payload is None:
-            return False
-        self.apply_payload(payload)
-        return True
-
-    def apply_payload(self, payload: SessionPayload) -> None:
-        self._require_idle('cannot load a session')
-        provider = self.config.provider_by_name(payload.provider) or self.provider
-        model = provider.model(payload.model) or (
-            provider.models[0] if provider.models else self.model)
-        with self._lock:
-            self.provider = provider
-            self.model = model
-            self.client = self._make_client(provider)
-            self.config.select(provider.name, model.id)
-            self.session_name = payload.name if payload.name != LAST_SESSION else ''
-            self.session_title = payload.title
-            self.session_created = payload.created
-            self.turn = payload.turn
-            self.items = list(payload.items)
-            self.context.committed[:] = payload.messages
-            self.context.draft.clear()
-            self.context.archived[:] = payload.compaction_archive
-            self.context.invalidate()
-            self.system = build_system_prompt(self.config, self.goals, self.skills,
-                                              cwd=self.cwd,
-                                              vision=model.vision)
-            prefix = StablePrefix.create(
-                provider=provider.name, endpoint=provider.base_url,
-                model=model.id, system=self.system,
-                tools=self.registry.schemas(provider.wire, vision=model.vision),
-                generation=max(1, payload.prefix_generation), wire=provider.wire,
-            )
-            self.context.stable_prefix = prefix
-            self.turn_in = 0
-            self.turn_out = 0
-            self.status = 'idle'
-        self.agents.update_root(self.context, self.provider, self.model, self.system)
-        self._emit('session_loaded', name=self.session_name or payload.name,
-                   title=self.session_title)
-
-    def clear(self) -> None:
-        self._require_idle('cannot clear the conversation')
-        with self._lock:
-            self.context.committed.clear()
-            self.context.draft.clear()
-            self.context.archived.clear()
-            self.context.invalidate()
-            self.items.clear()
-            self.turn = 0
-            self.session_name = ''
-            self.session_title = ''
-            self.session_created = ''
-            self.turn_in = 0
-            self.turn_out = 0
-            self.total_in = 0
-            self.total_out = 0
-            self.usage_records.clear()
-            self.context.stable_prefix = StablePrefix.create(
-                provider=self.provider.name, endpoint=self.provider.base_url,
-                model=self.model.id, system=self.system,
-                tools=self.registry.schemas(self.provider.wire,
-                                            vision=self.model.vision),
-                generation=1, wire=self.provider.wire,
-            )
-        try:
-            self.store.save(SessionPayload(name=''), LAST_SESSION)
-        except Exception:
-            pass
-        self._emit('session_cleared')
-
-    def rewind(self, turn: int) -> str:
-        """Drop the given turn and everything after it; returns the user text."""
-        self._require_idle('cannot rewind the conversation')
-        with self._lock:
-            from adcode.session import SessionStore as _Store
-            starts = _Store.turn_starts(self.context.committed)
-            # Transcript turn ids survive compaction, but the retained history
-            # starts later.  Align the oldest retained user message with the
-            # suffix of transcript turns instead of assuming ``turn - 1``.
-            turn_ids = sorted({item.turn for item in self.items
-                               if item.kind == 'user' and item.turn > 0})
-            index = len(starts) - sum(1 for value in turn_ids if value >= turn)
-            if index < 0:
-                # The requested turn was archived by compaction; roll back to
-                # the oldest retained turn instead of wiping the whole context.
-                index = 0
-            text = ''
-            if 0 <= index < len(starts):
-                cut = starts[index]
-                message = self.context.committed[cut]
-                text = str(message.get('content') or '')
-                marker = '</conversation_summary>'
-                if text.startswith('<conversation_summary>') and marker in text:
-                    text = text.split(marker, 1)[1].lstrip('\n')
-                del self.context.committed[cut:]
-            else:
-                self.context.committed.clear()
-            self.context.draft.clear()
-            self.context.invalidate()
-            self.items = [item for item in self.items if item.turn < turn]
-            self.turn = max(0, turn - 1)
-            self.status = 'idle'
-        self._emit('session_rewound', turn=turn)
-        self.save_active()
-        return text
-
-    def fork(self, name: str = '') -> str:
-        self._require_idle('cannot fork the conversation')
-        with self._lock:
-            source = self.session_name
-            if name:
-                new_name = name.strip()
-            else:
-                new_name = self.store.unique_name(f'{new_session_name()}_fork')
-            if not new_name:
-                raise ValueError('session name must not be empty')
-            self.session_name = new_name
-            self.session_title = f'Fork of {self.session_title or source or "session"}'
-        payload = self.payload()
-        self.store.save(payload)
-        self.store.save(payload, LAST_SESSION)
-        self._append_notice(f'Forked into session {new_name}.', level='info')
-        self.save_active()
-        return new_name
-
-    # ── model switching ─────────────────────────────────────
     def set_model(self, provider: ProviderConfig, model: ModelConfig) -> None:
-        self._require_idle('cannot switch models')
-        with self._lock:
-            self.provider = provider
-            self.model = model
-            self.client = self._make_client(provider)
-            self.config.select(provider.name, model.id)
-            self.context.stable_prefix = StablePrefix.create(
-                provider=provider.name, endpoint=provider.base_url,
-                model=model.id, system=self.system,
-                tools=self.registry.schemas(provider.wire, vision=model.vision),
-                generation=self.context.stable_prefix.generation + 1,
-                wire=provider.wire,
-            )
-            self.turn_in = 0
-            self.turn_out = 0
-        self.agents.update_root(self.context, self.provider, self.model, self.system)
-        self._emit('model_changed', provider=provider.name, model=model.id)
+        self._require_idle('model change')
+        client = self._make_client(provider, model)
+        model_info = self._model_info(provider, model)
+        self.client = client
+        self.provider = provider
+        self.model = model
+        self._call(lambda: self._apply_model(provider, model, model_info, client))
+
+    def _apply_model(self, provider, model, model_info, client) -> None:
+        engine = self._engine
+        if engine is not None:
+            engine.set_client(client, model_info)
+        if self.agents is not None:
+            self.agents.set_model(provider, model, model_info, client)
 
     def refresh_tools(self) -> None:
-        """Re-register dynamic tools after MCP or configuration changes."""
-        self.registry.unregister_source('agent')
-        self.registry.unregister_source('skill')
-        if self.config.agents.enabled:
-            self.registry.register_many(self.agents.tool_specs())
-        self.registry.register_many(self.skills.tool_specs())
-        # Skills and delegation limits also appear in the system prompt, so
-        # rebuild it instead of only refreshing the tool schemas.
-        self._refresh_system_and_prefix(force=True)
-        self._emit('tools_refreshed')
+        self._require_idle('tool refresh')
+        registry = self._registry
+        registry.unregister_source('agent')
+        registry.unregister_source('skill')
+        if self.agents is not None:
+            self.agents.reinstall_tools()
+        specs = self.skills.tool_specs() if self.skills is not None else []
+        for tool in specs:
+            registry.register(tool, replace=True, source='skill')
+        self._call(lambda: self._engine.refresh_tools())
 
+    def shutdown(self) -> None:
+        self._stop = True
+        engine = self._engine
+        if engine is not None:
+            engine.interrupt()
+        self._drain_work()
+        if self._loop is not None and not self._loop.is_closed():
+            try:
+                if self.agents is not None:
+                    asyncio.run_coroutine_threadsafe(self.agents.shutdown(),
+                                                     self._loop).result(timeout=5)
+                if engine is not None:
+                    asyncio.run_coroutine_threadsafe(engine.shutdown(),
+                                                     self._loop).result(timeout=5)
+            except concurrent.futures.TimeoutError:
+                pass
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        if self._pump is not None:
+            self._pump.join(timeout=2)
+        shutdown_shell_sessions()
 
-def _title_from(text: str) -> str:
-    visible = strip_image_markers(text).strip()
-    if not visible and has_image_marker(text):
-        return 'Image'
-    line = visible.splitlines()[0] if visible else ''
-    line = ' '.join(line.split())
-    return line[:60]
+    def _drain_work(self) -> None:
+        self._work._stop_requested = True
+        with self._work._condition:
+            self._work._condition.notify_all()
+        self._work._items.clear()
 
+    # ── snapshots ───────────────────────────────────────────
+    @property
+    def busy(self) -> bool:
+        engine = self._engine
+        return engine.busy() if engine is not None else False
 
-def _continuation_prompt(thinking: str, full: str) -> str:
-    parts = []
-    if thinking:
-        parts.append(f'<reasoning>\n{thinking}\n</reasoning>\n')
-    if full:
-        parts.append(f'<output>\n{full}\n</output>\n')
-    parts.append(
-        '\n[The previous response was cut off by the output token limit. '
-        'Continue exactly where it stopped. Do not repeat anything above. '
-        'Keep producing the rest of your reasoning, then finish the task.]')
-    return ''.join(parts)
+    @property
+    def status(self) -> str:
+        engine = self._engine
+        return engine.status if engine is not None else 'idle'
 
+    @property
+    def items(self) -> list[TranscriptItem]:
+        engine = self._engine
+        return engine.items if engine is not None else []
 
-def _diff_dict(file_diff: FileDiff | None) -> dict[str, Any] | None:
-    if file_diff is None:
-        return None
-    return {
-        'path': file_diff.path,
-        'unified': file_diff.unified,
-        'additions': file_diff.additions,
-        'deletions': file_diff.deletions,
-        'omitted': file_diff.omitted,
-    }
+    @property
+    def context(self) -> Any:
+        return self._engine.conversation
+
+    @property
+    def usage_records(self) -> list[dict[str, Any]]:
+        engine = self._engine
+        return engine._usage_records if engine is not None else []
+
+    @property
+    def session_name(self) -> str:
+        engine = self._engine
+        return engine.session_name if engine is not None else ''
+
+    @property
+    def session_title(self) -> str:
+        engine = self._engine
+        return engine.session_title if engine is not None else ''
+
+    def snapshot(self) -> AgentSnapshot:
+        engine = self._engine
+        if engine is None:
+            return AgentSnapshot(provider=self.provider.name,
+                                 model=self.model.id,
+                                 effort=self.config.reasoning.effort)
+        snap = engine.snapshot()
+        snap.queued = self._work.qsize()
+        return snap
+
+    def items_snapshot(self) -> list[TranscriptItem]:
+        engine = self._engine
+        return engine.items_snapshot() if engine is not None else []
+
+    def drain_ui_events(self, limit: int = 2_000) -> list[tuple[str, dict]]:
+        return self._sink.drain(limit)
+
+    # ── sessions ────────────────────────────────────────────
+    def _require_idle(self, action: str) -> None:
+        if self.busy:
+            raise RuntimeError(f'{action} while a turn is still running')
+
+    def payload(self) -> SessionPayload:
+        return self._sync_call(lambda: self._engine.payload())
+
+    def save_active(self) -> None:
+        self._sync_call(lambda: self._engine.save_active())
+
+    def save_as(self, name: str) -> None:
+        self._require_idle('session rename')
+        self._sync_call(lambda: self._engine.save_as(name))
+
+    def load_session(self, name: str) -> bool:
+        self._require_idle('session load')
+        return self._sync_call(lambda: self._engine.load_session(name))
+
+    def apply_payload(self, payload: SessionPayload) -> None:
+        self._require_idle('session load')
+        self._sync_call(lambda: self._engine.apply_payload(payload))
+
+    def clear(self) -> None:
+        self._require_idle('session clear')
+        self._sync_call(lambda: self._engine.clear())
+
+    def rewind(self, turn: int) -> str:
+        self._require_idle('rewind')
+        return self._sync_call(lambda: self._engine.rewind(turn))
+
+    def fork(self, name: str = '') -> str:
+        self._require_idle('fork')
+        return self._sync_call(lambda: self._engine.fork(name))
+
+    def _sync_call(self, fn: Callable[[], Any]) -> Any:
+        """Run an engine method; on the loop when it is alive, direct if not."""
+        if self._loop is not None and not self._loop.is_closed():
+            return self._call(fn)
+        return fn()
+
+    # ── sub-agent pump ──────────────────────────────────────
+    def pump_agent_events(self) -> None:
+        """Fold child-agent activity into the transcript and live view."""
+        manager = self.agents
+        if manager is None:
+            return
+        dirty = False
+        show_activity = self.config.agents.show_activity
+        show_output = self.config.agents.show_output
+        for event in manager.drain_agent_events():
+            name = event.agent_name
+            if event.kind in ('thinking_delta', 'text_delta', 'compaction_delta'):
+                mode = {'thinking_delta': 'thinking', 'text_delta': 'answer',
+                        'compaction_delta': 'compacting'}[event.kind]
+                live = self.agent_live.setdefault(
+                    name, {'mode': mode, 'text': ''})
+                live['mode'] = mode
+                live['text'] = (live['text'] + event.content)[-4_000:]
+                dirty = True
+            elif event.kind == 'usage':
+                try:
+                    usage = json.loads(event.content)
+                except ValueError:
+                    usage = {}
+                self._emit('usage', **usage)
+            elif event.kind == 'status':
+                status = event.status
+                if status in (AgentStatus.PENDING_INIT, AgentStatus.RUNNING):
+                    continue
+                content = event.content or ''
+                if status == AgentStatus.COMPLETED and content:
+                    content = f'completed · {content[:300]}'
+                self._emit('agent_event', agent=name, status=status,
+                           content=content)
+                dirty = True
+            elif event.kind == 'tool_start' and show_activity:
+                brief = _tool_brief(event.tool_args)
+                self._emit('agent_event', agent=name, status='tool',
+                           content=f'{event.tool_name}{brief}')
+                dirty = True
+            elif event.kind == 'tool_result' and show_output:
+                self._emit('agent_event', agent=name, status='tool_result',
+                           content=event.content[:500])
+                dirty = True
+            elif event.kind == 'tool_output_line' and show_output:
+                self._emit('agent_event', agent=name, status='tool_output',
+                           content=event.content[-500:])
+                dirty = True
+        if dirty:
+            self._emit('agents_refresh')
+
+    def _emit(self, kind: str, **payload: Any) -> None:
+        self._sink.emit(kind, payload)
 
 
 def _tool_brief(args: dict[str, Any]) -> str:
-    for key in ('command', 'path', 'pattern', 'url', 'task_name', 'target', 'name'):
-        value = args.get(key)
-        if value:
-            text = str(value).replace('\n', ' ')
-            return text[:80] + ('...' if len(text) > 80 else '')
-    return ''
+    """A short, human-readable summary of a tool call's arguments."""
+    if not isinstance(args, dict) or not args:
+        return ''
+    parts = []
+    for key, value in list(args.items())[:3]:
+        text = str(value).replace('\n', ' ')
+        if len(text) > 60:
+            text = text[:57] + '...'
+        parts.append(f'{key}={text}')
+    return f"({', '.join(parts)})" if parts else ''
