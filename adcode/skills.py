@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from adcode.config import SkillsSettings
-from adcode.tools.registry import ToolSpec
+from adcode.tools.registry import AnnotatedTool
 
 
 @dataclass
@@ -223,24 +223,24 @@ class SkillRegistry:
         lines.append('</available_skills>')
         return '\n'.join(lines)
 
-    def tool_specs(self) -> list[ToolSpec]:
+    def tool_specs(self) -> list[AnnotatedTool]:
         if not self.settings.enabled:
             return []
 
-        def skill_list(args: dict[str, Any]) -> str:
-            query = str(args.get('query', '') or '').lower()
+        def skill_list(query: str = '') -> str:
+            needle = str(query or '').lower()
             results = []
             for skill in self.list():
                 haystack = f'{skill.name} {skill.description}'.lower()
-                if query and query not in haystack:
+                if needle and needle not in haystack:
                     continue
                 results.append(f'{skill.name} - {skill.description}')
             return '\n'.join(results) or '(no matching skills)'
 
-        def skill_load(args: dict[str, Any]) -> str:
-            skill = self.get(str(args.get('name', '')))
+        def skill_load(name: str = '') -> str:
+            skill = self.get(str(name))
             if skill is None:
-                return f'Error: unknown skill: {args.get("name", "")}'
+                return f'Error: unknown skill: {name}'
             tree = skill.file_tree()
             tree_text = '\n'.join(f'  {entry}' for entry in tree)
             return (
@@ -252,20 +252,20 @@ class SkillRegistry:
             )
 
         return [
-            ToolSpec(
-                'skill_list',
-                'List installed skills, optionally filtered by a query.',
-                {'type': 'object', 'properties': {
+            AnnotatedTool(
+                name='skill_list', read_only=True,
+                description='List installed skills, optionally filtered by a query.',
+                parameters={'type': 'object', 'properties': {
                     'query': {'type': 'string', 'description': 'Optional filter text'},
                 }, 'required': []},
-                skill_list, read_only=True, source='skill',
+                handler=skill_list,
             ),
-            ToolSpec(
-                'skill_load',
-                'Load the full instructions of an installed skill by name.',
-                {'type': 'object', 'properties': {
+            AnnotatedTool(
+                name='skill_load', read_only=True,
+                description='Load the full instructions of an installed skill by name.',
+                parameters={'type': 'object', 'properties': {
                     'name': {'type': 'string', 'description': 'Skill name'},
                 }, 'required': ['name']},
-                skill_load, read_only=True, source='skill',
+                handler=skill_load,
             ),
         ]

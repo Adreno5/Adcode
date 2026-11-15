@@ -69,16 +69,16 @@ def test_stdio_transport_and_pagination(stdio_server):
     assert manager.add_server(config)
     client = manager.get_client('fake')
     assert {tool['name'] for tool in client.tools} == {'echo', 'add'}
-    names = {spec.name for spec in registry.specs()
-             if spec.source.startswith('mcp:')}
+    names = {name for name in registry.names()
+             if registry.source_of(name).startswith('mcp:')}
     assert names == {'mcp__fake__echo', 'mcp__fake__add'}
-    assert registry.execute('mcp__fake__echo', {'text': 'hi'}).text == 'echo:hi'
-    assert registry.execute('mcp__fake__add', {'a': 2, 'b': 3}).text == '5'
+    assert registry.execute('mcp__fake__echo', {'text': 'hi'})[0] == 'echo:hi'
+    assert registry.execute('mcp__fake__add', {'a': 2, 'b': 3})[0] == '5'
     assert manager.refresh()['fake'] == 'ok'
     assert manager.diagnostics()[0]['tool_count'] == 2
     manager.shutdown()
-    assert not [spec for spec in registry.specs()
-                if spec.source.startswith('mcp:')]
+    assert not [name for name in registry.names()
+                if registry.source_of(name).startswith('mcp:')]
 
 
 class HTTPHandler(BaseHTTPRequestHandler):
@@ -124,7 +124,7 @@ def test_http_transport():
     url = f'http://127.0.0.1:{server.server_address[1]}/mcp'
     try:
         assert manager.add_server({'name': 'http', 'transport': 'http', 'url': url})
-        assert registry.execute('mcp__http__ping', {}).text == 'pong'
+        assert registry.execute('mcp__http__ping', {})[0] == 'pong'
     finally:
         manager.shutdown()
         server.shutdown()
@@ -198,7 +198,7 @@ def test_sse_transport():
     url = f'http://127.0.0.1:{server.server_address[1]}/sse'
     try:
         assert manager.add_server({'name': 'sse', 'transport': 'sse', 'url': url})
-        assert registry.execute('mcp__sse__sse_echo', {}).text == 'sse-pong'
+        assert registry.execute('mcp__sse__sse_echo', {})[0] == 'sse-pong'
     finally:
         manager.shutdown()
         server.stopping.set()

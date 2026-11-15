@@ -1,53 +1,18 @@
-"""Per-thread execution context for tools."""
+# adcode/tools/runtime.py
+# Per-turn tool context, re-exported from the engine sdk.
+#
+# The engine (harness.agent.ConversationEngine) pushes a ToolContext around
+# every tool call; tools read cwd / interrupt / live_sink from here.
 
-from __future__ import annotations
+from harness.tools.context import (
+    ToolContext,
+    current_context,
+    pop_context,
+    push_context,
+    resolve_path,
+)
 
-import contextvars
-import os
-import threading
-from dataclasses import dataclass, field
-from typing import Callable
-
-
-@dataclass
-class ToolContext:
-    cwd: str = '.'
-    interrupt: threading.Event = field(default_factory=threading.Event)
-    live_sink: Callable[[str], None] | None = None
-    agent: str = 'root'
-
-
-_CURRENT: contextvars.ContextVar[ToolContext | None] = contextvars.ContextVar(
-    'adcode_tool_context', default=None)
-
-
-def current_context() -> ToolContext:
-    """Return this thread's context, creating one lazily.
-
-    A single shared default instance would let one thread's ``live_sink`` leak
-    into another thread that never pushed a context of its own.
-    """
-    context = _CURRENT.get()
-    if context is None:
-        context = ToolContext()
-        _CURRENT.set(context)
-    return context
-
-
-def push_context(context: ToolContext):
-    return _CURRENT.set(context)
-
-
-def pop_context(token) -> None:
-    _CURRENT.reset(token)
-
-
-def resolve_path(path: str) -> str:
-    """Resolve a tool path against the context's working directory."""
-    base = current_context().cwd or '.'
-    text = os.path.expanduser(str(path)) if path else ''
-    if not text:
-        return base
-    if os.path.isabs(text):
-        return text
-    return os.path.normpath(os.path.join(base, text))
+__all__ = [
+    'ToolContext', 'current_context', 'pop_context', 'push_context',
+    'resolve_path',
+]
