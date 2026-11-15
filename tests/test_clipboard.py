@@ -8,6 +8,12 @@ from adcode.tui.input import KeyEvent
 from adcode.tui.settings import SettingsOverlay
 
 
+@pytest.fixture(autouse=True)
+def clean_cache(monkeypatch):
+    """The module keeps copies it made itself; no test may inherit them."""
+    monkeypatch.setattr(clipboard, '_cached', '')
+
+
 @pytest.fixture()
 def paste_text(monkeypatch):
     """Replace the clipboard with a value the test controls.
@@ -52,6 +58,9 @@ def test_trailing_newline_is_stripped(monkeypatch):
     monkeypatch.setattr(clipboard, '_read_pyperclip', lambda: None)
     monkeypatch.setattr(clipboard, '_read_commands',
                         lambda: [['true'], ['true']])
+    # 'true' is not an executable on Windows; pretend the helper exists so the
+    # test exercises the output handling instead of the platform lookup.
+    monkeypatch.setattr(clipboard.shutil, 'which', lambda name: name)
     monkeypatch.setattr(clipboard, '_run', lambda *args, **kwargs: 'text\n')
 
     assert clipboard.get_clipboard() == 'text'
