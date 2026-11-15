@@ -82,6 +82,34 @@ def iter_segments(text: str) -> list[tuple[str, str]]:
     return segments
 
 
+def is_image_url(reference: str) -> bool:
+    """True for an http(s) URL that names an image file."""
+    value = reference.strip().strip('"\'').lower()
+    if not value.startswith(('http://', 'https://')):
+        return False
+    path = value.split('?', 1)[0].split('#', 1)[0]
+    return path.endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp'))
+
+
+def file_uri_to_path(reference: str) -> str:
+    """Turn a ``file://`` URI into a local path; other values pass through.
+
+    Drag-and-drop and file managers hand out URIs on some systems, while every
+    other clipboard shape is already a path.
+    """
+    value = reference.strip().strip('"\'')
+    if not value.lower().startswith('file://'):
+        return value
+    from urllib.parse import unquote, urlparse
+    parsed = urlparse(value)
+    path = unquote(parsed.path)
+    if len(path) > 2 and path[0] == '/' and path[2] == ':':
+        path = path[1:]            # file:///C:/shots/a.png
+    if parsed.netloc and parsed.netloc != 'localhost':
+        path = f'//{parsed.netloc}{path}'
+    return path or value
+
+
 def sniff_media_type(data: bytes) -> str | None:
     if data.startswith(b'\x89PNG\r\n\x1a\n'):
         return 'image/png'
@@ -91,6 +119,61 @@ def sniff_media_type(data: bytes) -> str | None:
         return 'image/gif'
     if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
         return 'image/webp'
+    return None
+
+
+def image_info(data: bytes) -> tuple[int, int] | None:
+    """Return ``(width, height)`` read from the header, or None."""
+    media_type = sniff_media_type(data)
+    try:
+        if media_type == 'image/png' and len(data) >= 24:
+            return struct.unpack('>II', data[16:24])
+        if media_type == 'image/gif' and len(data) >= 10:
+            return struct.unpack('<HH', data[6:10])
+        if media_type == 'image/jpeg':
+            return _jpeg_size(data)
+        if media_type == 'image/webp':
+            return _webp_size(data)
+    except (struct.error, IndexError):
+        return None
+    return None
+
+
+def _jpeg_size(data: bytes) -> tuple[int, int] | None:
+    index, length = 2, len(data)
+    while index + 9 < length:
+        if data[index] != 0xFF:
+            index += 1
+            continue
+        marker = data[index + 1]
+        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+            index += 2
+            continue
+        size = struct.unpack('>H', data[index + 2:index + 4])[0]
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            height, width = struct.unpack('>HH', data[index + 5:index + 9])
+            return (width, height)
+        index += 2 + size
+    return None
+
+
+def _webp_size(data: bytes) -> tuple[int, int] | None:
+    if len(data) < 25:
+        return None
+    kind = data[12:16]
+    if kind == b'VP8 ':
+        if len(data) < 30 or data[23:26] != b'\x9d\x01\x2a':
+            return None
+        width, height = struct.unpack('<HH', data[26:30])
+        return (width & 0x3FFF, height & 0x3FFF)
+    if kind == b'VP8L':
+        if data[20] != 0x2F:
+            return None
+        bits = int.from_bytes(data[21:25], 'little')
+        return ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
+    if kind == b'VP8X' and len(data) >= 30:
+        return (int.from_bytes(data[24:27], 'little') + 1,
+                int.from_bytes(data[27:30], 'little') + 1)
     return None
 
 

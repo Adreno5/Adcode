@@ -120,6 +120,38 @@ def test_alt_v_sends_a_native_image_part(harness_factory, wire):
     assert user_items and 'what is this?' in user_items[0]
 
 
+@pytest.mark.parametrize('wire', WIRES)
+def test_the_model_can_look_at_an_image_by_itself(harness_factory, wire):
+    harness = harness_factory(wire=wire)
+    (harness.workspace.project / 'shot.png').write_bytes(
+        images.encode_png(3, 3, bytes([10, 20, 30, 255] * 9)))
+    harness.gateway.responder = ScriptedResponder([
+        Turn(tool_calls=[ToolCall(name='view_image',
+                                  args={'path': 'shot.png'},
+                                  id='call_view_1')]),
+        Turn(text='The screenshot is a solid dark square.'),
+    ])
+
+    harness.submit('what is in shot.png?', expect_requests=2, timeout=30.0)
+    harness.wait_idle(20.0)
+    harness.wait_for_text('solid dark square')
+
+    request = harness.requests[1]
+    kind = {'openai chat completions': 'image_url',
+            'openai responses': 'input_image'}.get(wire, 'image')
+    assert f'"type": "{kind}"' in request.all_text
+    assert 'file_id' in request.all_text or 'base64' in request.all_text
+
+    session = harness.workspace.session_payload()
+    assert session
+    contents = [message.get('content') for message in session['messages']]
+    assert any(isinstance(text, str) and 'Loaded shot.png (3x3' in text
+               for text in contents)
+    assert any(isinstance(text, str) and text.startswith('<tool_images>')
+               for text in contents)
+    assert not any(isinstance(text, str) and 'base64' in text for text in contents)
+
+
 def test_tool_call_writes_into_the_temp_workspace(harness):
     harness.gateway.responder = ScriptedResponder([
         Turn(thinking='Write the file with the real tool registry.',

@@ -20,7 +20,10 @@ from adcode.agents.manager import AgentManager
 from adcode.config import AppConfig, ModelConfig, ProviderConfig
 from adcode.diff import FileDiff
 from adcode.goals import GoalStore
-from adcode.images import FileIdCache, has_image_marker, strip_image_markers
+from adcode.images import (
+    MARKER_RE as IMAGE_MARKER_RE, FileIdCache, has_image_marker, image_marker,
+    strip_image_markers,
+)
 from adcode.llm.client import LLMClient
 from adcode.llm.context import (
     ConversationContext, StablePrefix, TokenBudgetExceeded, stream_compact,
@@ -91,8 +94,9 @@ class AgentLoop:
                                                     'images', 'files.json'))
         self.client = self._make_client(self.provider)
 
-        self.system = build_system_prompt(config, goals, skills, cwd=self.cwd)
-        schemas = registry.schemas(self.provider.wire)
+        self.system = build_system_prompt(config, goals, skills, cwd=self.cwd,
+                                          vision=self.model.vision)
+        schemas = registry.schemas(self.provider.wire, vision=self.model.vision)
         self.context = ConversationContext(
             StablePrefix.create(
                 provider=self.provider.name, endpoint=self.provider.base_url,
@@ -523,6 +527,7 @@ class AgentLoop:
                        full: str = '') -> bool:
         """Execute a tool batch; returns False when the turn was interrupted."""
         draft: list[dict[str, Any]] = []
+        image_markers: list[str] = []
         # Providers occasionally omit call ids; the assistant message and every
         # matching tool result must agree on the same fallback id.
         stamp = int(time.time() * 1000)
@@ -572,6 +577,10 @@ class AgentLoop:
             draft.append({
                 'role': 'tool', 'tool_call_id': call_id, 'content': normalized,
             })
+            for reference in IMAGE_MARKER_RE.findall(normalized):
+                marker = image_marker(reference)
+                if marker not in image_markers:
+                    image_markers.append(marker)
             if name == 'update_goal':
                 self._refresh_system_and_prefix(force=True)
             if self._interrupt.is_set() or self._stop.is_set():
@@ -592,6 +601,15 @@ class AgentLoop:
         }
         context.stage(assistant_message)
         context.stage(*draft)
+        if image_markers:
+            # Tool results are plain text on every wire, so the picture travels
+            # in its own user block right after them.  The leading tag keeps
+            # turn_starts() from treating it as a user turn.
+            context.stage({
+                'role': 'user',
+                'content': '<tool_images>\n' + '\n'.join(image_markers)
+                           + '\n</tool_images>',
+            })
         with self._lock:
             self.status = 'thinking'
         self._emit('status', status='thinking')
@@ -823,7 +841,8 @@ class AgentLoop:
     # ── system/prefix management ────────────────────────────
     def _refresh_system_and_prefix(self, force: bool = False) -> None:
         system = build_system_prompt(self.config, self.goals, self.skills,
-                                     cwd=self.cwd)
+                                     cwd=self.cwd,
+                                     vision=self.model.vision)
         if force or system != self.context.stable_prefix.system:
             if system != self.context.stable_prefix.system:
                 with self._lock:
@@ -832,7 +851,8 @@ class AgentLoop:
             self.agents.update_root(self.context, self.provider, self.model, self.system)
 
     def _refresh_prefix(self, force: bool = False) -> None:
-        schemas = self.registry.schemas(self.provider.wire)
+        schemas = self.registry.schemas(self.provider.wire,
+                                        vision=self.model.vision)
         current = self.context.stable_prefix
         # ``self.system`` is authoritative: ``_refresh_system_and_prefix`` has
         # already folded new goals, instructions or skills into it.  Using the
@@ -943,11 +963,12 @@ class AgentLoop:
             self.context.archived[:] = payload.compaction_archive
             self.context.invalidate()
             self.system = build_system_prompt(self.config, self.goals, self.skills,
-                                              cwd=self.cwd)
+                                              cwd=self.cwd,
+                                              vision=model.vision)
             prefix = StablePrefix.create(
                 provider=provider.name, endpoint=provider.base_url,
                 model=model.id, system=self.system,
-                tools=self.registry.schemas(provider.wire),
+                tools=self.registry.schemas(provider.wire, vision=model.vision),
                 generation=max(1, payload.prefix_generation), wire=provider.wire,
             )
             self.context.stable_prefix = prefix
@@ -978,7 +999,8 @@ class AgentLoop:
             self.context.stable_prefix = StablePrefix.create(
                 provider=self.provider.name, endpoint=self.provider.base_url,
                 model=self.model.id, system=self.system,
-                tools=self.registry.schemas(self.provider.wire),
+                tools=self.registry.schemas(self.provider.wire,
+                                            vision=self.model.vision),
                 generation=1, wire=self.provider.wire,
             )
         try:
@@ -1053,7 +1075,7 @@ class AgentLoop:
             self.context.stable_prefix = StablePrefix.create(
                 provider=provider.name, endpoint=provider.base_url,
                 model=model.id, system=self.system,
-                tools=self.registry.schemas(provider.wire),
+                tools=self.registry.schemas(provider.wire, vision=model.vision),
                 generation=self.context.stable_prefix.generation + 1,
                 wire=provider.wire,
             )

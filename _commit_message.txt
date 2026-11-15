@@ -1,0 +1,17 @@
+feat: let the model look at an image with view_image
+
+A vision model no longer has to wait for a paste: view_image takes a path
+or an http(s) URL, copies the file into the session store and answers with
+a short description plus the [image: path] marker.
+
+- the loop collects markers from tool results and stages them in a
+  <tool_images> user block, because tool results are plain text on every
+  wire; turn_starts ignores the <tool_ prefix so rewind and edit skip it
+- view_image is offered only to models marked vision-capable, and
+  sub-agents inherit the rule from their own model
+- the system prompt tells a vision model it can see images
+- a rejected file id (400/403/404/422) now falls back to inline images
+  once and disables file ids for that provider, instead of failing the turn
+- alt+v also accepts a clipboard file path, file:// URI or image link
+- attaching prints the stored name and size, warns about a model that is
+  not vision-capable, and the footer counts attached images

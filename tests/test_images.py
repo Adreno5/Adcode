@@ -111,6 +111,22 @@ def test_resolve_image_relative_and_url(tmp_path):
     assert remote is not None and remote.url.endswith('cat.png')
 
 
+def test_is_image_url_only_matches_image_links():
+    assert images.is_image_url('https://example.com/cat.PNG')
+    assert images.is_image_url('https://example.com/a/b.jpeg?x=1#frag')
+    assert not images.is_image_url('https://example.com/page')
+    assert not images.is_image_url('ftp://example.com/cat.png')
+    assert not images.is_image_url('sessions/images/cat.png')
+
+
+def test_file_uri_to_path():
+    assert images.file_uri_to_path('file:///C:/shots/a%20b.png') == 'C:/shots/a b.png'
+    assert images.file_uri_to_path('file://localhost/tmp/a.png') == '/tmp/a.png'
+    assert images.file_uri_to_path('"C:/shots/a.png"') == 'C:/shots/a.png'
+    assert images.file_uri_to_path('https://example.com/a.png') == \
+        'https://example.com/a.png'
+
+
 def test_parts_for_each_wire(tmp_path):
     store = images.ImageStore(tmp_path / 'images', tmp_path)
     reference = store.save(sample_png())
@@ -152,6 +168,44 @@ def test_unresolved_marker_stays_text(tmp_path):
     messages = client._openai_chat_messages(
         [{'role': 'user', 'content': text}])
     assert messages[0]['content'] == text
+
+
+def test_has_file_id_scans_nested_payloads():
+    assert LLMClient._has_file_id({'input': [{'content': [
+        {'type': 'input_image', 'file_id': 'file-1'}]}]})
+    assert not LLMClient._has_file_id({'input': [{'content': [
+        {'type': 'input_image', 'file_id': ''}]}]})
+    assert not LLMClient._has_file_id({'input': 'file_id'})
+
+
+def test_file_id_rejected_statuses():
+    class Failure(Exception):
+        def __init__(self, status: int) -> None:
+            self.status_code = status
+
+    for status in (400, 403, 404, 422):
+        assert LLMClient._file_id_rejected(Failure(status))
+    for status in (0, 401, 408, 429, 500, 503):
+        assert not LLMClient._file_id_rejected(Failure(status))
+
+
+def test_an_unsupported_scope_wins_over_cached_file_ids(tmp_path):
+    from adcode.config import ProviderConfig
+
+    store = images.ImageStore(tmp_path / 'images', tmp_path)
+    resolved = images.resolve_image(store.save(sample_png()), str(tmp_path))
+    assert resolved is not None
+    client = object.__new__(LLMClient)
+    client.provider = ProviderConfig(name='Test', base_url='http://localhost/v1')
+    client.file_cache = images.FileIdCache(tmp_path / 'files.json')
+    scope = client._file_scope()
+
+    client.file_cache.set_id(scope, client._file_key(resolved), 'file-cached')
+    assert client._file_id(resolved) == 'file-cached'
+
+    # Once the provider rejected the reference, the cached ids are not reused.
+    client.file_cache.mark_unsupported(scope, 'nope')
+    assert client._file_id(resolved) == ''
 
 
 def test_url_image_needs_no_local_file(tmp_path):
@@ -359,10 +413,78 @@ def test_alt_v_reports_an_empty_clipboard(tmp_path, monkeypatch):
 
     module, app = make_app(tmp_path)
     monkeypatch.setattr(module, 'read_clipboard_image', lambda: None)
+    monkeypatch.setattr(module, 'get_clipboard', lambda: '')
     try:
         app._handle_event(KeyEvent(kind='key', key='alt+v', alt=True))
         assert app.prompt.text == ''
         assert 'No image in the clipboard' in app.items[-1].text
+    finally:
+        close_app(app)
+
+
+def test_alt_v_accepts_a_copied_file_path(tmp_path, monkeypatch):
+    from adcode.tui.input import KeyEvent
+
+    module, app = make_app(tmp_path)
+    source = tmp_path / 'shot.png'
+    source.write_bytes(sample_png())
+    monkeypatch.setattr(module, 'read_clipboard_image', lambda: None)
+    monkeypatch.setattr(module, 'get_clipboard', lambda: f'"{source}"')
+    try:
+        app._handle_event(KeyEvent(kind='key', key='alt+v', alt=True))
+        assert images.has_image_marker(app.prompt.text)
+        assert 'Attached' in app.items[-1].text
+    finally:
+        close_app(app)
+
+
+def test_alt_v_accepts_a_copied_image_url(tmp_path, monkeypatch):
+    from adcode.tui.input import KeyEvent
+
+    module, app = make_app(tmp_path)
+    monkeypatch.setattr(module, 'read_clipboard_image', lambda: None)
+    monkeypatch.setattr(module, 'get_clipboard',
+                        lambda: 'https://example.com/cat.png')
+    try:
+        app._handle_event(KeyEvent(kind='key', key='alt+v', alt=True))
+        assert '[image: https://example.com/cat.png]' in app.prompt.text
+    finally:
+        close_app(app)
+
+
+def select_model(app, vision: bool) -> None:
+    from adcode.config import ModelConfig, ProviderConfig
+
+    provider = ProviderConfig(name='Test', base_url='http://localhost/v1',
+                              models=[ModelConfig(id='vision-model', vision=vision)])
+    app.config.providers = [provider]
+    app.config.select('Test', 'vision-model')
+
+
+def test_attach_warns_when_the_model_is_not_vision_capable(tmp_path, monkeypatch):
+    from adcode.tui.input import KeyEvent
+
+    module, app = make_app(tmp_path)
+    select_model(app, vision=False)
+    monkeypatch.setattr(module, 'read_clipboard_image', sample_png)
+    try:
+        app._handle_event(KeyEvent(kind='key', key='alt+v', alt=True))
+        assert 'not marked as vision-capable' in app.items[-1].text
+        assert app.items[-1].level == 'warning'
+    finally:
+        close_app(app)
+
+
+def test_attach_is_quiet_for_a_vision_model(tmp_path, monkeypatch):
+    from adcode.tui.input import KeyEvent
+
+    module, app = make_app(tmp_path)
+    select_model(app, vision=True)
+    monkeypatch.setattr(module, 'read_clipboard_image', sample_png)
+    try:
+        app._handle_event(KeyEvent(key='alt+v', kind='key', alt=True))
+        assert 'Attached' in app.items[-1].text
+        assert 'vision-capable' not in app.items[-1].text
     finally:
         close_app(app)
 
@@ -381,3 +503,104 @@ def test_image_command_copies_a_file_into_the_store(tmp_path):
         assert 'Unsupported image' in app.items[-1].text
     finally:
         close_app(app)
+
+
+
+# ── the model reading an image itself ──────────────────────
+
+
+def sample_gif(width: int = 3, height: int = 5) -> bytes:
+    return b'GIF89a' + struct.pack('<HH', width, height) + b'\x00' * 40
+
+
+def sample_jpeg(width: int = 7, height: int = 9) -> bytes:
+    # SOI, APP0, SOF0 (baseline), EOI: enough for the header reader.
+    app0 = b'\xff\xe0' + struct.pack('>H', 16) + b'JFIF\x00' + b'\x00' * 9
+    sof = b'\xff\xc0' + struct.pack('>HBHHB', 11, 8, height, width, 1) + b'\x01'
+    return b'\xff\xd8' + app0 + sof + b'\xff\xd9'
+
+
+def sample_webp(width: int = 11, height: int = 13) -> bytes:
+    payload = b'\x2f' + struct.pack('<I', ((width - 1) & 0x3FFF)
+                                    | (((height - 1) & 0x3FFF) << 14))
+    chunk = b'VP8L' + struct.pack('<I', len(payload)) + payload
+    chunk += b'\x00' * (-len(chunk) % 2)
+    body = b'WEBP' + chunk
+    return b'RIFF' + struct.pack('<I', len(body)) + body
+
+
+def test_image_info_reads_every_supported_header():
+    assert images.image_info(sample_png(2, 3)) == (2, 3)
+    assert images.image_info(sample_gif(3, 5)) == (3, 5)
+    assert images.image_info(sample_jpeg(7, 9)) == (7, 9)
+    assert images.image_info(sample_webp(11, 13)) == (11, 13)
+    assert images.image_info(b'not an image') is None
+    assert images.image_info(b'') is None
+
+
+def run_tool(name: str, args: dict, cwd) -> str:
+    from adcode.tools.registry import ToolRegistry
+    from adcode.tools.runtime import ToolContext, pop_context, push_context
+
+    token = push_context(ToolContext(cwd=str(cwd)))
+    try:
+        return ToolRegistry().execute(name, args).text
+    finally:
+        pop_context(token)
+
+
+def test_view_image_stores_the_file_and_returns_a_marker(tmp_path):
+    (tmp_path / 'shot.png').write_bytes(sample_png(4, 6))
+    text = run_tool('view_image', {'path': 'shot.png'}, tmp_path)
+    assert 'Loaded shot.png (4x6 image/png' in text
+    match = images.MARKER_RE.search(text)
+    assert match is not None
+    stored = tmp_path / match.group(1)
+    assert stored.exists()
+    assert stored.read_bytes() == (tmp_path / 'shot.png').read_bytes()
+    assert match.group(1).startswith('sessions/images/')
+
+
+def test_view_image_deduplicates_the_same_bytes(tmp_path):
+    (tmp_path / 'a.png').write_bytes(sample_png())
+    (tmp_path / 'b.png').write_bytes(sample_png())
+    first = images.MARKER_RE.search(
+        run_tool('view_image', {'path': 'a.png'}, tmp_path))
+    second = images.MARKER_RE.search(
+        run_tool('view_image', {'path': 'b.png'}, tmp_path))
+    assert first is not None and second is not None
+    assert first.group(1) == second.group(1)
+
+
+def test_view_image_rejects_what_it_cannot_show(tmp_path):
+    (tmp_path / 'notes.txt').write_text('hello')
+    assert run_tool('view_image', {'path': 'notes.txt'}, tmp_path).startswith(
+        'Error: not a supported image')
+    assert run_tool('view_image', {'path': 'missing.png'}, tmp_path).startswith(
+        'Error: file not found')
+    assert run_tool('view_image', {'path': ''}, tmp_path).startswith(
+        'Error: path is required')
+
+
+def test_view_image_passes_a_url_through(tmp_path):
+    text = run_tool('view_image', {'path': 'https://example.com/cat.png'}, tmp_path)
+    assert '[image: https://example.com/cat.png]' in text
+    assert not (tmp_path / 'sessions').exists()
+
+
+def test_vision_only_tools_are_hidden_from_text_models():
+    from adcode.tools.registry import ToolRegistry
+
+    registry = ToolRegistry()
+    openai_names = {schema['function']['name']
+                    for schema in registry.schemas('openai chat completions')}
+    assert 'view_image' in openai_names
+    hidden = {schema['function']['name']
+              for schema in registry.schemas('openai chat completions', vision=False)}
+    assert 'view_image' not in hidden
+    anthropic_hidden = {schema['name'] for schema in
+                        registry.schemas('anthropic messages', vision=False)}
+    assert 'view_image' not in anthropic_hidden
+    anthropic = {schema['name'] for schema in
+                 registry.schemas('anthropic messages')}
+    assert 'view_image' in anthropic

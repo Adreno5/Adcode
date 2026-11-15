@@ -17,6 +17,9 @@ import weakref
 from dataclasses import dataclass, field
 from typing import Any
 
+from adcode.images import (
+    MAX_IMAGE_BYTES, ImageStore, image_info, image_marker, sniff_media_type,
+)
 from adcode.tools.runtime import current_context, resolve_path
 
 _GREP_SKIP_DIRS = frozenset({
@@ -515,6 +518,46 @@ def _fetch(args: dict[str, Any]) -> str:
     return f'[{status}]\n{text}'
 
 
+def _view_image(args: dict[str, Any]) -> str:
+    """Copy an image into the session store and hand it to the model.
+
+    The returned marker is expanded into a native image part by the wire
+    adapter, so the picture reaches the model without any base64 in the stored
+    conversation.  Sub-agents share this tool, which is why the file lives in
+    the workspace rather than in a per-process cache.
+    """
+    raw_path = str(args.get('path') or '').strip().strip('"\'')
+    if not raw_path:
+        return 'Error: path is required'
+    if raw_path.startswith(('http://', 'https://')):
+        return f'Loaded {raw_path}.\n{image_marker(raw_path)}'
+    path = _resolve(raw_path)
+    if not os.path.isfile(path):
+        return f'Error: file not found: {raw_path}'
+    try:
+        with open(path, 'rb') as stream:
+            data = stream.read(MAX_IMAGE_BYTES + 1)
+    except OSError as error:
+        return f'Error reading {raw_path}: {error}'
+    if len(data) > MAX_IMAGE_BYTES:
+        return (f'Error: {raw_path} is larger than '
+                f'{MAX_IMAGE_BYTES // 1_048_576} MB')
+    media_type = sniff_media_type(data)
+    if media_type is None:
+        return (f'Error: not a supported image: {raw_path} '
+                f'(png, jpeg, gif or webp)')
+    store = ImageStore(os.path.join(_base_dir(), 'sessions', 'images'), _base_dir())
+    try:
+        reference = store.save(data)
+    except (ValueError, OSError) as error:
+        return f'Error: cannot store {raw_path}: {error}'
+    size = image_info(data)
+    shape = f'{size[0]}x{size[1]} ' if size else ''
+    kilobytes = max(1, round(len(data) / 1024))
+    return (f'Loaded {raw_path} ({shape}{media_type}, {kilobytes} KB). '
+            f'The image is attached below.\n{image_marker(reference)}')
+
+
 def _diff(args: dict[str, Any]) -> str:
     from adcode.diff import git_worktree_diff
     file_diff = git_worktree_diff(_base_dir(), str(args.get('path', '') or ''))
@@ -557,6 +600,24 @@ def builtin_tools() -> list[dict[str, Any]]:
             },
             'func': _read,
             'read_only': True,
+        },
+        {
+            'name': 'view_image',
+            'description': ('Look at an image file yourself: a screenshot, a diagram, '
+                            'a photo. The picture is attached to the conversation so '
+                            'you can describe or reason about it. Supports png, jpeg, '
+                            'gif and webp up to 5 MB, plus http(s) image URLs.'),
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'path': {'type': 'string',
+                             'description': 'Image file path, or an http(s) URL'},
+                },
+                'required': ['path'],
+            },
+            'func': _view_image,
+            'read_only': True,
+            'vision_only': True,
         },
         {
             'name': 'write',
