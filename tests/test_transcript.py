@@ -113,7 +113,8 @@ def test_tool_call_lead_in_gradient(config, palette):
 
 def test_tool_call_row_hugs_the_left_edge(config, palette):
     """The accent bar sits flush left; its gutter cell is still reserved."""
-    from adcode.tui.text import ROW_BLEED, line_width
+    from adcode.tui.canvas import char_width
+    from adcode.tui.text import ROW_BAR, ROW_BLEED, line_width
     item = TranscriptItem(kind='tool', turn=1, name='bash', display='bash',
                           args={'command': 'ls -la'}, status='done')
     config.tools.mode = 'call'
@@ -122,8 +123,12 @@ def test_tool_call_row_hugs_the_left_edge(config, palette):
     # The row claims one cell of the transcript's left margin ...
     assert getattr(row, 'bleed', 0) == ROW_BLEED
     # ... but keeps the two-cell gutter, so the name keeps its separation.
-    assert plain_text(row).startswith('│ bash')
-    assert row[0].fg == 'accent' and row[0].text == '│'
+    assert plain_text(row).startswith(f'{ROW_BAR} bash')
+    assert row[0].fg == 'accent' and row[0].text == ROW_BAR
+    # The bar paints against the left border of its cell, not its middle ...
+    assert ROW_BAR == '▏'
+    # ... and takes no more room than the old ``│`` did.
+    assert char_width(ROW_BAR) == char_width('│') == 1
     # The row is one cell wider than wrapped text, so both edges line up.
     assert line_width(row) == 80 + ROW_BLEED
 
@@ -134,9 +139,10 @@ def test_tool_call_row_hugs_the_left_edge(config, palette):
 
 def test_row_offset_for_bleeding_tool_rows():
     from adcode.tui.app import _row_offset
-    from adcode.tui.text import ROW_BLEED, Row, Span
+    from adcode.tui.text import ROW_BAR, ROW_BLEED, Row, Span
     assert _row_offset([Span('> hi', 'accent')]) == 1
-    assert _row_offset(Row([Span('│ bash', 'accent', 'panel')], ROW_BLEED)) == 0
+    assert _row_offset(Row([Span(f'{ROW_BAR} bash', 'accent', 'panel')],
+                           ROW_BLEED)) == 0
 
 
 def test_tool_result_partial_and_full(config):

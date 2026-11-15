@@ -19,11 +19,16 @@ class Span:
 
 Line = list[Span]
 
-# A tool call row keeps its ``│ `` gutter but starts flush with the screen edge,
-# so it declares how far it bleeds into the transcript's left margin.  The
+# A tool call row keeps its two-cell gutter but starts flush with the screen
+# edge, so it declares how far it bleeds into the transcript's left margin.  The
 # gutter cell is preserved: the bar sits in it, the text keeps its one-space
 # separation, and nothing else gains a column.
 ROW_BLEED = 1
+
+# The bar is a left-edge block rather than a centred ``│``: both occupy exactly
+# one cell, but this one paints its ink against the left border of that cell, so
+# the rule reads as flush with the screen edge instead of floating mid-column.
+ROW_BAR = '▏'
 
 
 class Row(list):

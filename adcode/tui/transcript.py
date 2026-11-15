@@ -18,7 +18,7 @@ from adcode.theme import RGB, Palette, lead_in_gradient
 from adcode.tui.canvas import BOLD, DIM, char_width
 from adcode.tui.markdown import MarkdownRenderer
 from adcode.tui.text import (
-    ROW_BLEED, Line, Row, Span, add_span, line_width, truncate_line,
+    ROW_BAR, ROW_BLEED, Line, Row, Span, add_span, line_width, truncate_line,
     wrap_line, wrap_lines,
 )
 
@@ -348,9 +348,11 @@ class TranscriptRenderer:
     def _tool_call_line(self, item: TranscriptItem, width: int, config: AppConfig,
                         now: float, palette: Palette | None = None) -> list[Line]:
         # The row bleeds one cell left of the transcript margin, so it is one
-        # cell wider than the wrapped text around it.
+        # cell wider than the wrapped text around it.  The accent bar is a
+        # left-edge glyph: it keeps the one-cell gutter but puts its ink on the
+        # screen edge instead of in the middle of that cell.
         row_width = width + ROW_BLEED
-        line: Line = [Span('│ ', 'accent', 'panel')]
+        line: Line = [Span(ROW_BAR + ' ', 'accent', 'panel')]
         add_span(line, Span(item.display or item.name, 'text', 'panel', attrs=BOLD))
         if config.tools.show_args:
             brief = _tool_arg_brief(item.name, item.args)

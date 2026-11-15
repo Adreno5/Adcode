@@ -188,9 +188,11 @@ frames, and the per-frame duration. The `partial` mode configures:
 | `result` | Only the result section |
 | `both` | The call line and the result section |
 
-The call line bleeds one cell into the transcript's left margin, so its accent
-bar sits flush with the screen edge while the `│ ` gutter keeps the name one
-space away from it. Result rows stay aligned with the wrapped text.
+The call line bleeds one cell into the transcript's left margin, and its accent
+bar is a left-edge block (`▏`, one cell wide, same room as `│`) rather than a
+centred glyph, so the rule really sits flush with the screen edge while the
+gutter keeps the name one space away from it. Result rows stay aligned with the
+wrapped text.
 
 Result sections support the same negative-row window, style, gradient, and
 ellipsis controls as thinking, plus a full mode with an optional line cap.
