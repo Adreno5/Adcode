@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from adcode.config import AppConfig, ThinkingDisplay
+from adcode.images import summarize_image_markers
 from adcode.session import TranscriptItem
 from adcode.theme import RGB, Palette, lead_in_gradient
 from adcode.tui.canvas import BOLD, DIM, char_width
@@ -294,7 +295,7 @@ class TranscriptRenderer:
     def _render_user(self, item: TranscriptItem, width: int) -> list[Line]:
         prefix = [Span('> ', 'accent', attrs=BOLD)]
         result: list[Line] = []
-        for index, raw in enumerate(item.text.split('\n')):
+        for index, raw in enumerate(summarize_image_markers(item.text).split('\n')):
             line: Line = list(prefix) if index == 0 else [Span('  ', None)]
             add_span(line, Span(raw, 'text'))
             result.extend(wrap_line(line, width))

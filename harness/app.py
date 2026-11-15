@@ -73,6 +73,7 @@ class AppHarness:
         self.input_queue: 'queue.Queue[Any]' = queue.Queue()
         self.input = ScriptedInput(self.input_queue)
         self.clipboard = ''
+        self.clipboard_image: bytes | None = None
         self.artifacts: Any = None
         self.app: AdCodeApp | None = None
         self.error: BaseException | None = None
@@ -172,6 +173,8 @@ class AppHarness:
             app_module, 'get_clipboard', self._get_clipboard))
         stack.enter_context(mock.patch.object(
             app_module, 'set_clipboard', self._set_clipboard))
+        stack.enter_context(mock.patch.object(
+            app_module, 'read_clipboard_image', lambda: self.clipboard_image))
         stack.enter_context(mock.patch.object(
             dialogs_module, 'get_clipboard', self._get_clipboard))
 

@@ -15,6 +15,10 @@ import anthropic
 import openai
 
 from adcode.config import ModelConfig, ProviderConfig
+from adcode.images import (
+    anthropic_source, data_url, has_image_marker, image_marker, iter_segments,
+    resolve_image,
+)
 
 ChatEvent = dict[str, Any]
 
@@ -82,6 +86,41 @@ def _tool_call_payload(call_id: str, name: str, arguments: str) -> dict[str, Any
     return {'kind': 'tool_call', 'id': call_id, 'name': name, 'args': args}
 
 
+def _image_parts(text: Any, kind: str, base_dir: str = ''
+                 ) -> list[dict[str, Any]] | None:
+    """Replace ``[image: path]`` markers with native content parts.
+
+    ``kind`` selects the wire dialect: ``image_url`` for chat completions,
+    ``input_image`` for the Responses API and ``anthropic`` for Messages.  The
+    bytes are read here, while the request is built, so base64 never enters the
+    stored conversation.
+    """
+    if not isinstance(text, str) or not has_image_marker(text):
+        return None
+    text_type = 'input_text' if kind == 'input_image' else 'text'
+    parts: list[dict[str, Any]] = []
+    replaced = False
+    for segment, chunk in iter_segments(text):
+        if segment == 'text':
+            if chunk:
+                parts.append({'type': text_type, 'text': chunk})
+            continue
+        ref = resolve_image(chunk, base_dir)
+        if ref is None:
+            # Keep the marker visible instead of silently dropping it.
+            parts.append({'type': text_type, 'text': image_marker(chunk)})
+            continue
+        replaced = True
+        if kind == 'image_url':
+            parts.append({'type': 'image_url', 'image_url': {'url': data_url(ref)}})
+        elif kind == 'input_image':
+            parts.append({'type': 'input_image', 'image_url': data_url(ref),
+                          'detail': 'auto'})
+        else:
+            parts.append({'type': 'image', 'source': anthropic_source(ref)})
+    return parts if replaced else None
+
+
 class LLMClient:
     """One provider connection, one wire protocol, streaming everywhere."""
 
@@ -89,6 +128,8 @@ class LLMClient:
         self.provider = provider
         self.name = provider.name
         self.wire = provider.wire
+        # Set by the loop; relative ``[image: ...]`` markers resolve against it.
+        self.base_dir = ''
         headers = dict(provider.extra_headers) if provider.extra_headers else None
         if 'openai' in self.wire:
             self._client: Any = openai.OpenAI(
@@ -130,12 +171,40 @@ class LLMClient:
     def reasoning_enabled(self, model: ModelConfig, force: bool) -> bool:
         return bool(model.reasoning or force)
 
+    # ── image parts ─────────────────────────────────────────
+    def _chat_content(self, text: str) -> list[dict[str, Any]] | None:
+        """Chat-completions user content with native image parts."""
+        return _image_parts(text, 'image_url', self.base_dir)
+
+    def _responses_content(self, text: str) -> list[dict[str, Any]] | None:
+        """Responses user content: ``input_text`` / ``input_image`` parts."""
+        return _image_parts(text, 'input_image', self.base_dir)
+
+    def _anthropic_content(self, text: str) -> list[dict[str, Any]] | None:
+        """Messages user content: ``text`` / ``image`` blocks."""
+        return _image_parts(text, 'anthropic', self.base_dir)
+
+    def _openai_chat_messages(self, messages: list[dict[str, Any]]
+                              ) -> list[dict[str, Any]]:
+        prepared: list[dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                prepared.append(message)
+                continue
+            parts = (self._chat_content(message.get('content'))
+                     if message.get('role') == 'user' else None)
+            if parts is None:
+                prepared.append(message)
+            else:
+                prepared.append({**message, 'content': parts})
+        return prepared
+
     # ── OpenAI chat completions ─────────────────────────────
     def _openai_chat(self, messages: list[dict[str, Any]], model: ModelConfig,
                      system: str, max_tokens: int,
                      tools: list[dict[str, Any]] | None,
                      effort: str, force: bool) -> Generator[ChatEvent, None, None]:
-        msgs: list[dict[str, Any]] = messages
+        msgs: list[dict[str, Any]] = self._openai_chat_messages(messages)
         if system:
             msgs = [{'role': 'system', 'content': system}, *msgs]
         kwargs: dict[str, Any] = {
@@ -230,7 +299,7 @@ class LLMClient:
                           effort: str, force: bool) -> Generator[ChatEvent, None, None]:
         kwargs: dict[str, Any] = {
             'model': model.id,
-            'input': self._to_responses_input(messages),
+            'input': self._to_responses_input(messages, self.base_dir),
             'instructions': system or None,
             'max_output_tokens': max_tokens,
             'stream': True,
@@ -357,7 +426,8 @@ class LLMClient:
             yield {'kind': 'finish', 'reason': 'incomplete'}
 
     @staticmethod
-    def _to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _to_responses_input(messages: list[dict[str, Any]], base_dir: str = ''
+                            ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         for message in messages:
             role = message.get('role', '')
@@ -369,7 +439,11 @@ class LLMClient:
                 })
                 continue
             content = message.get('content')
-            if content:
+            parts = (_image_parts(content, 'input_image', base_dir)
+                     if role == 'user' else None)
+            if parts is not None:
+                result.append({'role': role, 'content': parts})
+            elif content:
                 result.append({'role': role, 'content': content})
             for call in message.get('tool_calls') or []:
                 function = call.get('function', {})
@@ -405,7 +479,8 @@ class LLMClient:
 
     # ── Anthropic messages ──────────────────────────────────
     @staticmethod
-    def _to_anthropic_msgs(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _to_anthropic_msgs(messages: list[dict[str, Any]], base_dir: str = ''
+                           ) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         pending_tool_results: list[dict[str, Any]] = []
 
@@ -477,7 +552,8 @@ class LLMClient:
             elif role == 'assistant':
                 merge('assistant', message.get('content'))
             elif role == 'user':
-                merge('user', message.get('content'))
+                merge('user', _image_parts(message.get('content'), 'anthropic',
+                                           base_dir) or message.get('content'))
         flush_tool_results()
         return out
 
@@ -487,7 +563,7 @@ class LLMClient:
                    effort: str, force: bool) -> Generator[ChatEvent, None, None]:
         kwargs: dict[str, Any] = {
             'model': model.id,
-            'messages': self._to_anthropic_msgs(messages),
+            'messages': self._to_anthropic_msgs(messages, self.base_dir),
             'max_tokens': max_tokens,
         }
         if system:

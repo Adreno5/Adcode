@@ -12,6 +12,7 @@ import threading
 
 import pytest
 
+from adcode import images
 from harness.script import ScriptedResponder, ToolCall, Turn
 from harness.workspace import GLOBAL_MARKER, PROJECT_MARKER
 
@@ -72,6 +73,41 @@ def test_typed_message_streams_answer_and_persists(harness):
         'Harness::harness-model'
     assert str(harness.workspace.config_path).startswith(
         str(harness.workspace.root))
+
+
+@pytest.mark.parametrize('wire', WIRES)
+def test_alt_v_sends_a_native_image_part(harness_factory, wire):
+    harness = harness_factory(wire=wire)
+    harness.gateway.responder = ScriptedResponder([Turn(text='I see the image.')])
+    harness.clipboard_image = images.encode_png(
+        1, 1, bytes([255, 0, 0, 255]))
+
+    harness.press('alt+v')
+    harness.wait_until(lambda: '[image:' in harness.prompt_text, timeout=10.0,
+                       description='the pasted image marker')
+    harness.type_text(' what is this?')
+    harness.press('enter')
+    harness.wait_for_requests(1)
+    harness.wait_idle(20.0)
+    harness.wait_for_text('I see the image.')
+
+    request = harness.requests[0]
+    assert 'what is this?' in request.all_text
+    if wire == 'anthropic messages':
+        assert '"type": "image"' in request.all_text
+        assert '"media_type": "image/png"' in request.all_text
+    else:
+        assert 'data:image/png;base64,' in request.all_text
+
+    # The stored history keeps the small marker, never the encoded bytes.
+    session = harness.workspace.session_payload()
+    assert session
+    content = session['messages'][0]['content']
+    assert isinstance(content, str) and '[image: sessions/images/paste-' in content
+    assert 'base64' not in content
+    user_items = [text for kind, text in harness.transcript_texts()
+                  if kind == 'user']
+    assert user_items and 'what is this?' in user_items[0]
 
 
 def test_tool_call_writes_into_the_temp_workspace(harness):

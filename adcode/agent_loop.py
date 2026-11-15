@@ -20,6 +20,7 @@ from adcode.agents.manager import AgentManager
 from adcode.config import AppConfig, ModelConfig, ProviderConfig
 from adcode.diff import FileDiff
 from adcode.goals import GoalStore
+from adcode.images import has_image_marker, strip_image_markers
 from adcode.llm.client import LLMClient
 from adcode.llm.context import (
     ConversationContext, StablePrefix, TokenBudgetExceeded, stream_compact,
@@ -86,6 +87,7 @@ class AgentLoop:
             raise RuntimeError('no provider/model configured')
         self.provider, self.model = selected
         self.client = LLMClient(self.provider)
+        self.client.base_dir = self.cwd
 
         self.system = build_system_prompt(config, goals, skills, cwd=self.cwd)
         schemas = registry.schemas(self.provider.wire)
@@ -919,6 +921,7 @@ class AgentLoop:
             self.provider = provider
             self.model = model
             self.client = LLMClient(provider)
+            self.client.base_dir = self.cwd
             self.config.select(provider.name, model.id)
             self.session_name = payload.name if payload.name != LAST_SESSION else ''
             self.session_title = payload.title
@@ -1036,6 +1039,7 @@ class AgentLoop:
             self.provider = provider
             self.model = model
             self.client = LLMClient(provider)
+            self.client.base_dir = self.cwd
             self.config.select(provider.name, model.id)
             self.context.stable_prefix = StablePrefix.create(
                 provider=provider.name, endpoint=provider.base_url,
@@ -1063,7 +1067,10 @@ class AgentLoop:
 
 
 def _title_from(text: str) -> str:
-    line = text.strip().splitlines()[0] if text.strip() else ''
+    visible = strip_image_markers(text).strip()
+    if not visible and has_image_marker(text):
+        return 'Image'
+    line = visible.splitlines()[0] if visible else ''
     line = ' '.join(line.split())
     return line[:60]
 

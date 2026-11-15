@@ -36,6 +36,9 @@ whole screen is written to the terminal in one pass.
   automatic tool scanning (including pagination cursors).
 - **Skills** -- scans `~/.agents/skills` (plus project and extra paths), gives
   the model a compact preview, and loads full instructions on demand.
+- **Image attachments** -- `alt+v` pastes a copied screenshot into the
+  message; the vision model receives it as a native image part on all three
+  wires. Images are stored as files, never as base64 in the history.
 - **Session toolkit** -- rollback, edit-and-resend, fork, aside questions
   (`/btw`), durable goals, and automatic crash recovery.
 - **Single settings browser** -- `/config` exposes thinking display, tool
@@ -100,7 +103,8 @@ maximum output, vision support, tool calling, and reasoning efforts.
 | `tab` | Complete the selected command |
 | `esc` | Interrupt the current turn, or close the palette/overlay |
 | `ctrl+c` | Copy selection, else clear the input, else interrupt; press twice on an empty prompt to exit |
-| `ctrl+v` | Paste (bracketed paste is supported) |
+| `ctrl+v` | Paste text, or attach a copied screenshot when the clipboard has no text |
+| `alt+v` | Attach the clipboard image to the message |
 | `ctrl+a` | Select all |
 | `shift+left` / `shift+right` | Extend the selection by one character |
 | `shift+home` / `shift+end` | Extend the selection to the line edge |
@@ -132,6 +136,7 @@ Enter completes it, and Enter runs the command.
 | `/agents list\|max\|depth\|wait\|interrupt\|types\|teams` | Inspect and configure sub-agents |
 | `/mcp add\|edit\|remove\|list\|doctor\|refresh` | Manage MCP servers and rescan their tools |
 | `/skills [list\|reload]` | Browse and reload installed skills |
+| `/image <path\|url>` | Attach an image file or URL to the next message |
 | `/diff [path]` | Show the Git working-tree diff in the transcript |
 | `/sessions` | Browse and load saved sessions |
 | `/save [name]` / `/load [name]` | Save / load a session |
@@ -321,6 +326,32 @@ project instructions from `AGENTS.md` (or `prompt`) in the working directory.
 Both are inserted into the system prompt; when they conflict, the project
 instructions take precedence.
 
+## Images
+
+Copy a screenshot, then press `alt+v` (or use `/image <path|url>`). The image
+is stored under `sessions/images/` with a content-addressed name and a short
+`[image: sessions/images/paste-<hash>.png]` marker is inserted into the prompt.
+The marker is plain text, so it survives session save/load, rewind, edit and
+fork, and it costs almost nothing in the history.
+
+The marker is expanded into a native image part only while a request is being
+built:
+
+- **OpenAI Chat Completions** -- a user content array with `text` and
+  `image_url` parts carrying a data URL.
+- **OpenAI Responses** -- `input_text` and `input_image` parts with an
+  `image_url` (the API accepts base64 data URLs or a hosted URL).
+- **Anthropic Messages** -- `text` and `image` blocks. For local files AdCode
+  passes the path itself and the Anthropic SDK reads and base64-encodes it
+  while serializing, so the program never holds the encoded string.
+
+Base64 is therefore transient request data: it is never written to the session
+JSON, never shown in the transcript and never counted as context text. Each
+marker is estimated at about 1,200 tokens for compaction. `http(s)` URLs can be
+used instead of a local file and are passed through as image URLs, which needs
+no encoding at all. Providers that do not accept images will simply reject the
+request; models from models.dev are marked with vision support when known.
+
 ## Rendering Architecture
 
 ```
@@ -370,6 +401,7 @@ adcode/
 ├── models_dev.py     # models.dev catalogue and cache
 ├── session.py        # transcript items, save/load, rewind/fork
 ├── goals.py          # durable goal store
+├── images.py         # image markers, file store, clipboard, per-wire helpers
 ├── skills.py         # skill discovery, preview and tools
 ├── system_prompt.py  # global/project instructions, environment, goals and skills
 ├── commands.py       # slash commands and completion

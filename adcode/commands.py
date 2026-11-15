@@ -92,12 +92,20 @@ def cmd_help(app: Any, args: str) -> None:
         'tab                complete the selected command',
         'esc                interrupt the current turn / close overlays',
         'ctrl+c             copy selection, clear input, or press twice to exit',
-        'ctrl+v             paste · ctrl+a select all · ctrl+z undo',
+        'ctrl+v             paste text, or attach a copied screenshot',
+        'alt+v              attach the clipboard image to the message',
+        'ctrl+a select all · ctrl+z undo · ctrl+y redo',
         'pgup / pgdn        scroll the transcript · mouse wheel scrolls too',
         'ctrl+home / end    jump in the input',
     ]
     app.open_message('Help', '**Commands**\n' + '\n'.join(rows)
                      + '\n\n**Keys**\n' + '\n'.join(keys))
+
+
+@command('/image', 'Attach an image file or URL to your next message',
+         '/image <path|url>')
+def cmd_image(app: Any, args: str) -> None:
+    app.attach_image_file(args)
 
 
 @command('/clear', 'Clear the conversation history')

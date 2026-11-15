@@ -12,11 +12,15 @@ import os
 import queue
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 from adcode.agent_loop import AgentLoop, AgentSnapshot
 from adcode.config import AppConfig, ConfigStore, ProviderConfig, ModelConfig
 from adcode.goals import GoalStore
+from adcode.images import (
+    ImageStore, image_marker, read_clipboard_image, resolve_image,
+)
 from adcode.mcp.manager import get_mcp_manager
 from adcode.session import SessionStore, TranscriptItem
 from adcode.skills import SkillRegistry
@@ -221,6 +225,8 @@ class AdCodeApp:
             else InputThread(self.input_queue))
         self.posted: 'queue.Queue[Callable[[], None]]' = queue.Queue()
         self.session_store = SessionStore(os.path.join(self.cwd, 'sessions'))
+        self.images = ImageStore(os.path.join(self.cwd, 'sessions', 'images'),
+                                 self.cwd)
         self.goals = GoalStore(os.path.join(self.cwd, 'sessions', 'goals.json'))
         self.skills = SkillRegistry(self.config.skills, self.cwd).scan()
         self.registry = ToolRegistry()
@@ -730,8 +736,16 @@ class AdCodeApp:
                 self.request_exit()
             return
         if key == 'ctrl+v':
-            self.prompt.insert(get_clipboard())
+            text = get_clipboard()
+            if text:
+                self.prompt.insert(text)
+            else:
+                # A copied screenshot has no text form; attach it instead.
+                self.attach_clipboard_image()
             self.dirty = True
+            return
+        if key == 'alt+v':
+            self.attach_clipboard_image()
             return
         if key == 'ctrl+x':
             cut = self.prompt.cut()
@@ -863,6 +877,51 @@ class AdCodeApp:
             self.btw_mode = False
         self.loop.submit(text, mode)
         self.dirty = True
+
+    # ── image attachments ───────────────────────────────────
+    def attach_clipboard_image(self) -> bool:
+        data = read_clipboard_image()
+        if not data:
+            self.notify('No image in the clipboard. Copy a screenshot, then press alt+v.',
+                        'warning')
+            return False
+        return self.attach_image_bytes(data)
+
+    def attach_image_bytes(self, data: bytes) -> bool:
+        try:
+            reference = self.images.save(data)
+        except ValueError as error:
+            self.notify(f'Cannot attach image: {error}', 'warning')
+            return False
+        except OSError as error:
+            self.notify(f'Cannot store image: {error}', 'error')
+            return False
+        self.prompt.insert(f'{image_marker(reference)} ')
+        self.dirty = True
+        return True
+
+    def attach_image_file(self, reference: str) -> bool:
+        reference = reference.strip().strip('"\'')
+        if not reference:
+            self.notify('Usage: /image <path or https url>', 'warning')
+            return False
+        if reference.startswith(('http://', 'https://')):
+            self.prompt.insert(f'{image_marker(reference)} ')
+            self.dirty = True
+            return True
+        path = Path(reference).expanduser()
+        if not path.is_absolute():
+            path = Path(self.cwd) / path
+        if resolve_image(str(path), self.cwd) is None:
+            self.notify(
+                f'Unsupported image: {reference} (png, jpeg, gif or webp, '
+                f'up to 5 MB)', 'error')
+            return False
+        try:
+            return self.attach_image_bytes(path.read_bytes())
+        except OSError as error:
+            self.notify(f'Cannot read image: {error}', 'error')
+            return False
 
     def _move_horizontal(self, delta: int, extend: bool) -> None:
         if extend:

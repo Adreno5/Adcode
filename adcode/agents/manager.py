@@ -745,6 +745,7 @@ class AgentManager:
         context = scope.context
         context.stage({'role': 'user', 'content': task})
         client = LLMClient(scope.provider)
+        client.base_dir = self.cwd
         last_answer = ''
         answer = ''
         turns = 0

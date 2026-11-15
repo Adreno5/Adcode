@@ -8,11 +8,13 @@ usage from it.
 
 from __future__ import annotations
 
+import base64
 import json
 import urllib.request
 
 import pytest
 
+from adcode import images
 from adcode.config import ModelConfig, ProviderConfig
 from adcode.llm.client import LLMClient
 from harness.gateway import FakeLLMGateway
@@ -126,6 +128,42 @@ def test_gateway_sse_wire_format_is_literal_http(gateway):
     assert len(gateway.requests) == 1
     assert gateway.requests[0].wire == 'openai chat completions'
     assert gateway.requests[0].body['messages'][0]['content'] == 'raw http'
+
+
+@pytest.mark.parametrize('wire', WIRES)
+def test_gateway_receives_a_native_image_part(gateway, wire, tmp_path):
+    gateway.responder = ScriptedResponder([Turn(text='seen')])
+    pixels = bytes([255, 0, 0, 255])
+    (tmp_path / 'shot.png').write_bytes(images.encode_png(1, 1, pixels))
+    client = LLMClient(provider(gateway.base_url, wire))
+    client.base_dir = str(tmp_path)
+    collect(client, wire, [{'role': 'user',
+                            'content': 'look [image: shot.png] here'}])
+
+    body = gateway.requests[0].body
+    if wire == 'openai chat completions':
+        parts = body['messages'][-1]['content']
+        assert parts[0] == {'type': 'text', 'text': 'look '}
+        assert parts[1]['type'] == 'image_url'
+        url = parts[1]['image_url']['url']
+        assert url.startswith('data:image/png;base64,')
+        payload = base64.b64decode(url.split(',', 1)[1])
+        assert payload == images.encode_png(1, 1, pixels)
+    elif wire == 'openai responses':
+        parts = body['input'][-1]['content']
+        assert parts[0] == {'type': 'input_text', 'text': 'look '}
+        assert parts[1]['type'] == 'input_image'
+        assert parts[1]['image_url'].startswith('data:image/png;base64,')
+    else:
+        blocks = body['messages'][0]['content']
+        assert blocks[0] == {'type': 'text', 'text': 'look '}
+        assert blocks[1]['type'] == 'image'
+        source = blocks[1]['source']
+        assert source['type'] == 'base64'
+        assert source['media_type'] == 'image/png'
+        # The SDK read the file itself: the body carries base64, not a path.
+        assert isinstance(source['data'], str)
+        assert base64.b64decode(source['data']) == images.encode_png(1, 1, pixels)
 
 
 @pytest.mark.parametrize('wire', WIRES)

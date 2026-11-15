@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from adcode.images import IMAGE_TOKEN_ESTIMATE, count_image_markers
+
 _ANSI_RE = re.compile(r'\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 _UUID_RE = re.compile(
     r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-'
@@ -29,8 +31,11 @@ def estimate_text_tokens(text: str) -> int:
 
 def estimate_tokens(value: Any) -> int:
     if isinstance(value, str):
-        return estimate_text_tokens(value)
-    return estimate_text_tokens(canonical_json(value))
+        text = value
+    else:
+        text = canonical_json(value)
+    return (estimate_text_tokens(text)
+            + IMAGE_TOKEN_ESTIMATE * count_image_markers(text))
 
 
 def normalize_tool_result(tool_name: str, original: str,
