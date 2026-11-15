@@ -25,7 +25,9 @@ from typing import Any, Callable, Iterator
 from adcode.config import AgentTypeConfig, AppConfig, ModelConfig, ProviderConfig
 from adcode.diff import FileDiff
 from adcode.goals import GoalStore
-from adcode.images import FileIdCache
+from adcode.images import (
+    MARKER_RE as IMAGE_MARKER_RE, FileIdCache, image_marker,
+)
 from adcode.llm.client import LLMClient
 from adcode.llm.context import (
     ConversationContext, StablePrefix, stream_compact,
@@ -442,7 +444,7 @@ class AgentManager:
         if agent_type.tools:
             allowed = set(agent_type.tools)
         wire = parent.provider.wire
-        tools = self.registry.schemas(wire, allowed)
+        tools = self.registry.schemas(wire, allowed, vision=parent.model.vision)
         child_prefix = StablePrefix.create(
             provider=parent.provider.name, endpoint=parent.provider.base_url,
             model=parent.model.id, system=child_system, tools=tools,
@@ -776,7 +778,8 @@ class AgentManager:
                     context.rollback()
                     return last_answer or f'agent stopped after {max_turns} turns'
 
-                tools = self.registry.schemas(scope.provider.wire, scope.allowed_tools)
+                tools = self.registry.schemas(scope.provider.wire, scope.allowed_tools,
+                                              vision=scope.model.vision)
                 candidate = StablePrefix.create(
                     provider=scope.provider.name, endpoint=scope.provider.base_url,
                     model=scope.model.id, system=scope.system, tools=tools,
@@ -872,6 +875,7 @@ class AgentManager:
                         str(call.get('id') or f'call_{stamp}_{index}')
                         for index, call in enumerate(tool_calls)
                     ]
+                    image_markers: list[str] = []
                     draft: list[dict[str, Any]] = [{
                         'role': 'assistant',
                         'content': full or None,
@@ -911,6 +915,17 @@ class AgentManager:
                         draft.append({
                             'role': 'tool', 'tool_call_id': call_ids[index],
                             'content': normalized,
+                        })
+                        for reference in IMAGE_MARKER_RE.findall(normalized):
+                            marker = image_marker(reference)
+                            if marker not in image_markers:
+                                image_markers.append(marker)
+                    if image_markers:
+                        draft.append({
+                            'role': 'user',
+                            'content': '<tool_images>\n'
+                                       + '\n'.join(image_markers)
+                                       + '\n</tool_images>',
                         })
                     context.stage(*draft)
                     last_answer = full or last_answer

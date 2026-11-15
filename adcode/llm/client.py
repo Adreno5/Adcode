@@ -244,11 +244,13 @@ class LLMClient:
         key = self._file_key(ref)
         if not key:
             return ''
+        # A rejected file reference disables the scope even while ids remain
+        # cached: they are only valid until the provider says otherwise.
+        if cache.unsupported(scope):
+            return ''
         cached = cache.get_id(scope, key)
         if cached:
             return cached
-        if cache.unsupported(scope):
-            return ''
         try:
             file_id = self._upload(ref)
         except Exception as error:
@@ -296,6 +298,33 @@ class LLMClient:
                 warn(text)
             except Exception:
                 pass
+
+    @staticmethod
+    def _has_file_id(payload: Any) -> bool:
+        """True when a built request body references an uploaded file."""
+        if isinstance(payload, dict):
+            file_id = payload.get('file_id')
+            if isinstance(file_id, str) and file_id:
+                return True
+            return any(LLMClient._has_file_id(value) for value in payload.values())
+        if isinstance(payload, (list, tuple)):
+            return any(LLMClient._has_file_id(value) for value in payload)
+        return False
+
+    def _fallback_inline(self, error: Exception) -> None:
+        """Stop using uploaded file ids after the provider rejected one."""
+        cache = getattr(self, 'file_cache', None)
+        if cache is not None:
+            cache.mark_unsupported(self._file_scope(), f'file id rejected: {error}')
+        self._note('The provider rejected the uploaded image reference; '
+                   'images are sent inline from now on.')
+
+    @staticmethod
+    def _file_id_rejected(error: Exception) -> bool:
+        """True for the statuses a provider uses to refuse a file reference."""
+        status = int(getattr(error, 'status_code', 0)
+                     or getattr(error, 'status', 0) or 0)
+        return status in (400, 403, 404, 422)
 
     def _openai_chat_messages(self, messages: list[dict[str, Any]]
                               ) -> list[dict[str, Any]]:
@@ -410,29 +439,43 @@ class LLMClient:
                           tools: list[dict[str, Any]] | None,
                           prompt_cache_key: str | None,
                           effort: str, force: bool) -> Generator[ChatEvent, None, None]:
-        kwargs: dict[str, Any] = {
-            'model': model.id,
-            'input': self._to_responses_input(messages, self.base_dir,
-                                              self._file_id),
-            'instructions': system or None,
-            'max_output_tokens': max_tokens,
-            'stream': True,
-        }
-        if tools:
-            kwargs['tools'] = self._to_responses_tools(tools)
-        if prompt_cache_key:
-            kwargs['prompt_cache_key'] = prompt_cache_key
-        if self.reasoning_enabled(model, force):
-            kwargs['reasoning'] = {
-                'effort': resolve_effort(effort, model.reasoning_efforts),
-                'summary': 'auto',
+        def build(file_ids: Callable[[ImageRef], str] | None) -> dict[str, Any]:
+            kwargs: dict[str, Any] = {
+                'model': model.id,
+                'input': self._to_responses_input(messages, self.base_dir, file_ids),
+                'instructions': system or None,
+                'max_output_tokens': max_tokens,
+                'stream': True,
             }
+            if tools:
+                kwargs['tools'] = self._to_responses_tools(tools)
+            if prompt_cache_key:
+                kwargs['prompt_cache_key'] = prompt_cache_key
+            if self.reasoning_enabled(model, force):
+                kwargs['reasoning'] = {
+                    'effort': resolve_effort(effort, model.reasoning_efforts),
+                    'summary': 'auto',
+                }
+            return kwargs
 
-        def factory() -> Generator[ChatEvent, None, None]:
-            stream = self._client.responses.create(**kwargs)
+        def factory(payload: dict[str, Any]) -> Generator[ChatEvent, None, None]:
+            stream = self._client.responses.create(**payload)
             yield from self._consume_openai_responses(stream)
 
-        yield from _retry_generator(factory)
+        kwargs = build(self._file_id)
+        emitted = False
+        try:
+            for event in _retry_generator(lambda: factory(kwargs)):
+                # A retry notice is not model output; anything else means the
+                # stream already reached the caller and must not be replayed.
+                emitted = emitted or event.get('kind') != 'retry'
+                yield event
+        except (openai.APIError, anthropic.APIError) as error:
+            if (emitted or not self._has_file_id(kwargs)
+                    or not self._file_id_rejected(error)):
+                raise
+            self._fallback_inline(error)
+            yield from _retry_generator(lambda: factory(build(None)))
 
     def _consume_openai_responses(self, stream: Any) -> Generator[ChatEvent, None, None]:
         call_buf: dict[str, dict[str, Any]] = {}
@@ -678,30 +721,32 @@ class LLMClient:
                    system: str, max_tokens: int,
                    tools: list[dict[str, Any]] | None,
                    effort: str, force: bool) -> Generator[ChatEvent, None, None]:
-        kwargs: dict[str, Any] = {
-            'model': model.id,
-            'messages': self._to_anthropic_msgs(messages, self.base_dir,
-                                                self._file_id),
-            'max_tokens': max_tokens,
-        }
-        if system:
-            kwargs['system'] = system
-        if tools:
-            kwargs['tools'] = tools
-        if self.reasoning_enabled(model, force):
-            budget_map = {
-                'low': 2_048, 'medium': 4_096, 'high': 8_192, 'xhigh': 12_288,
-                'max': 16_384, 'ultra': 24_576,
+        def build(file_ids: Callable[[ImageRef], str] | None) -> dict[str, Any]:
+            kwargs: dict[str, Any] = {
+                'model': model.id,
+                'messages': self._to_anthropic_msgs(messages, self.base_dir, file_ids),
+                'max_tokens': max_tokens,
             }
-            budget = budget_map.get(resolve_effort(effort, model.reasoning_efforts), 4_096)
-            # The Messages API requires 1024 <= budget_tokens < max_tokens.
-            budget = max(1_024, min(budget, max_tokens - 1))
-            if budget < max_tokens:
-                kwargs['thinking'] = {'type': 'enabled', 'budget_tokens': budget}
+            if system:
+                kwargs['system'] = system
+            if tools:
+                kwargs['tools'] = tools
+            if self.reasoning_enabled(model, force):
+                budget_map = {
+                    'low': 2_048, 'medium': 4_096, 'high': 8_192, 'xhigh': 12_288,
+                    'max': 16_384, 'ultra': 24_576,
+                }
+                budget = budget_map.get(
+                    resolve_effort(effort, model.reasoning_efforts), 4_096)
+                # The Messages API requires 1024 <= budget_tokens < max_tokens.
+                budget = max(1_024, min(budget, max_tokens - 1))
+                if budget < max_tokens:
+                    kwargs['thinking'] = {'type': 'enabled', 'budget_tokens': budget}
+            return kwargs
 
-        def factory() -> Generator[ChatEvent, None, None]:
+        def factory(payload: dict[str, Any]) -> Generator[ChatEvent, None, None]:
             buffers: dict[int, dict[str, Any]] = {}
-            with self._client.messages.stream(**kwargs) as stream:
+            with self._client.messages.stream(**payload) as stream:
                 for event in stream:
                     etype = getattr(event, 'type', '')
                     if etype == 'message_start':
@@ -755,7 +800,18 @@ class LLMClient:
             yield {'kind': 'finish',
                    'reason': 'length' if stop_reason == 'max_tokens' else (stop_reason or 'stop')}
 
-        yield from _retry_generator(factory)
+        kwargs = build(self._file_id)
+        emitted = False
+        try:
+            for event in _retry_generator(lambda: factory(kwargs)):
+                emitted = emitted or event.get('kind') != 'retry'
+                yield event
+        except (anthropic.APIError, openai.APIError) as error:
+            if (emitted or not self._has_file_id(kwargs)
+                    or not self._file_id_rejected(error)):
+                raise
+            self._fallback_inline(error)
+            yield from _retry_generator(lambda: factory(build(None)))
 
     # ── model discovery ─────────────────────────────────────
     def list_models(self) -> list[str]:

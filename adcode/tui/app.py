@@ -19,7 +19,8 @@ from adcode.agent_loop import AgentLoop, AgentSnapshot
 from adcode.config import AppConfig, ConfigStore, ProviderConfig, ModelConfig
 from adcode.goals import GoalStore
 from adcode.images import (
-    ImageStore, image_marker, read_clipboard_image, resolve_image,
+    ImageStore, count_image_markers, file_uri_to_path, image_marker, is_image_url,
+    read_clipboard_image, resolve_image,
 )
 from adcode.mcp.manager import get_mcp_manager
 from adcode.session import SessionStore, TranscriptItem
@@ -888,11 +889,25 @@ class AdCodeApp:
     # ── image attachments ───────────────────────────────────
     def attach_clipboard_image(self) -> bool:
         data = read_clipboard_image()
-        if not data:
-            self.notify('No image in the clipboard. Copy a screenshot, then press alt+v.',
-                        'warning')
-            return False
-        return self.attach_image_bytes(data)
+        if data:
+            return self.attach_image_bytes(data)
+        # A file copied in the file manager lands on the clipboard as its path.
+        clipboard = get_clipboard().strip()
+        if clipboard and '\n' not in clipboard and \
+                self._looks_like_image_reference(clipboard):
+            return self.attach_image_file(clipboard)
+        self.notify('No image in the clipboard. Copy a screenshot, then press alt+v.',
+                    'warning')
+        return False
+
+    def _looks_like_image_reference(self, text: str) -> bool:
+        value = file_uri_to_path(text)
+        if value.startswith(('http://', 'https://')):
+            return is_image_url(value)
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = Path(self.cwd) / path
+        return resolve_image(str(path), self.cwd) is not None
 
     def attach_image_bytes(self, data: bytes) -> bool:
         try:
@@ -905,16 +920,33 @@ class AdCodeApp:
             return False
         self.prompt.insert(f'{image_marker(reference)} ')
         self.dirty = True
+        name = reference.rsplit('/', 1)[-1]
+        size = (f'{len(data) / 1_048_576:.1f} MB' if len(data) >= 1_048_576
+                else f'{max(1, round(len(data) / 1024))} KB')
+        warning = self._vision_warning()
+        if warning:
+            self.notify(f'Attached {name} ({size}). {warning}', 'warning')
+        else:
+            self.notify(f'Attached {name} ({size}).', 'info')
         return True
 
+    def _vision_warning(self) -> str:
+        """Warn when the selected model is not known to accept images."""
+        selected = self.config.selected()
+        if selected is None or selected[1].vision:
+            return ''
+        return (f'{selected[1].id} is not marked as vision-capable; '
+                f'it may reject the image.')
+
     def attach_image_file(self, reference: str) -> bool:
-        reference = reference.strip().strip('"\'')
+        reference = file_uri_to_path(reference)
         if not reference:
             self.notify('Usage: /image <path or https url>', 'warning')
             return False
         if reference.startswith(('http://', 'https://')):
             self.prompt.insert(f'{image_marker(reference)} ')
             self.dirty = True
+            self.notify(f'Attached {reference}', 'info')
             return True
         path = Path(reference).expanduser()
         if not path.is_absolute():
@@ -1221,6 +1253,9 @@ class AdCodeApp:
         queued = snap.queued
         if queued:
             extras.append(f'{queued} queued')
+        attached = count_image_markers(self.prompt.text)
+        if attached:
+            extras.append(f'{attached} image{"s" if attached > 1 else ""}')
         if self.btw_mode:
             extras.append('aside question mode')
         if self.exit_armed:

@@ -19,6 +19,8 @@ class ToolSpec:
     handler: Callable[[dict[str, Any]], str]
     read_only: bool = False
     source: str = 'builtin'
+    # A tool whose result carries an image: only offered to a vision model.
+    vision_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,7 @@ class ToolRegistry:
                 handler=raw['func'],
                 read_only=bool(raw.get('read_only')),
                 source='builtin',
+                vision_only=bool(raw.get('vision_only')),
             ))
 
     # ── registration ────────────────────────────────────────
@@ -83,8 +86,11 @@ class ToolRegistry:
         return [spec.name for spec in self.specs()]
 
     # ── schemas ─────────────────────────────────────────────
-    def schemas(self, wire: str, allowed: set[str] | None = None) -> list[dict[str, Any]]:
+    def schemas(self, wire: str, allowed: set[str] | None = None, *,
+                vision: bool = True) -> list[dict[str, Any]]:
         specs = self.specs(allowed)
+        if not vision:
+            specs = [spec for spec in specs if not spec.vision_only]
         if wire == 'anthropic messages':
             return [{
                 'name': spec.name,

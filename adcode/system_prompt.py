@@ -79,8 +79,15 @@ def environment_block(cwd: str | None = None) -> str:
 
 
 def build_system_prompt(config: AppConfig, goals: GoalStore | None,
-                        skills: SkillRegistry | None, cwd: str | None = None) -> str:
+                        skills: SkillRegistry | None, cwd: str | None = None,
+                        vision: bool = False) -> str:
     parts = [instructions_block(cwd), environment_block(cwd), BASE_SUFFIX]
+    if vision:
+        parts.append(
+            'You can see images. A user message that carries one shows it to you '
+            'directly; call view_image to look at an image file or URL yourself '
+            'instead of guessing what it contains.'
+        )
     goal_prompt = GoalStore.prompt(goals.active()) if goals is not None else ''
     if goal_prompt:
         parts.append(goal_prompt)

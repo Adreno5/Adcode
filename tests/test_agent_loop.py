@@ -105,6 +105,43 @@ def test_tool_turn(loop):
     assert tool_item.duration >= 0
 
 
+def test_view_image_tool_attaches_the_picture(loop, tmp_path):
+    """A tool result that names an image becomes a user image block."""
+    from adcode import images
+
+    (tmp_path / 'shot.png').write_bytes(
+        images.encode_png(2, 2, bytes([1, 2, 3, 255] * 4)))
+    loop.cwd = str(tmp_path)
+    loop.client.base_dir = str(tmp_path)
+    rounds = {'n': 0}
+
+    def chat(messages, model, **kwargs):
+        rounds['n'] += 1
+        if rounds['n'] == 1:
+            yield {'kind': 'tool_call', 'id': 'c1', 'name': 'view_image',
+                   'args': {'path': 'shot.png'}}
+            yield {'kind': 'finish', 'reason': 'tool_calls'}
+            return
+        yield {'kind': 'text', 'content': 'I can see it.'}
+        yield {'kind': 'finish', 'reason': 'stop'}
+
+    loop.client.chat = chat
+    loop.submit('look at the screenshot')
+    wait_idle(loop)
+    roles = [message['role'] for message in loop.context.committed]
+    assert roles == ['user', 'assistant', 'tool', 'user', 'assistant']
+    tool_message = loop.context.committed[2]
+    assert 'Loaded shot.png (2x2 image/png' in tool_message['content']
+    injected = loop.context.committed[3]['content']
+    assert injected.startswith('<tool_images>')
+    assert '[image: sessions/images/paste-' in injected
+    # The picture is only expanded for the request; history keeps the marker.
+    assert 'base64' not in injected
+    tool_item = next(item for item in loop.items if item.kind == 'tool')
+    assert tool_item.name == 'view_image'
+    assert tool_item.status == 'done'
+
+
 def test_turn_is_not_capped_by_tool_rounds(loop):
     """A long investigation is only ended by the model, not a fixed count."""
     rounds = 130

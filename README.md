@@ -104,7 +104,7 @@ maximum output, vision support, tool calling, and reasoning efforts.
 | `esc` | Interrupt the current turn, or close the palette/overlay |
 | `ctrl+c` | Copy selection, else clear the input, else interrupt; press twice on an empty prompt to exit |
 | `ctrl+v`, `shift+insert` | Paste text, or attach a copied screenshot when the clipboard has no text |
-| `alt+v` | Attach the clipboard image to the message |
+| `alt+v` | Attach the clipboard image, image path, or image URL to the message |
 | `ctrl+a` | Select all |
 | `shift+left` / `shift+right` | Extend the selection by one character |
 | `shift+home` / `shift+end` | Extend the selection to the line edge |
@@ -334,6 +334,12 @@ is stored under `sessions/images/` with a content-addressed name and a short
 The marker is plain text, so it survives session save/load, rewind, edit and
 fork, and it costs almost nothing in the history.
 
+`alt+v` also works when the clipboard holds a file path, a `file://` URI or an
+image link instead of pixels (a file copied in Explorer or Finder lands that
+way). Attaching prints the stored name and size, and warns when the selected
+model is not marked as vision-capable. Each attachment counts in the footer as
+`N images` until the message is sent.
+
 The marker is expanded into a native image part only while a request is being
 built, and the image is first uploaded through the provider's Files API:
 
@@ -354,6 +360,12 @@ the Anthropic SDK so it reads and encodes the bytes while serializing. AdCode
 never builds the base64 string itself. A 5xx or a network error is not
 remembered, so the next turn tries again.
 
+A file id is not immortal: uploads expire and some endpoints only accept the
+inline shape. When a request that carried a file id comes back rejected
+(400/403/404/422), the id is dropped, the request is retried once with the image
+inlined, and that provider stops using file ids from then on. Nothing is lost
+but one round trip.
+
 Base64 is therefore transient request data: it is never written to the session
 JSON, never shown in the transcript and never counted as context text. Each
 marker is estimated at about 1,200 tokens for compaction. `http(s)` URLs can be
@@ -361,6 +373,32 @@ used instead of a local file and are passed straight through as image URLs, with
 no upload and no encoding. Providers that do not accept images will simply
 reject the request; models from models.dev are marked with vision support when
 known.
+
+### The model looks on its own
+
+A vision model does not have to wait for a paste: `view_image` takes a path or
+an `http(s)` URL and answers with a one-line description plus the same marker.
+The file is copied into `sessions/images/` first (content-addressed, so viewing
+the same screenshot twice stores it once), which keeps the conversation valid
+after the original is edited or deleted.
+
+Tool results are plain text on all three wires, so the picture cannot ride
+inside them. Instead the loop stages a `<tool_images>` user block right after
+the tool results:
+
+```
+assistant: tool_calls [view_image("shot.png")]
+tool:      Loaded shot.png (1920x1080 image/png, 240 KB). ...
+user:      <tool_images>
+           [image: sessions/images/paste-<hash>.png]
+           </tool_images>
+```
+
+That block is skipped by rewind and edit (`turn_starts` ignores the `<tool_`
+prefix), so it never appears as a user turn, and it reaches every wire as a
+normal image part. `view_image` is only offered to models marked
+vision-capable: a text-only model never sees the schema, and sub-agents inherit
+the same rule from their own model.
 
 ## Rendering Architecture
 

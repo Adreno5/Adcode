@@ -223,6 +223,39 @@ def test_a_provider_without_a_files_api_still_gets_the_image(gateway, wire,
     assert gateway.upload_attempts == 1, 'a refused endpoint is not probed again'
 
 
+@pytest.mark.parametrize('wire', ['openai responses', 'anthropic messages'])
+def test_a_rejected_file_id_retries_the_request_inline(gateway, wire, tmp_path):
+    gateway.responder = ScriptedResponder([Turn(text='seen')])
+    (tmp_path / 'shot.png').write_bytes(
+        images.encode_png(1, 1, bytes([9, 9, 9, 255])))
+    client = LLMClient(provider(gateway.base_url, wire))
+    client.base_dir = str(tmp_path)
+    client.file_cache = images.FileIdCache(tmp_path / 'files.json')
+    warnings: list[str] = []
+    client.warn = warnings.append
+    gateway.fail_next = 1
+    gateway.fail_status = 400
+
+    events = collect(client, wire, [{'role': 'user',
+                                     'content': 'see [image: shot.png]'}])
+
+    text = ''.join(event.get('content', '') for event in events
+                   if event.get('kind') == 'text')
+    assert text == 'seen'
+    assert len(gateway.requests) == 2
+    assert 'file_id' in gateway.requests[0].all_text
+    second = gateway.requests[1].all_text
+    assert 'file_id' not in second
+    assert 'base64' in second
+    assert client.file_cache.unsupported(client._file_scope())
+    assert warnings and 'rejected' in warnings[0]
+
+    # Every later turn goes straight to the inline form.
+    collect(client, wire, [{'role': 'user', 'content': 'and [image: shot.png]'}])
+    assert 'file_id' not in gateway.requests[2].all_text
+    assert gateway.upload_attempts == 1
+
+
 @pytest.mark.parametrize('wire', WIRES)
 def test_gateway_lists_models(gateway, wire):
     client = LLMClient(provider(gateway.base_url, wire))
