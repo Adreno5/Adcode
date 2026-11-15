@@ -444,6 +444,141 @@ class MultiSelectDialog(Overlay):
         _draw_hint(canvas, x, y + h - 2, w, hint, palette)
 
 
+class CommandPalette(Overlay):
+    """A searchable list of commands, opened with ctrl+p.
+
+    The palette is a filter box plus a list: typing narrows the commands,
+    enter runs the selected one and esc closes the panel.
+    """
+
+    def __init__(self, title: str, items: list[DialogItem],
+                 on_select: Callable[[Any], None],
+                 on_cancel: Callable[[], None] | None = None,
+                 width: int = 72) -> None:
+        super().__init__()
+        self.title = title
+        self.items = items
+        self.on_select = on_select
+        self.on_cancel = on_cancel
+        self.desired_width = width
+        self.filter = ''
+        self.index = 0
+        self.top = 0
+
+    def _visible(self) -> list[DialogItem]:
+        if not self.filter:
+            return self.items
+        needle = self.filter.lower()
+        return [item for item in self.items
+                if needle in item.label.lower()
+                or needle in item.description.lower()]
+
+    def handle(self, event: KeyEvent) -> bool:
+        visible = self._visible()
+        if event.kind == 'mouse':
+            step = _wheel_step(event)
+            if step and visible:
+                self.index = max(0, min(len(visible) - 1, self.index + step * 3))
+            return True
+        if event.kind == 'paste':
+            self.filter += event.text.replace('\r', '').replace('\n', ' ')
+            self.index = 0
+            return True
+        if event.kind == 'text':
+            self.filter += event.text
+            self.index = 0
+            return True
+        if event.kind != 'key':
+            return True
+        key = event.key
+        if key == 'esc':
+            self.closed = True
+            if self.on_cancel is not None:
+                self.on_cancel()
+            return True
+        if key == 'up':
+            if visible:
+                self.index = (self.index - 1) % len(visible)
+            return True
+        if key == 'down':
+            if visible:
+                self.index = (self.index + 1) % len(visible)
+            return True
+        if key == 'pgup':
+            self.index = max(0, self.index - 8)
+            return True
+        if key == 'pgdn':
+            if visible:
+                self.index = min(len(visible) - 1, self.index + 8)
+            return True
+        if key == 'backspace':
+            self.filter = self.filter[:-1]
+            self.index = 0
+            return True
+        if key == 'enter':
+            if visible:
+                self.closed = True
+                self.on_select(visible[min(self.index, len(visible) - 1)].value)
+            return True
+        return True
+
+    def render(self, canvas: Canvas, width: int, height: int,
+               palette: Palette, now: float) -> None:
+        visible = self._visible()
+        panel_width = min(self.desired_width, max(30, width - 4))
+        rows = min(len(visible), 12)
+        # border + search + spacer + list + hint + border
+        panel_height = min(max(6, rows + 5), max(6, height - 4))
+        x = max(0, (width - panel_width) // 2)
+        y = max(0, min(4, (height - panel_height) // 2))
+        _draw_backdrop(canvas, width, height, palette)
+        _draw_frame(canvas, x, y, panel_width, panel_height, palette, self.title)
+
+        inner = max(10, panel_width - 6)
+        search = self.filter or ''
+        canvas.draw_text(x + 3, y + 1, '> ', palette.accent, None, BOLD)
+        canvas.draw_text(x + 5, y + 1, truncate_text(search, inner - 1),
+                         palette.text)
+        caret = x + 5 + text_width(truncate_text(search, inner - 1))
+        self._cursor = (min(x + panel_width - 2, caret), y + 1)
+
+        body_height = max(1, panel_height - 5)
+        if visible:
+            self.index = max(0, min(self.index, len(visible) - 1))
+        if self.index < self.top:
+            self.top = self.index
+        elif self.index >= self.top + body_height:
+            self.top = self.index - body_height + 1
+        row = y + 3
+        for offset in range(body_height):
+            position = self.top + offset
+            if position >= len(visible):
+                break
+            item = visible[position]
+            selected = position == self.index
+            bg = palette.selection_bg if selected else None
+            if bg is not None:
+                canvas.fill_rect(x + 1, row, panel_width - 2, 1, bg)
+            marker = '› ' if selected else '  '
+            canvas.draw_text(x + 2, row, marker,
+                             palette.accent if selected else palette.muted, bg)
+            canvas.draw_text(x + 4, row,
+                             truncate_text(item.label, max(8, inner - 4)),
+                             palette.selection_fg if selected else palette.text,
+                             bg, BOLD if selected else 0)
+            if item.description:
+                label_width = text_width(truncate_text(item.label, max(8, inner - 4)))
+                desc_x = x + 5 + label_width
+                canvas.draw_text(desc_x, row, truncate_text(
+                    item.description, max(1, x + panel_width - 2 - desc_x)),
+                    palette.muted, bg, DIM)
+            row += 1
+        if not visible:
+            canvas.draw_text(x + 3, y + 3, 'no matching command', palette.muted)
+        _draw_hint(canvas, x, y + panel_height - 2, panel_width,
+                   '↑↓ move · enter run · esc close', palette)
+
+
 class TextPrompt(Overlay):
     def __init__(self, title: str, label: str, initial: str,
                  on_submit: Callable[[str], None],

@@ -97,6 +97,8 @@ def cmd_help(app: Any, args: str) -> None:
         'ctrl+a select all · ctrl+z undo · ctrl+y redo',
         'pgup / pgdn        scroll the transcript · mouse wheel scrolls too',
         'ctrl+home / end    jump in the input',
+        'ctrl+p             open the command palette',
+        'ctrl+q             quit',
     ]
     app.open_message('Help', '**Commands**\n' + '\n'.join(rows)
                      + '\n\n**Keys**\n' + '\n'.join(keys))

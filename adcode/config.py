@@ -360,6 +360,7 @@ class UiSettings:
     show_token_status: bool = True
     show_turn_stats: bool = True
     double_click_ms: int = 350
+    fps: int = 60
 
     @classmethod
     def from_dict(cls, raw: Any) -> 'UiSettings':
@@ -372,6 +373,7 @@ class UiSettings:
             show_token_status=_bool(raw.get('show_token_status'), True),
             show_turn_stats=_bool(raw.get('show_turn_stats'), True),
             double_click_ms=_bounded_int(raw.get('double_click_ms'), 100, 2_000, 350),
+            fps=_bounded_int(raw.get('fps'), 10, 240, 60),
         )
 
 

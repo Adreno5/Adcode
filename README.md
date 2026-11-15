@@ -43,6 +43,10 @@ whole screen is written to the terminal in one pass.
   (`/btw`), durable goals, and automatic crash recovery.
 - **Single settings browser** -- `/config` exposes thinking display, tool
   display, appearance, reasoning, context, agents, skills, and MCP settings.
+- **Command palette** -- `ctrl+p` opens every command in a searchable list,
+  and `ctrl+q` quits.
+- **Clipboard and proxy support** -- pasting works on every platform and in
+  every input field, and HTTP or SOCKS5 proxies are honoured everywhere.
 
 ## Requirements
 
@@ -115,6 +119,14 @@ maximum output, vision support, tool calling, and reasoning efforts.
 | `home` / `end` | Line start / end |
 | `ctrl+home` / `ctrl+end` | Input start / end |
 | `ctrl+l` | Redraw the screen |
+| `ctrl+p` | Open the command palette (type to filter, enter to run) |
+| `ctrl+q` | Quit |
+
+## Command palette
+
+`ctrl+p` opens the command palette: type to narrow the list, `↑`/`↓` to move,
+`enter` to run the command and `esc` to close. It lists the same commands the
+`/` prefix and the `/help` output show.
 
 ## Commands
 
@@ -183,6 +195,13 @@ frames, and the per-frame duration. The `partial` mode configures:
   row alpha from 0 to 255),
 - the omitted-content marker (`none`, an ellipsis `label`, or a character
   `count`).
+
+### Frame rate
+
+The app draws at 60 frames per second by default. `/config` exposes
+`Appearance > Frames per second` (`ui.fps`, 10 to 240) to change it. A frame
+that has nothing new to show writes no bytes to the terminal, so a higher
+rate costs nothing while the app is idle.
 
 ### Tool display
 

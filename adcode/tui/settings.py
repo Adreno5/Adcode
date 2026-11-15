@@ -123,6 +123,7 @@ def build_settings_tree(config: AppConfig) -> list[SettingNode]:
         _bool('ui.header', 'Show header', 'ui.show_header'),
         _bool('ui.tokens', 'Show token status', 'ui.show_token_status'),
         _number('ui.scroll', 'Mouse wheel lines', 'ui.mouse_scroll_lines', 1, 30),
+        _number('ui.fps', 'Frames per second', 'ui.fps', 10, 240),
     ]
 
     thinking_choices = [

@@ -30,7 +30,7 @@ from adcode.tools.builtin import shutdown_shell_sessions
 from adcode.tools.registry import ToolRegistry
 from adcode.tui.canvas import BOLD, DIM, Canvas, text_width, truncate_text
 from adcode.tui.dialogs import (
-    ConfirmDialog, DialogItem, MessageDialog, Overlay,
+    CommandPalette, ConfirmDialog, DialogItem, MessageDialog, Overlay,
     SelectDialog, TextPrompt,
 )
 from adcode.tui.input import (
@@ -43,7 +43,11 @@ from adcode.tui.text import Line, Span, add_span, line_width
 from adcode.tui.transcript import LiveRender, TranscriptRenderer
 
 SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-_RENDER_INTERVAL = 1 / 30
+# Fallback frame rate when the configuration carries no value.
+_DEFAULT_FPS = 60
+# How long the event loop sleeps when there is nothing to draw. A keypress
+# wakes it up right away, so this only bounds the poll.
+_IDLE_POLL = 0.15
 
 
 class PromptState:
@@ -248,6 +252,8 @@ class AdCodeApp:
         self.btw_mode = False
         self.exit_armed = False
         self.last_render = 0.0
+        self._prompt_cache: tuple[tuple[Any, ...], tuple[list[Line], int, int]] | None = None
+        self._snapshot_cache: AgentSnapshot | None = None
         self._last_cursor: tuple[int, int] | None = None
         self._cursor_visible: bool | None = None
         self.last_interrupt = 0.0
@@ -468,6 +474,14 @@ class AdCodeApp:
         return list(self.standalone_items)
 
     def snapshot(self) -> AgentSnapshot:
+        """The agent snapshot, taken once per frame.
+
+        Header and footer ask for the same numbers; walking the conversation
+        twice per frame was pure waste.
+        """
+        cached = self._snapshot_cache
+        if cached is not None:
+            return cached
         if self.loop is not None:
             snap = self.loop.snapshot()
         else:
@@ -478,7 +492,12 @@ class AdCodeApp:
                 effort=self.config.reasoning.effort,
             )
         snap.status = self.phase
+        self._snapshot_cache = snap
         return snap
+
+    def _drop_snapshot(self) -> None:
+        """Forget the cached snapshot after the state changed."""
+        self._snapshot_cache = None
 
     def _update_title(self) -> None:
         if self.loop is None:
@@ -492,8 +511,13 @@ class AdCodeApp:
     # ── event loop ──────────────────────────────────────────
     def _loop(self) -> None:
         while self.running:
-            busy = self.phase not in ('idle',)
-            timeout = 0.03 if (busy or self._needs_animation()) else 0.15
+            # A frame that is due has to be drawn on time: the loop never
+            # sleeps longer than one frame interval while something is
+            # pending or an animation is running. An idle app sleeps long and
+            # wakes up on the next input event.
+            interval = self._render_interval()
+            timeout = (interval if (self.dirty or self._needs_animation())
+                       else _IDLE_POLL)
             try:
                 event = self.input_queue.get(timeout=timeout)
             except queue.Empty:
@@ -671,6 +695,10 @@ class AdCodeApp:
 
     # ── input ───────────────────────────────────────────────
     def _handle_event(self, event: KeyEvent) -> None:
+        if event.kind == 'key' and event.key == 'ctrl+q':
+            # One key quits, whatever is on the screen.
+            self.request_exit()
+            return
         if event.kind == 'mouse':
             if event.action == 'wheel_up':
                 self.follow = False
@@ -717,6 +745,9 @@ class AdCodeApp:
             return
         if key == 'ctrl+l':
             self.dirty = True
+            return
+        if key == 'ctrl+p':
+            self.open_command_palette()
             return
         if key == 'ctrl+c':
             if self.prompt.selection()[0] != self.prompt.selection()[1]:
@@ -1065,6 +1096,22 @@ class AdCodeApp:
         total = self._last_total or len(self._transcript_lines())
         return max(0, total - viewport)
 
+    def _prompt_rows(self, columns: int) -> tuple[list[Line], int, int]:
+        """Wrap the input, reusing the previous result when nothing changed.
+
+        Wrapping rebuilds one span per character, so a long prompt used to
+        cost more than the rest of the frame together and froze typing.
+        """
+        width = max(16, columns - 2)
+        key = (self.prompt.text, self.prompt.cursor, self.prompt.anchor, width)
+        cached = self._prompt_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        layout = _prompt_layout(self.prompt.text, self.prompt.cursor,
+                                self.prompt.anchor, width)
+        self._prompt_cache = (key, layout)
+        return layout
+
     def _transcript_lines(self) -> list[Line]:
         width = max(16, self.screen.size().columns - 2)
         live = LiveRender(
@@ -1088,17 +1135,24 @@ class AdCodeApp:
         header = 2 if self.config.ui.show_header else 0
         return max(1, rows - header - 1 - 1 - 3)
 
+    def _render_interval(self) -> float:
+        """Seconds between two frames, derived from the configured rate."""
+        fps = int(getattr(self.config.ui, 'fps', 0) or _DEFAULT_FPS)
+        return 1.0 / max(1, min(240, fps))
+
     def _render_if_due(self) -> None:
         now = time.monotonic()
         if not self.dirty:
             return
-        if now - self.last_render < _RENDER_INTERVAL:
+        if now - self.last_render < self._render_interval():
             return
         self.last_render = now
         self.dirty = False
         self._render()
 
     def _render(self) -> None:
+        # The snapshot belongs to one frame; the next frame reads it again.
+        self._drop_snapshot()
         columns, rows = self.screen.size()
         if columns != self.canvas.width or rows != self.canvas.height:
             self.canvas.resize(columns, rows)
@@ -1108,9 +1162,7 @@ class AdCodeApp:
         header_h = 2 if self.config.ui.show_header else 0
         if self.config.ui.show_header:
             self._draw_header(columns)
-        prompt_rows, caret_row, caret_col = _prompt_layout(
-            self.prompt.text, self.prompt.cursor, self.prompt.anchor,
-            max(16, columns - 2))
+        prompt_rows, caret_row, caret_col = self._prompt_rows(columns)
         max_prompt = max(3, min(10, rows // 3))
         window_start = 0
         if len(prompt_rows) > max_prompt:
@@ -1331,6 +1383,21 @@ class AdCodeApp:
         self.dirty = True
         if submit:
             self.submit(text.strip())
+
+    def open_command_palette(self) -> None:
+        """Open the command palette (ctrl+p)."""
+        from adcode.commands import COMMANDS
+        items = [DialogItem(command.name, command.name, command.description)
+                 for command in COMMANDS]
+        if not items:
+            self.notify('No commands are registered.', 'warning')
+            return
+        self.open_overlay(CommandPalette('Command palette', items,
+                                          self._run_command))
+
+    def _run_command(self, name: str) -> None:
+        from adcode.commands import dispatch
+        dispatch(self, str(name))
 
     def open_settings(self) -> None:
         self.open_overlay(SettingsOverlay(self.config, self.config_changed))
