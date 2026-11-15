@@ -19,7 +19,6 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
-import os
 import threading
 import time
 from collections import deque
@@ -32,11 +31,12 @@ from harness.agent.engine_config import (
 )
 from harness.agent.events import EventSink
 from harness.images import FileIdCache
-from harness.transcript import SessionPayload, SessionStore
+from harness.transcript import SessionPayload, TranscriptItem
 
 from adcode.agents.manager import AgentManager, AgentStatus
 from adcode.config import AppConfig, ModelConfig, ProviderConfig
 from adcode.llm.client import LLMClient
+from adcode import paths
 from adcode.system_prompt import build_system_prompt
 from adcode.tools.builtin import install_coding_tools, shutdown_shell_sessions
 
@@ -101,7 +101,7 @@ class _WorkQueue:
 class AgentLoop:
     """Owns the sdk engine behind a thread-safe, event-driven facade."""
 
-    def __init__(self, config: AppConfig, registry, store: SessionStore,
+    def __init__(self, config: AppConfig, registry, store: Any,
                  goals, skills, emit: Callable[[str, dict[str, Any]], None] | None = None,
                  mcp_manager: Any = None, cwd: str = '') -> None:
         self.config = config
@@ -122,8 +122,7 @@ class AgentLoop:
         if self._selected is None:
             raise RuntimeError('no provider/model configured')
         self.provider, self.model = self._selected
-        self._file_cache = FileIdCache(
-            os.path.join(cwd or '.', 'sessions', 'images', 'files.json'))
+        self._file_cache = FileIdCache(str(paths.image_file_ids()))
         self.client = self._make_client(self.provider, self.model)
 
         # The app hands us an empty registry; the built-in suite is installed

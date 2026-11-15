@@ -23,6 +23,7 @@ from adcode.images import (
     read_clipboard_image, resolve_image,
 )
 from adcode.mcp.manager import get_mcp_manager
+from adcode.paths import goals_file, sessions_db
 from adcode.session import DbSessionStore, TranscriptItem
 from adcode.skills import SkillRegistry
 from adcode.theme import Palette, build_palette
@@ -239,11 +240,10 @@ class AdCodeApp:
             input_thread if input_thread is not None
             else InputThread(self.input_queue))
         self.posted: 'queue.Queue[Callable[[], None]]' = queue.Queue()
-        self.session_store = DbSessionStore(
-            db_path=os.path.join(self.cwd, 'sessions', 'adcode.db'))
+        self.session_store = DbSessionStore(db_path=str(sessions_db()))
         self.images = ImageStore(os.path.join(self.cwd, 'sessions', 'images'),
                                  self.cwd)
-        self.goals = GoalStore(os.path.join(self.cwd, 'sessions', 'goals.json'))
+        self.goals = GoalStore(str(goals_file()))
         self.skills = SkillRegistry(self.config.skills, self.cwd).scan()
         self.registry = ToolRegistry()
         self.mcp = get_mcp_manager(self.registry)

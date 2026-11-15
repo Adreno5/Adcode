@@ -324,7 +324,10 @@ def _view_image(args: dict[str, Any]) -> str:
     if media_type is None:
         return (f'Error: not a supported image: {raw_path} '
                 f'(png, jpeg, gif or webp)')
-    store = ImageStore(os.path.join(_base_dir(), 'sessions', 'images'), _base_dir())
+    # images live under the app state dir, never in the project
+    from adcode.paths import images_dir
+
+    store = ImageStore(str(images_dir()), _base_dir())
     try:
         reference = store.save(data)
     except (ValueError, OSError) as error:

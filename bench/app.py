@@ -160,6 +160,10 @@ class AppHarness:
     # ── isolation ──────────────────────────────────────────
     def _install_isolated_globals(self, stack: ExitStack) -> None:
         workspace = self.workspace
+        import adcode.paths as paths_module
+
+        stack.enter_context(mock.patch.object(
+            paths_module, 'APP_DIR', workspace.root / 'adcode-home'))
         stack.enter_context(mock.patch.object(
             system_prompt_module, 'GLOBAL_INSTRUCTIONS_PATH',
             workspace.global_instructions_path))
