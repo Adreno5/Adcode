@@ -4,7 +4,7 @@ import zlib
 import pytest
 
 from adcode import images
-from adcode.llm.client import LLMClient
+from adcode.llm.client import LLMClient, _file_id_rejected, _has_file_id, _image_parts
 from adcode.llm.usage import estimate_text_tokens, estimate_tokens
 
 
@@ -128,54 +128,62 @@ def test_file_uri_to_path():
 
 
 def test_parts_for_each_wire(tmp_path):
+    from infra.orchestrator.anthropic import AnthropicCompatClient
+    from infra.orchestrator.openai import OpenAICompatClient
+
     store = images.ImageStore(tmp_path / 'images', tmp_path)
     reference = store.save(sample_png())
     text = f'look [image: {reference}] please'
 
-    client = object.__new__(LLMClient)
+    client = LLMClient(_provider('openai chat completions'))
     client.base_dir = str(tmp_path)
-    chat_parts = client._chat_content(text)
-    assert chat_parts is not None
+    prepared = client._prepared([{'role': 'user', 'content': text}])
+    chat_parts = prepared[0]['content']
     assert chat_parts[0] == {'type': 'text', 'text': 'look '}
     assert chat_parts[1]['type'] == 'image_url'
     assert chat_parts[1]['image_url']['url'].startswith('data:image/png;base64,')
     assert chat_parts[2] == {'type': 'text', 'text': ' please'}
 
-    responses = LLMClient._to_responses_input(
-        [{'role': 'user', 'content': text}], str(tmp_path))
+    # the sdk converters map the chat-shaped parts onto the native blocks
+    responses = OpenAICompatClient._messages_to_responses_input(prepared)
     parts = responses[0]['content']
     assert [part['type'] for part in parts] == ['input_text', 'input_image',
                                                 'input_text']
     assert parts[1]['image_url'].startswith('data:image/png;base64,')
     assert parts[1]['detail'] == 'auto'
 
-    anthropic = LLMClient._to_anthropic_msgs(
-        [{'role': 'user', 'content': text}], str(tmp_path))
+    _, anthropic = AnthropicCompatClient._split_system(prepared)
     blocks = anthropic[0]['content']
     assert [block['type'] for block in blocks] == ['text', 'image', 'text']
     source = blocks[1]['source']
     assert source['type'] == 'base64'
     assert source['media_type'] == 'image/png'
-    assert source['data'] == tmp_path / reference
+    # the sdk converter inlines the bytes; equivalent to handing the sdk a path
+    assert source['data'] and isinstance(source['data'], str)
+
+
+def _provider(wire: str = 'openai chat completions') -> 'ProviderConfig':
+    from adcode.config import ModelConfig, ProviderConfig
+    return ProviderConfig(
+        name='Test', base_url='http://localhost:1234/v1', api_key='k',
+        wire=wire, models=[ModelConfig(id='test-model')])
 
 
 def test_unresolved_marker_stays_text(tmp_path):
-    client = object.__new__(LLMClient)
-    client.base_dir = str(tmp_path)
+    client = LLMClient(_provider(), base_dir=str(tmp_path))
     text = 'see [image: images/missing.png]'
     # Nothing resolved, so the message stays unchanged instead of half-split.
-    assert client._chat_content(text) is None
-    messages = client._openai_chat_messages(
-        [{'role': 'user', 'content': text}])
-    assert messages[0]['content'] == text
+    assert _image_parts(text, base_dir=str(tmp_path)) is None
+    prepared = client._prepared([{'role': 'user', 'content': text}])
+    assert prepared[0]['content'] == text
 
 
 def test_has_file_id_scans_nested_payloads():
-    assert LLMClient._has_file_id({'input': [{'content': [
+    assert _has_file_id({'input': [{'content': [
         {'type': 'input_image', 'file_id': 'file-1'}]}]})
-    assert not LLMClient._has_file_id({'input': [{'content': [
+    assert not _has_file_id({'input': [{'content': [
         {'type': 'input_image', 'file_id': ''}]}]})
-    assert not LLMClient._has_file_id({'input': 'file_id'})
+    assert not _has_file_id({'input': 'file_id'})
 
 
 def test_file_id_rejected_statuses():
@@ -184,9 +192,9 @@ def test_file_id_rejected_statuses():
             self.status_code = status
 
     for status in (400, 403, 404, 422):
-        assert LLMClient._file_id_rejected(Failure(status))
+        assert _file_id_rejected(Failure(status))
     for status in (0, 401, 408, 429, 500, 503):
-        assert not LLMClient._file_id_rejected(Failure(status))
+        assert not _file_id_rejected(Failure(status))
 
 
 def test_an_unsupported_scope_wins_over_cached_file_ids(tmp_path):
@@ -195,9 +203,8 @@ def test_an_unsupported_scope_wins_over_cached_file_ids(tmp_path):
     store = images.ImageStore(tmp_path / 'images', tmp_path)
     resolved = images.resolve_image(store.save(sample_png()), str(tmp_path))
     assert resolved is not None
-    client = object.__new__(LLMClient)
-    client.provider = ProviderConfig(name='Test', base_url='http://localhost/v1')
-    client.file_cache = images.FileIdCache(tmp_path / 'files.json')
+    client = LLMClient(ProviderConfig(name='Test', base_url='http://localhost/v1'),
+                       file_cache=images.FileIdCache(tmp_path / 'files.json'))
     scope = client._file_scope()
 
     client.file_cache.set_id(scope, client._file_key(resolved), 'file-cached')
@@ -209,16 +216,19 @@ def test_an_unsupported_scope_wins_over_cached_file_ids(tmp_path):
 
 
 def test_url_image_needs_no_local_file(tmp_path):
-    client = object.__new__(LLMClient)
-    client.base_dir = str(tmp_path)
+    from infra.orchestrator.anthropic import AnthropicCompatClient
+    from infra.orchestrator.openai import OpenAICompatClient
+
+    client = LLMClient(_provider('openai responses'), base_dir=str(tmp_path))
     text = 'see [image: https://example.com/cat.png]'
-    parts = client._responses_content(text)
+    prepared = client._prepared([{'role': 'user', 'content': text}])
+    parts = OpenAICompatClient._messages_to_responses_input(prepared)[0]['content']
     assert parts[1] == {'type': 'input_image',
                         'image_url': 'https://example.com/cat.png',
                         'detail': 'auto'}
-    blocks = client._anthropic_content(text)
-    assert blocks[1]['source'] == {'type': 'url',
-                                   'url': 'https://example.com/cat.png'}
+    _, blocks_msg = AnthropicCompatClient._split_system(prepared)
+    assert blocks_msg[0]['content'][1]['source'] == {
+        'type': 'url', 'url': 'https://example.com/cat.png'}
 
 
 # ── Files API ──────────────────────────────────────────────
@@ -260,10 +270,11 @@ def make_client(tmp_path, wire='anthropic messages', sdk=None) -> LLMClient:
     provider = ProviderConfig(
         name='Files', base_url='http://localhost:9999/v1', api_key='k',
         wire=wire, models=[ModelConfig(id='harness-model')])
-    client = LLMClient(provider)
-    client.base_dir = str(tmp_path)
-    client.file_cache = images.FileIdCache(tmp_path / 'files.json')
-    client._client = sdk if sdk is not None else FakeFilesClient()
+    client = LLMClient(provider, ModelConfig(id='harness-model'),
+                       base_dir=str(tmp_path),
+                       file_cache=images.FileIdCache(tmp_path / 'files.json'))
+    if sdk is not None:
+        client._sdk = sdk
     return client
 
 
@@ -281,17 +292,25 @@ def test_file_id_cache_roundtrip(tmp_path):
 
 
 def test_images_upload_once_and_are_referenced_by_id(tmp_path):
+    from infra.orchestrator.anthropic import AnthropicCompatClient
+
     store = images.ImageStore(tmp_path / 'images', tmp_path)
     reference = store.save(sample_png())
     text = f'look [image: {reference}] please'
     sdk = FakeFilesClient('file-abc')
     client = make_client(tmp_path, sdk=sdk)
 
-    first = client._anthropic_content(text)
-    assert first[1]['source'] == {'type': 'file', 'file_id': 'file-abc'}
-    assert 'base64' not in str(first)
-    second = client._anthropic_content(text)
-    assert second[1]['source'] == {'type': 'file', 'file_id': 'file-abc'}
+    def prepared() -> list[dict]:
+        return client._prepared([{'role': 'user', 'content': text}])[0]['content']
+
+    first = prepared()
+    assert first[1] == {'type': 'image_url', 'image_url': {'file_id': 'file-abc'}}
+    _, msgs = AnthropicCompatClient._split_system(
+        [{'role': 'user', 'content': first}])
+    assert msgs[0]['content'][1]['source'] == {'type': 'file',
+                                               'file_id': 'file-abc'}
+    second = prepared()
+    assert second[1] == {'type': 'image_url', 'image_url': {'file_id': 'file-abc'}}
     assert len(sdk.uploads) == 1, 'the id is cached, not re-uploaded'
     name, data, mime = sdk.uploads[0]
     assert name.startswith('paste-') and name.endswith('.png')
@@ -300,12 +319,17 @@ def test_images_upload_once_and_are_referenced_by_id(tmp_path):
 
 
 def test_responses_use_file_id_too(tmp_path):
+    from infra.orchestrator.openai import OpenAICompatClient
+
     store = images.ImageStore(tmp_path / 'images', tmp_path)
     reference = store.save(sample_png())
     sdk = FakeFilesClient('file-resp')
     client = make_client(tmp_path, wire='openai responses', sdk=sdk)
 
-    parts = client._responses_content(f'see [image: {reference}]')
+    prepared = client._prepared([{'role': 'user',
+                                  'content': f'see [image: {reference}]'}])
+    parts = OpenAICompatClient._messages_to_responses_input(
+        prepared)[0]['content']
     assert parts[1] == {'type': 'input_image', 'file_id': 'file-resp',
                         'detail': 'auto'}
 
@@ -316,7 +340,9 @@ def test_chat_completions_never_uses_a_file_id(tmp_path):
     sdk = FakeFilesClient('file-chat')
     client = make_client(tmp_path, wire='openai chat completions', sdk=sdk)
 
-    parts = client._chat_content(f'see [image: {reference}]')
+    prepared = client._prepared([{'role': 'user',
+                                  'content': f'see [image: {reference}]'}])
+    parts = prepared[0]['content']
     assert parts[1]['image_url']['url'].startswith('data:image/png;base64,')
     assert sdk.uploads == [], 'chat completions has no file id to send'
 
@@ -329,12 +355,16 @@ def test_rejected_upload_falls_back_and_is_not_retried(tmp_path):
     client = make_client(tmp_path, sdk=sdk)
     client.warn = warnings.append
 
-    first = client._anthropic_content(f'see [image: {reference}]')
-    assert first[1]['source']['type'] == 'base64'
+    def inline_parts(text: str) -> list[dict]:
+        prepared = client._prepared([{'role': 'user', 'content': text}])
+        return prepared[0]['content']
+
+    first = inline_parts(f'see [image: {reference}]')
+    assert first[1]['image_url']['url'].startswith('data:image/png;base64,')
     assert warnings and 'Files API unavailable' in warnings[0]
 
-    second = client._anthropic_content(f'again [image: {reference}]')
-    assert second[1]['source']['type'] == 'base64'
+    second = inline_parts(f'again [image: {reference}]')
+    assert second[1]['image_url']['url'].startswith('data:image/png;base64,')
     assert len(sdk.uploads) == 0 and sdk.error is not None
     assert len(warnings) == 1, 'the warning is reported once, not per turn'
     # The provider stays marked so no later turn probes it again.
@@ -348,13 +378,17 @@ def test_transient_upload_failure_is_retried(tmp_path):
     client = make_client(tmp_path, sdk=sdk)
     client.warn = lambda text: None
 
-    first = client._anthropic_content(f'see [image: {reference}]')
-    assert first[1]['source']['type'] == 'base64'
+    def parts(text: str) -> list[dict]:
+        return client._prepared([{'role': 'user', 'content': text}])[0]['content']
+
+    first = parts(f'see [image: {reference}]')
+    assert first[1]['image_url']['url'].startswith('data:image/png;base64,')
     assert not client.file_cache.unsupported(client._file_scope())
     sdk.error = None
-    client._client = sdk
-    second = client._anthropic_content(f'see [image: {reference}]')
-    assert second[1]['source'] == {'type': 'file', 'file_id': 'file-123'}
+    client._sdk = sdk
+    second = parts(f'see [image: {reference}]')
+    assert second[1] == {'type': 'image_url',
+                         'image_url': {'file_id': 'file-123'}}
 
 
 def test_token_estimate_counts_images():
@@ -539,12 +573,15 @@ def test_image_info_reads_every_supported_header():
 
 
 def run_tool(name: str, args: dict, cwd) -> str:
+    from adcode.tools.builtin import install_coding_tools
     from adcode.tools.registry import ToolRegistry
     from adcode.tools.runtime import ToolContext, pop_context, push_context
 
+    registry = ToolRegistry()
+    install_coding_tools(registry)
     token = push_context(ToolContext(cwd=str(cwd)))
     try:
-        return ToolRegistry().execute(name, args).text
+        return registry.execute(name, args)[0]
     finally:
         pop_context(token)
 
@@ -589,18 +626,12 @@ def test_view_image_passes_a_url_through(tmp_path):
 
 
 def test_vision_only_tools_are_hidden_from_text_models():
+    from adcode.tools.builtin import install_coding_tools
     from adcode.tools.registry import ToolRegistry
 
     registry = ToolRegistry()
-    openai_names = {schema['function']['name']
-                    for schema in registry.schemas('openai chat completions')}
-    assert 'view_image' in openai_names
-    hidden = {schema['function']['name']
-              for schema in registry.schemas('openai chat completions', vision=False)}
+    install_coding_tools(registry)
+    names = {schema['name'] for schema in registry.build_schema()}
+    assert 'view_image' in names
+    hidden = {schema['name'] for schema in registry.build_schema(vision=False)}
     assert 'view_image' not in hidden
-    anthropic_hidden = {schema['name'] for schema in
-                        registry.schemas('anthropic messages', vision=False)}
-    assert 'view_image' not in anthropic_hidden
-    anthropic = {schema['name'] for schema in
-                 registry.schemas('anthropic messages')}
-    assert 'view_image' in anthropic

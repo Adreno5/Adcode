@@ -184,8 +184,47 @@ def build_http_client(timeout: float = 600.0, follow_redirects: bool = True) -> 
     )
 
 
+def build_async_http_client(timeout: float = 600.0,
+                            follow_redirects: bool = True) -> Any:
+    """Build an httpx.AsyncClient with the same proxy handling.
+
+    The engine sdk's clients drive the SDKs through both a sync and an async
+    httpx client; both must honour the configured SOCKS proxy, so this mirrors
+    build_http_client with the async transports.
+    """
+    httpx = httpx_module()
+
+    proxies = environment_proxies()
+    mounts: dict[str, Any] = {}
+    for pattern, url in proxies.items():
+        if url is None:
+            mounts[pattern] = None
+            continue
+        try:
+            mounts[pattern] = httpx.AsyncHTTPTransport(
+                proxy=url, socket_options=_socket_options())
+        except ImportError as error:
+            raise ProxyError(
+                'SOCKS proxy support is missing: install the project with its '
+                'SOCKS extra (pip install \"httpx2[socks]\") or remove the '
+                f'proxy from the environment. ({error})') from error
+    return httpx.AsyncClient(
+        transport=httpx.AsyncHTTPTransport(socket_options=_socket_options()),
+        mounts=mounts,
+        timeout=timeout,
+        follow_redirects=follow_redirects,
+    )
+
+
 def http_client() -> Any:
-    """A shared client for the urllib-style helpers."""
+    """A shared client for the urllib-style helpers.
+
+    The cache only covers the plain (no SOCKS) path: a SOCKS proxy is read
+    from the environment per call, and a client built before the variable
+    was set would silently bypass it for the life of the process.
+    """
+    if has_socks_proxy():
+        return build_http_client(timeout=60.0)
     global _http_client
     with _client_lock:
         if _http_client is None:
