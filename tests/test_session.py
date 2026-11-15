@@ -1,5 +1,6 @@
 from adcode.session import (
-    LAST_SESSION, SessionPayload, SessionStore, TranscriptItem,
+    DbSessionStore, LAST_SESSION, SessionPayload, SessionStore,
+    TranscriptItem,
 )
 
 
@@ -68,3 +69,72 @@ def test_transcript_item_roundtrip():
     clone = TranscriptItem.from_dict(item.to_dict())
     assert clone == item
     assert TranscriptItem.from_dict({'bad': True}) is None
+
+
+# ── the sqlite route ───────────────────────────────────────
+
+
+def _db(tmp_path):
+    return DbSessionStore(db_path=tmp_path / 'sessions' / 'adcode.db')
+
+
+def test_db_roundtrip_and_rows(tmp_path):
+    store = _db(tmp_path)
+    payload = SessionPayload(name='s', title='t', provider='P', model='m',
+                             messages=[
+                                 {'role': 'user', 'content': 'hi',
+                                  'reasoning_content': 'th'},
+                                 {'role': 'assistant', 'content': None,
+                                  'tool_calls': [{'id': 'c1', 'type': 'function',
+                                                  'function': {'name': 'edit',
+                                                               'arguments': '{}'}}]}],
+                             items=[TranscriptItem(kind='user', turn=1, text='hi')],
+                             turn=1, prefix_generation=4)
+    store.save(payload)
+    loaded = store.load('s')
+    assert loaded is not None and loaded.name == 's'
+    assert loaded.messages[0]['reasoning_content'] == 'th'
+    assert loaded.messages[1]['tool_calls'][0]['id'] == 'c1'
+    assert loaded.prefix_generation == 4
+    # a second save replaces the rows instead of appending
+    payload.messages = payload.messages[:1]
+    store.save(payload)
+    assert len(store.load('s').messages) == 1
+
+
+def test_db_names_listing_and_delete(tmp_path):
+    store = _db(tmp_path)
+    store.save(SessionPayload(name='alpha', messages=[
+        {'role': 'user', 'content': 'x'}]))
+    assert store.unique_name('alpha') == 'alpha_2'
+    assert [row['name'] for row in store.list()] == ['alpha']
+    assert store.delete('alpha') is True and store.delete('alpha') is False
+    assert store.list() == []
+
+
+def test_db_latest_checkpoint_semantics(tmp_path):
+    store = _db(tmp_path)
+    assert store.latest() is None
+    store.save(SessionPayload(name='old', messages=[
+        {'role': 'user', 'content': 'hi'}]), as_name='old')
+    assert store.latest().name == 'old'
+    store.save(SessionPayload(name=LAST_SESSION), as_name=LAST_SESSION)
+    assert store.latest() is None, 'a cleared checkpoint must not resurrect'
+    store.save(SessionPayload(name='next', messages=[
+        {'role': 'user', 'content': 'hi'}]), as_name='next')
+    store.save(SessionPayload(name='next', messages=[
+        {'role': 'user', 'content': 'hi'}]), as_name=LAST_SESSION)
+    # the checkpoint keeps the session's own name, like the json route
+    assert store.latest().name == 'next'
+
+
+def test_db_rewind_helpers(tmp_path):
+    payload = SessionPayload(name='s', messages=[
+        {'role': 'user', 'content': 'first'},
+        {'role': 'assistant', 'content': 'ok'},
+        {'role': 'user', 'content': 'second'},
+    ])
+    starts = DbSessionStore.turn_starts(payload.messages)
+    assert starts == [0, 2]
+    rewound = DbSessionStore.rewind(payload, 2)
+    assert [m['content'] for m in rewound.messages] == ['first', 'ok']

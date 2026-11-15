@@ -1,11 +1,13 @@
 # adcode/session.py
 # Session persistence, re-exported from the engine sdk.
 #
-# The sdk's transcript module carries the same payload format (version 2) and
-# the same store semantics: atomic JSON writes, the __last__ checkpoint,
-# rewind and fork helpers.  This shim keeps the historical import path stable.
+# Two routes share one payload format (version 2) and one set of helpers:
+# DbSessionStore persists the conversation thread in the sqlite database
+# (the default the app wires), SessionStore keeps the json-file route for
+# tooling.  This shim keeps the historical import path stable.
 
 from harness.transcript import (
+    DbSessionStore,
     LAST_SESSION,
     RESERVED_SESSION_NAMES,
     SESSION_VERSION,
@@ -17,7 +19,7 @@ from harness.transcript import (
 )
 
 __all__ = [
-    'LAST_SESSION', 'RESERVED_SESSION_NAMES', 'SESSION_VERSION',
-    'SessionPayload', 'SessionStore', 'TranscriptItem', 'group_turns',
-    'new_session_name',
+    'DbSessionStore', 'LAST_SESSION', 'RESERVED_SESSION_NAMES',
+    'SESSION_VERSION', 'SessionPayload', 'SessionStore', 'TranscriptItem',
+    'group_turns', 'new_session_name',
 ]

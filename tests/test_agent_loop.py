@@ -6,7 +6,7 @@ import pytest
 import adcode.agent_loop as agent_loop
 from adcode.agent_loop import AgentLoop
 from adcode.goals import GoalStore
-from adcode.session import SessionStore
+from adcode.session import DbSessionStore
 from adcode.skills import SkillRegistry
 from adcode.tools.registry import AnnotatedTool, ToolRegistry
 
@@ -80,7 +80,7 @@ def loop(config, tmp_path, monkeypatch):
         handler=lambda value: 'probe:' + str(value)))
     ScriptedClient.instances = []
     instance = AgentLoop(
-        config, registry, SessionStore(tmp_path / 'sessions'),
+        config, registry, DbSessionStore(db_path=tmp_path / 'sessions' / 'adcode.db'),
         GoalStore(tmp_path / 'goals.json'),
         SkillRegistry(config.skills, str(tmp_path)),
         emit=lambda kind, payload: None,
@@ -167,7 +167,7 @@ def test_compaction_trigger(config, tmp_path, monkeypatch):
     config.context.auto_compact = True
     config.context.compact_threshold = 5
     config.selected()[1].context_window = 2_000
-    loop = AgentLoop(config, ToolRegistry(), SessionStore(tmp_path / 's'),
+    loop = AgentLoop(config, ToolRegistry(), DbSessionStore(db_path=tmp_path / 'sessions' / 'adcode.db'),
                      GoalStore(tmp_path / 'g.json'),
                      SkillRegistry(config.skills, str(tmp_path)),
                      emit=lambda kind, payload: None)
@@ -191,7 +191,7 @@ def test_interrupt(config, tmp_path, monkeypatch):
             yield {'finish': 'stop'}
 
     monkeypatch.setattr(agent_loop, 'LLMClient', SlowClient)
-    loop = AgentLoop(config, ToolRegistry(), SessionStore(tmp_path / 's'),
+    loop = AgentLoop(config, ToolRegistry(), DbSessionStore(db_path=tmp_path / 'sessions' / 'adcode.db'),
                      GoalStore(tmp_path / 'g.json'),
                      SkillRegistry(config.skills, str(tmp_path)),
                      emit=lambda kind, payload: None)

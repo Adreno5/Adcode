@@ -23,7 +23,7 @@ from adcode.images import (
     read_clipboard_image, resolve_image,
 )
 from adcode.mcp.manager import get_mcp_manager
-from adcode.session import SessionStore, TranscriptItem
+from adcode.session import DbSessionStore, TranscriptItem
 from adcode.skills import SkillRegistry
 from adcode.theme import Palette, build_palette
 from adcode.tools.builtin import shutdown_shell_sessions
@@ -239,7 +239,8 @@ class AdCodeApp:
             input_thread if input_thread is not None
             else InputThread(self.input_queue))
         self.posted: 'queue.Queue[Callable[[], None]]' = queue.Queue()
-        self.session_store = SessionStore(os.path.join(self.cwd, 'sessions'))
+        self.session_store = DbSessionStore(
+            db_path=os.path.join(self.cwd, 'sessions', 'adcode.db'))
         self.images = ImageStore(os.path.join(self.cwd, 'sessions', 'images'),
                                  self.cwd)
         self.goals = GoalStore(os.path.join(self.cwd, 'sessions', 'goals.json'))

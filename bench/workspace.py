@@ -136,19 +136,18 @@ class Workspace:
     def project_path(self, relative: str) -> Path:
         return self.project / relative
 
+    def session_store(self):
+        from harness.transcript import DbSessionStore
+
+        return DbSessionStore(
+            db_path=self.project / 'sessions' / 'adcode.db')
+
     def session_payload(self, name: str = '__last__') -> dict[str, Any]:
-        path = self.project / 'sessions' / f'{name}.json'
-        try:
-            value = json.loads(path.read_text(encoding='utf-8-sig'))
-        except (OSError, ValueError):
-            return {}
-        return value if isinstance(value, dict) else {}
+        return self.session_store().load(name).to_json() \
+            if self.session_store().load(name) is not None else {}
 
     def session_files(self) -> list[str]:
-        directory = self.project / 'sessions'
-        if not directory.is_dir():
-            return []
-        return sorted(path.name for path in directory.glob('*.json'))
+        return sorted(row['name'] for row in self.session_store().list())
 
     # ── lifecycle ──────────────────────────────────────────
     def cleanup(self) -> None:

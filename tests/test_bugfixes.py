@@ -17,7 +17,7 @@ from adcode.goals import GoalStore
 from adcode.llm.client import LLMClient
 from adcode.llm.context import ConversationContext, StablePrefix
 from adcode.llm.usage import merge_usage, normalize_usage
-from adcode.session import SessionPayload, SessionStore, TranscriptItem
+from adcode.session import DbSessionStore, SessionPayload, SessionStore, TranscriptItem
 from adcode.skills import SkillRegistry
 from adcode.theme import build_palette
 from adcode.tools.registry import ToolRegistry
@@ -180,7 +180,8 @@ class _QuietClient:
 def _make_loop(config, tmp_path, monkeypatch):
     monkeypatch.setattr(agent_loop, 'LLMClient', _QuietClient)
     return AgentLoop(
-        config, ToolRegistry(), SessionStore(tmp_path / 'sessions'),
+        config, ToolRegistry(),
+        DbSessionStore(db_path=tmp_path / 'sessions' / 'adcode.db'),
         GoalStore(tmp_path / 'goals.json'),
         SkillRegistry(config.skills, str(tmp_path)),
         emit=lambda kind, payload: None, cwd=str(tmp_path),
