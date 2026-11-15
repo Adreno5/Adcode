@@ -32,11 +32,11 @@ import adcode.system_prompt as system_prompt_module
 import adcode.tui.app as app_module
 import adcode.tui.dialogs as dialogs_module
 from adcode.tui.app import AdCodeApp
-from harness.gateway import FakeLLMGateway
-from harness.input import ScriptedInput
-from harness.screen import FakeScreen, FrameSnapshot
-from harness.script import EchoResponder, ModelRequest, Responder
-from harness.workspace import DEFAULT_MODEL, Workspace, build_config
+from bench.gateway import FakeLLMGateway
+from bench.input import ScriptedInput
+from bench.screen import FakeScreen, FrameSnapshot
+from bench.script import EchoResponder, ModelRequest, Responder
+from bench.workspace import DEFAULT_MODEL, Workspace, build_config
 
 
 class HarnessError(RuntimeError):

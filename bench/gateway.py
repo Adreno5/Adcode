@@ -26,7 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Iterable
 from urllib.parse import urlsplit
 
-from harness.script import (
+from bench.script import (
     EchoResponder, ModelRequest, Responder, Turn,
 )
 
@@ -500,21 +500,41 @@ class FakeLLMGateway:
 
         created = self._response_object(model, [], 'in_progress')
         emit('response.created', response=created)
+        # The openai sdk's streaming helper validates the event sequence: a
+        # content delta must follow its output_item.added, mirroring the real
+        # api (reasoning item at index 0, message item at index 1, then the
+        # function calls).
+        emit('response.output_item.added',
+             item={'type': 'reasoning', 'id': 'rs_harness'}, output_index=0)
         for piece in self._chunks(turn.thinking, turn.chunk_size):
             emit('response.reasoning_text.delta', delta=piece,
                  item_id='rs_harness', output_index=0, content_index=0)
             self._paced(turn.chunk_delay)
         self._apply_gates(turn)
+        emit('response.output_item.added',
+             item={'type': 'message', 'id': 'msg_harness', 'content': []},
+             output_index=1)
+        emit('response.content_part.added',
+             item_id='msg_harness', output_index=1, content_index=0,
+             part={'type': 'output_text', 'text': ''})
         for piece in self._chunks(turn.text, turn.chunk_size):
             emit('response.output_text.delta', delta=piece,
-                 item_id='msg_harness', output_index=0, content_index=0,
+                 item_id='msg_harness', output_index=1, content_index=0,
                  logprobs=[])
             self._paced(turn.chunk_delay)
+        emit('response.content_part.done',
+             item_id='msg_harness', output_index=1, content_index=0,
+             part={'type': 'output_text', 'text': turn.text})
 
-        output: list[dict[str, Any]] = []
-        for index, (call, call_id) in enumerate(
+        output: list[dict[str, Any]] = [
+            {'type': 'reasoning', 'id': 'rs_harness'},
+            {'type': 'message', 'id': 'msg_harness',
+             'content': [{'type': 'output_text', 'text': turn.text}]},
+        ]
+        for offset, (call, call_id) in enumerate(
                 zip(turn.tool_calls, self._call_ids(turn))):
-            item_id = f'fc_harness_{index + 1}'
+            index = offset + 2
+            item_id = f'fc_harness_{offset + 1}'
             item = {
                 'type': 'function_call', 'id': item_id, 'call_id': call_id,
                 'name': call.name, 'arguments': '', 'status': 'in_progress',

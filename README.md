@@ -558,10 +558,10 @@ python -m pytest tests/test_simulation_chat.py tests/test_simulation_input.py \
 The manual toolkit produces screenshots and run data:
 
 ```bash
-python -m harness list                 # scenarios
-python -m harness run chat             # one scenario
-python -m harness run all              # every scenario
-python -m harness run commands --width 120 --height 40 --out out/
+python -m bench list                 # scenarios
+python -m bench run chat             # one scenario
+python -m bench run all              # every scenario
+python -m bench run commands --width 120 --height 40 --out out/
 ```
 
 Each run writes:

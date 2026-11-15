@@ -91,7 +91,17 @@ class ModelRequest:
         if self.wire == 'anthropic messages':
             raw = self.body.get('system')
         elif self.wire == 'openai responses':
-            raw = self.body.get('instructions')
+            # the api accepts both an instructions field and system-role
+            # input items; the sdk client uses the latter
+            raw = '\n'.join([
+                str(self.body.get('instructions') or ''),
+                *[' '.join(str(part.get('text') or '') for part in
+                           item.get('content') or [])
+                  if isinstance(item.get('content'), list)
+                  else str(item.get('content') or '')
+                  for item in self.body.get('input') or []
+                  if isinstance(item, dict) and item.get('role') == 'system'],
+            ]).strip()
         else:
             raw = '\n'.join(
                 str(message.get('content') or '')

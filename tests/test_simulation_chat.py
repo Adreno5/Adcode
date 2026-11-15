@@ -13,8 +13,8 @@ import threading
 import pytest
 
 from adcode import images
-from harness.script import ScriptedResponder, ToolCall, Turn
-from harness.workspace import GLOBAL_MARKER, PROJECT_MARKER
+from bench.script import ScriptedResponder, ToolCall, Turn
+from bench.workspace import GLOBAL_MARKER, PROJECT_MARKER
 
 WIRES = [
     'openai chat completions',

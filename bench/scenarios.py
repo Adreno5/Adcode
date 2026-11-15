@@ -2,7 +2,7 @@
 
 Run one with::
 
-    python -m harness run chat --out harness-out
+    python -m bench run chat --out harness-out
 
 Each scenario drives the real application (fake keyboard/mouse, fake local LLM
 gateway, temporary config) and captures labelled frames along the way.
@@ -14,8 +14,8 @@ import threading
 from dataclasses import dataclass
 from typing import Callable
 
-from harness.app import AppHarness
-from harness.script import ScriptedResponder, ToolCall, Turn
+from bench.app import AppHarness
+from bench.script import ScriptedResponder, ToolCall, Turn
 
 LONG_ANSWER = '\n'.join(
     f'{index + 1:02d}. streamed transcript row for scroll testing -- '
