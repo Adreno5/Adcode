@@ -1,5 +1,6 @@
 import struct
 import zlib
+from pathlib import Path
 
 import pytest
 
@@ -592,10 +593,11 @@ def test_view_image_stores_the_file_and_returns_a_marker(tmp_path):
     assert 'Loaded shot.png (4x6 image/png' in text
     match = images.MARKER_RE.search(text)
     assert match is not None
-    stored = tmp_path / match.group(1)
-    assert stored.exists()
+    # the store lives under the app state dir; markers resolve anywhere
+    stored = Path(match.group(1))
+    assert stored.is_absolute() and stored.exists()
     assert stored.read_bytes() == (tmp_path / 'shot.png').read_bytes()
-    assert match.group(1).startswith('sessions/images/')
+    assert '/.adcode/images/' in match.group(1)
 
 
 def test_view_image_deduplicates_the_same_bytes(tmp_path):

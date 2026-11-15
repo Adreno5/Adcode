@@ -16,7 +16,7 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from harness.agent.collab import (
     ACTIVE_STATES,
