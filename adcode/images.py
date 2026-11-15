@@ -221,24 +221,6 @@ def data_url(ref: ImageRef) -> str:
     return f'data:{ref.media_type};base64,{encoded}'
 
 
-def anthropic_source(ref: ImageRef, file_id: str = '') -> dict[str, object]:
-    """Anthropic image source.
-
-    A file uploaded to the Files API is referenced by id, so the request body
-    stays tiny.  Otherwise the SDK is handed the ``Path`` and reads and encodes
-    the bytes while serializing, so AdCode never holds base64 itself.
-    """
-    if ref.url:
-        return {'type': 'url', 'url': ref.url}
-    if file_id:
-        return {'type': 'file', 'file_id': file_id}
-    return {
-        'type': 'base64',
-        'media_type': ref.media_type,
-        'data': ref.path,
-    }
-
-
 class FileIdCache:
     """Provider-scoped file ids issued by a provider's Files API.
 

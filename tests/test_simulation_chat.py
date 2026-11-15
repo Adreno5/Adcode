@@ -13,8 +13,8 @@ import threading
 import pytest
 
 from adcode import images
-from harness.script import ScriptedResponder, ToolCall, Turn
-from harness.workspace import GLOBAL_MARKER, PROJECT_MARKER
+from bench.script import ScriptedResponder, ToolCall, Turn
+from bench.workspace import GLOBAL_MARKER, PROJECT_MARKER
 
 WIRES = [
     'openai chat completions',
@@ -60,7 +60,7 @@ def test_typed_message_streams_answer_and_persists(harness):
     assert {'read', 'write', 'edit', 'bash'}.issubset(set(request.tool_names))
 
     session = harness.workspace.session_payload()
-    assert session, 'the agent loop must persist the session in the temp cwd'
+    assert session, 'the agent loop must persist the session in the app state dir'
     assert session['messages'][0] == {'role': 'user', 'content': 'hi there'}
     assert any(message.get('role') == 'assistant'
                for message in session['messages'])

@@ -26,7 +26,7 @@ import legacy_canvas  # noqa: E402
 
 from adcode.theme import build_palette  # noqa: E402
 from adcode.tui import canvas as current  # noqa: E402
-from harness.vt import VirtualScreen  # noqa: E402
+from bench.vt import VirtualScreen  # noqa: E402
 
 
 class LegacyCanvas(legacy_canvas.Canvas):

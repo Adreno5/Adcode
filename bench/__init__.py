@@ -2,23 +2,23 @@
 
 Public surface:
 
-* :class:`~harness.app.AppHarness` -- the real app on a thread, with fake
+* :class:`~bench.app.AppHarness` -- the real app on a thread, with fake
   terminal screen/input and a temporary config/workspace.
-* :class:`~harness.gateway.FakeLLMGateway` -- a real local HTTP provider
+* :class:`~bench.gateway.FakeLLMGateway` -- a real local HTTP provider
   speaking the OpenAI Chat Completions, OpenAI Responses and Anthropic Messages
   wire protocols.
-* :class:`~harness.script.Turn` / ``ToolCall`` / responders -- the model script.
-* :class:`~harness.artifacts.ArtifactWriter` -- screenshots and run data.
+* :class:`~bench.script.Turn` / ``ToolCall`` / responders -- the model script.
+* :class:`~bench.artifacts.ArtifactWriter` -- screenshots and run data.
 
-Run ``python -m harness list`` or ``python -m harness run chat`` for the
+Run ``python -m bench list`` or ``python -m bench run chat`` for the
 manual, screenshot-producing scenarios.
 """
 
-from harness.app import AppHarness, HarnessError
-from harness.artifacts import ArtifactWriter
-from harness.gateway import FakeGateway, FakeLLMGateway
-from harness.screen import FakeScreen, FrameSnapshot
-from harness.script import (
+from bench.app import AppHarness, HarnessError
+from bench.artifacts import ArtifactWriter
+from bench.gateway import FakeGateway, FakeLLMGateway
+from bench.screen import FakeScreen, FrameSnapshot
+from bench.script import (
     CallbackResponder, EchoResponder, ModelRequest, ScriptedResponder,
     ToolCall, Turn, TurnUsage,
 )

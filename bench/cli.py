@@ -8,15 +8,15 @@ import time
 import traceback
 from pathlib import Path
 
-from harness.app import AppHarness, HarnessError
-from harness.artifacts import ArtifactWriter
-from harness.script import EchoResponder
-from harness.scenarios import SCENARIOS, list_scenarios
+from bench.app import AppHarness, HarnessError
+from bench.artifacts import ArtifactWriter
+from bench.script import EchoResponder
+from bench.scenarios import SCENARIOS, list_scenarios
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog='python -m harness',
+        prog='python -m bench',
         description='Run AdCode against a fake local LLM gateway and capture '
                     'screenshots of the real UI.')
     sub = parser.add_subparsers(dest='command', required=True)

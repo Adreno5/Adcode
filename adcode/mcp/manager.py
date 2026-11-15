@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
 from adcode.mcp.client import MCPClient, MCPError, build_transport
-from adcode.tools.registry import ToolRegistry, ToolSpec
+from adcode.tools.registry import AnnotatedTool, ToolRegistry
 
 StatusCallback = Callable[[str, str, str], None]
 
@@ -163,7 +163,6 @@ class MCPManager:
         with self._lock:
             self.registry.unregister_source_prefix('mcp:')
             self._tool_map.clear()
-            specs: list[ToolSpec] = []
             for server_name, client in self.clients.items():
                 used: set[str] = set()
                 for tool in client.tools:
@@ -180,23 +179,25 @@ class MCPManager:
                         full_name += '_'
                     self._tool_map[full_name] = (server_name, original)
 
-                    def handler(args: dict[str, Any], _server: str = server_name,
-                                _tool: str = original) -> str:
+                    def handler(_server: str = server_name,
+                                _tool: str = original, **params: Any) -> str:
                         client = self.clients.get(_server)
                         if client is None:
                             return f'Error: MCP server {_server} is not connected'
-                        return client.call_tool(_tool, args)
+                        return client.call_tool(_tool, params)
 
                     description = str(tool.get('description') or '')
-                    specs.append(ToolSpec(
-                        name=full_name,
-                        description=f'[{server_name}] {description}',
-                        parameters=tool.get('input_schema') or {
-                            'type': 'object', 'properties': {}},
-                        handler=handler,
+                    self.registry.register(
+                        AnnotatedTool(
+                            name=full_name,
+                            description=f'[{server_name}] {description}',
+                            parameters=tool.get('input_schema') or {
+                                'type': 'object', 'properties': {}},
+                            handler=handler,
+                        ),
+                        replace=True,
                         source=f'mcp:{server_name}',
-                    ))
-            self.registry.register_many(specs)
+                    )
 
     # ── invocation ──────────────────────────────────────────
     def execute(self, full_name: str, arguments: dict[str, Any]) -> str:

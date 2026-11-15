@@ -20,8 +20,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'benchmarks'))
 
 import adcode.tui.app as app_module  # noqa: E402
-from harness.app import AppHarness  # noqa: E402
-from harness.script import ScriptedResponder, Turn  # noqa: E402
+from bench.app import AppHarness  # noqa: E402
+from bench.script import ScriptedResponder, Turn  # noqa: E402
 import legacy_canvas  # noqa: E402
 
 

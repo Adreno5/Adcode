@@ -7,11 +7,11 @@ import queue
 
 import pytest
 
-from harness.artifacts import ArtifactWriter
-from harness.cli import main as cli_main
-from harness.input import ScriptedInput, key_sequence, mouse_sequence
-from harness.screenshots import render_png, svg_from_payload
-from harness.vt import VirtualScreen
+from bench.artifacts import ArtifactWriter
+from bench.cli import main as cli_main
+from bench.input import ScriptedInput, key_sequence, mouse_sequence
+from bench.screenshots import render_png, svg_from_payload
+from bench.vt import VirtualScreen
 
 
 def drain(events: 'queue.Queue') -> list:
@@ -103,8 +103,8 @@ def test_png_renderer_reports_missing_pillow(monkeypatch, tmp_path):
     def missing(*args, **kwargs):
         raise ImportError('no pillow')
 
-    monkeypatch.setattr('harness.screenshots.png_from_payload', missing)
-    monkeypatch.setattr('harness.screenshots.find_raster_python',
+    monkeypatch.setattr('bench.screenshots.png_from_payload', missing)
+    monkeypatch.setattr('bench.screenshots.find_raster_python',
                         lambda explicit=None: None)
     dump = tmp_path / 'frame.json'
     dump.write_text(json.dumps({'width': 1, 'height': 1, 'rows': [

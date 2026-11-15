@@ -14,10 +14,10 @@ from adcode.config import (
     AppConfig, ConfigStore, ModelConfig, ProviderConfig, config_from_dict,
 )
 from adcode.goals import GoalStore
-from adcode.llm.client import LLMClient, _retry_generator
+from adcode.llm.client import LLMClient
 from adcode.llm.context import ConversationContext, StablePrefix
 from adcode.llm.usage import merge_usage, normalize_usage
-from adcode.session import SessionPayload, SessionStore, TranscriptItem
+from adcode.session import DbSessionStore, SessionPayload, SessionStore, TranscriptItem
 from adcode.skills import SkillRegistry
 from adcode.theme import build_palette
 from adcode.tools.registry import ToolRegistry
@@ -62,51 +62,10 @@ def test_merge_usage_keeps_split_reports():
     assert merged['cache_hit_rate'] == pytest.approx(0.4)
 
 
-# ── retry policy ───────────────────────────────────────────
-def test_retry_does_not_replay_emitted_events(monkeypatch):
-    import openai
-
-    class FakeAPIError(Exception):
-        status_code = 500
-
-    monkeypatch.setattr(openai, 'APIError', FakeAPIError)
-    calls = {'n': 0}
-
-    def factory():
-        calls['n'] += 1
-        yield {'kind': 'text', 'content': 'partial '}
-        raise FakeAPIError('stream died')
-
-    stream = _retry_generator(factory)
-    assert next(stream) == {'kind': 'text', 'content': 'partial '}
-    with pytest.raises(FakeAPIError):
-        next(stream)
-    assert calls['n'] == 1
-
-
-def test_retry_happens_before_the_first_event(monkeypatch):
-    import openai
-
-    class FakeAPIError(Exception):
-        status_code = 500
-
-    monkeypatch.setattr(openai, 'APIError', FakeAPIError)
-    calls = {'n': 0}
-
-    def factory():
-        calls['n'] += 1
-        if calls['n'] == 1:
-            raise FakeAPIError('busy')
-        yield {'kind': 'text', 'content': 'ok'}
-
-    events = list(_retry_generator(factory))
-    assert calls['n'] == 2
-    assert events[-1] == {'kind': 'text', 'content': 'ok'}
-    assert events[0]['kind'] == 'retry'
-
-
 # ── anthropic message shaping ──────────────────────────────
 def test_anthropic_messages_stay_alternating():
+    from infra.orchestrator.anthropic import AnthropicCompatClient
+
     messages = [
         {'role': 'user', 'content': 'first'},
         {'role': 'assistant', 'content': None,
@@ -118,7 +77,9 @@ def test_anthropic_messages_stay_alternating():
         {'role': 'assistant', 'content': ''},
         {'role': 'user', 'content': 'second'},
     ]
-    converted = LLMClient._to_anthropic_msgs(messages)
+    _, converted = AnthropicCompatClient._split_system(messages)
+    # consecutive same-role entries merge: the tool result and the injected
+    # subagent block land in ONE user message, tool_result blocks first
     assert [message['role'] for message in converted] == [
         'user', 'assistant', 'user']
     last = converted[2]['content']
@@ -204,18 +165,23 @@ def test_compaction_keeps_retained_user_turn_addressable():
 
 
 class _QuietClient:
-    def __init__(self, provider):
-        pass
+    def __init__(self, provider, model=None, *, base_dir='', file_cache=None,
+                 warn=None):
+        self.provider = provider
 
-    def chat(self, messages, model, **kwargs):
-        yield {'kind': 'text', 'content': 'ok'}
-        yield {'kind': 'finish', 'reason': 'stop'}
+    async def stream(self, messages, tools=None, **kwargs):
+        yield 'ok'
+        yield {'finish': 'stop'}
+
+    def invoke(self, messages, tools=None, **kwargs):
+        raise NotImplementedError
 
 
 def _make_loop(config, tmp_path, monkeypatch):
     monkeypatch.setattr(agent_loop, 'LLMClient', _QuietClient)
     return AgentLoop(
-        config, ToolRegistry(), SessionStore(tmp_path / 'sessions'),
+        config, ToolRegistry(),
+        DbSessionStore(db_path=tmp_path / 'sessions' / 'adcode.db'),
         GoalStore(tmp_path / 'goals.json'),
         SkillRegistry(config.skills, str(tmp_path)),
         emit=lambda kind, payload: None, cwd=str(tmp_path),
@@ -224,6 +190,14 @@ def _make_loop(config, tmp_path, monkeypatch):
 
 def test_rewind_aligns_after_compaction(config, tmp_path, monkeypatch):
     loop = _make_loop(config, tmp_path, monkeypatch)
+    loop.start()
+    try:
+        _rewind_after_compaction(loop)
+    finally:
+        loop.shutdown()
+
+
+def _rewind_after_compaction(loop):
     loop.context.committed[:] = [
         {'role': 'user',
          'content': '<conversation_summary>old</conversation_summary>'},
@@ -232,9 +206,9 @@ def test_rewind_aligns_after_compaction(config, tmp_path, monkeypatch):
         {'role': 'user', 'content': 'question six'},
         {'role': 'assistant', 'content': 'answer six'},
     ]
-    loop.items = [TranscriptItem(kind='user', turn=turn, text=f'q{turn}')
-                  for turn in range(1, 7)]
-    loop.turn = 6
+    loop.items[:] = [TranscriptItem(kind='user', turn=turn, text=f'q{turn}')
+                     for turn in range(1, 7)]
+    loop._engine.turn = 6
     assert loop.rewind(5) == 'question five'
     assert [message['content'] for message in loop.context.committed] == [
         '<conversation_summary>old</conversation_summary>']
@@ -243,34 +217,39 @@ def test_rewind_aligns_after_compaction(config, tmp_path, monkeypatch):
 
 def test_system_prompt_tracks_goal_changes(config, tmp_path, monkeypatch):
     loop = _make_loop(config, tmp_path, monkeypatch)
-    assert '<active_goal>' not in loop.context.stable_prefix.system
-    loop.goals.create('ship it')
-    loop._refresh_system_and_prefix(force=True)
-    assert '<active_goal>' in loop.context.stable_prefix.system
-    assert loop.context.stable_prefix.system == loop.system
+    loop.start()
+    try:
+        assert '<active_goal>' not in loop._system_provider()
+        loop.goals.create('ship it')
+        assert '<active_goal>' in loop._system_provider()
+    finally:
+        loop.shutdown()
 
 
 # ── tools ──────────────────────────────────────────────────
 def test_tool_paths_resolve_against_the_tool_cwd(tmp_path):
+    from adcode.tools.builtin import install_coding_tools
+
     registry = ToolRegistry()
+    install_coding_tools(registry)
     context = ToolContext(cwd=str(tmp_path))
     token = push_context(context)
     try:
         result = registry.execute('write', {'path': 'nested/file.txt',
                                             'content': 'data\n'})
-        assert not result.error
+        assert not result[2]
         assert (tmp_path / 'nested' / 'file.txt').read_text() == 'data\n'
-        listing = registry.execute('ls', {'path': '.'}).text
+        listing = registry.execute('ls', {'path': '.'})[0]
         assert 'nested/' in listing
-        read_back = registry.execute('read', {'path': 'nested/file.txt'}).text
+        read_back = registry.execute('read', {'path': 'nested/file.txt'})[0]
         assert 'data' in read_back
         edited = registry.execute('edit', {'path': 'nested/file.txt',
                                            'old': 'data', 'new': 'more'})
-        assert 'Replaced' in edited.text
+        assert 'Replaced' in edited[0]
         # The diff must describe the file in the tool cwd, not a same-named
         # relative path in the process cwd.
-        assert edited.file_diff is not None
-        assert 'more' in edited.file_diff.unified
+        assert edited[1] is not None
+        assert 'more' in edited[1].unified
     finally:
         pop_context(token)
 

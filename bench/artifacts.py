@@ -28,8 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from harness.screen import FrameSnapshot
-from harness.screenshots import render_png, svg_from_payload
+from bench.screen import FrameSnapshot
+from bench.screenshots import render_png, svg_from_payload
 
 _SLUG = re.compile(r'[^A-Za-z0-9_.-]+')
 

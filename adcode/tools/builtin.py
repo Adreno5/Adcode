@@ -1,27 +1,30 @@
-"""Built-in coding tools: files, search, shell, HTTP and diffs."""
+# adcode/tools/builtin.py
+# The built-in tool suite: files, search, shell, HTTP and diffs.
+#
+# Built on the engine sdk's mechanisms (harness.tools.shell sessions,
+# harness.tools.context per-turn context, harness.images markers, infra.net
+# proxy-aware HTTP, ManagedToolRegistry snapshot-diff execution).  Handlers
+# keep the "Error: ..." text convention: failures are model-facing text the
+# model recovers from, not exceptions.
 
 from __future__ import annotations
 
-import ctypes
 import fnmatch
 import glob as glob_module
-import locale
 import os
 import re
 import subprocess
-import threading
-import time
 import urllib.error
 import urllib.request
-import weakref
-from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
-from adcode import net
-from adcode.images import (
+from harness.images import (
     MAX_IMAGE_BYTES, ImageStore, image_info, image_marker, sniff_media_type,
 )
-from adcode.tools.runtime import current_context, resolve_path
+from harness.tools.context import current_context, resolve_path
+from harness.tools.registry import AnnotatedTool
+from harness.tools.shell import ShellSessions, session_shell_tool
+from infra import net
 
 _GREP_SKIP_DIRS = frozenset({
     '.git', '.hg', '.svn', 'node_modules', '__pycache__', '.venv', 'venv',
@@ -31,8 +34,20 @@ _GREP_SKIP_DIRS = frozenset({
 })
 _GREP_MAX_FILE = 10 * 1024 * 1024
 _GREP_MAX_RESULTS = 200
-_MAX_OUTPUT_LINES = 5_000
 _rg_path: str | None | bool = False
+
+# the shell owner installed by install_coding_tools; shutdown_shell_sessions
+# reaps it (and anything else registered here) at engine shutdown
+_SHELL_OWNERS: list[ShellSessions] = []
+
+
+def _dict_handler(func: Callable[[dict[str, Any]], str]) -> Callable[..., str]:
+    """Adapt an args-dict handler to the sdk Tool handler(**params) shape."""
+    def wrapper(**kwargs):
+        return func(kwargs)
+    wrapper.__name__ = func.__name__
+    wrapper.__doc__ = func.__doc__
+    return wrapper
 
 
 def _base_dir() -> str:
@@ -41,7 +56,6 @@ def _base_dir() -> str:
 
 
 def _resolve(path: str) -> str:
-    """Resolve a tool path against the tool context's working directory."""
     return resolve_path(path)
 
 
@@ -255,242 +269,6 @@ def _grep(args: dict[str, Any]) -> str:
     return _grep_python(args)
 
 
-# ── persistent shell sessions ──────────────────────────────
-
-@dataclass(eq=False)
-class _BashSession:
-    proc: subprocess.Popen[bytes] | None = None
-    output: list[str] = field(default_factory=list)
-    read_pos: int = 0
-    workdir: str = '.'
-    reader: threading.Thread | None = None
-
-
-_bash_local = threading.local()
-_bash_sessions: weakref.WeakSet[_BashSession] = weakref.WeakSet()
-_bash_sessions_lock = threading.RLock()
-
-
-def _bash_session() -> _BashSession:
-    session = getattr(_bash_local, 'session', None)
-    if session is None:
-        session = _BashSession()
-        _bash_local.session = session
-        with _bash_sessions_lock:
-            _bash_sessions.add(session)
-    return session
-
-
-def _console_output_codepage() -> str:
-    if os.name != 'nt':
-        return ''
-    try:
-        code_page = ctypes.windll.kernel32.GetConsoleOutputCP()
-        return f'cp{code_page}' if code_page else ''
-    except Exception:
-        return ''
-
-
-def _decode_output(data: bytes) -> str:
-    if data.startswith(b'\xef\xbb\xbf'):
-        data = data[3:]
-    try:
-        return data.decode('utf-8')
-    except UnicodeDecodeError:
-        encoding = _console_output_codepage() or locale.getpreferredencoding(False) or 'utf-8'
-        return data.decode(encoding, errors='replace')
-
-
-def _close_process_pipes(proc: subprocess.Popen[bytes]) -> None:
-    for pipe in (proc.stdin, proc.stdout, proc.stderr):
-        if pipe is not None and not pipe.closed:
-            try:
-                pipe.close()
-            except OSError:
-                pass
-
-
-def _kill_tree(proc: subprocess.Popen[bytes]) -> None:
-    """Kill the shell and every child it spawned (shell=True on Windows)."""
-    if os.name == 'nt':
-        try:
-            subprocess.run(
-                ['taskkill', '/F', '/T', '/PID', str(proc.pid)],
-                capture_output=True, timeout=5,
-            )
-            return
-        except Exception:
-            pass
-    else:
-        try:
-            import signal
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            return
-        except Exception:
-            pass
-    try:
-        proc.kill()
-    except Exception:
-        pass
-
-
-def _bash_kill(session: _BashSession | None = None) -> None:
-    active = session or _bash_session()
-    reader = active.reader
-    active.reader = None
-    if active.proc:
-        proc = active.proc
-        _kill_tree(proc)
-        try:
-            proc.wait(timeout=3)
-        except Exception:
-            pass
-        _close_process_pipes(proc)
-        active.proc = None
-    if reader is not None and reader is not threading.current_thread():
-        # Reap the old reader before the next command reuses the buffer, so a
-        # killed process cannot append stale lines to the new output.
-        reader.join(timeout=1)
-
-
-def shutdown_shell_sessions() -> None:
-    with _bash_sessions_lock:
-        sessions = list(_bash_sessions)
-    for session in sessions:
-        _bash_kill(session)
-
-
-def _bash_execute(args: dict[str, Any]) -> str:
-    session = _bash_session()
-    _bash_kill(session)
-    command = str(args['command'])
-    session.workdir = _resolve(str(args.get('workdir', '') or '.'))
-    try:
-        timeout = float(args.get('timeout', 48))
-    except (TypeError, ValueError):
-        timeout = 48.0
-    session.output = []
-    session.read_pos = 0
-    context = current_context()
-    live_sink = context.live_sink
-    try:
-        session.proc = subprocess.Popen(
-            command, shell=True, cwd=session.workdir,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env={**os.environ, 'PYTHONUTF8': '1', 'PYTHONIOENCODING': 'utf-8'},
-            start_new_session=(os.name != 'nt'),
-        )
-    except Exception as error:
-        session.proc = None
-        return f'Error: {error}'
-    proc = session.proc
-
-    def reader() -> None:
-        assert proc.stdout is not None
-        for line in iter(proc.stdout.readline, b''):
-            try:
-                decoded = _decode_output(line).rstrip('\r\n')
-                session.output.append(decoded)
-                if len(session.output) > _MAX_OUTPUT_LINES:
-                    drop = len(session.output) - _MAX_OUTPUT_LINES
-                    del session.output[:drop]
-                    session.read_pos = max(0, session.read_pos - drop)
-                # The sink is captured in this thread's closure: contextvars do
-                # not propagate to new threads automatically.
-                if live_sink is not None:
-                    live_sink(decoded)
-            except Exception:
-                pass
-
-    thread = threading.Thread(target=reader, daemon=True)
-    session.reader = thread
-    thread.start()
-    interrupted = False
-    timed_out = False
-    deadline = time.monotonic() + max(0.1, timeout)
-    while True:
-        try:
-            proc.wait(timeout=0.1)
-            break
-        except subprocess.TimeoutExpired:
-            if context.interrupt.is_set():
-                interrupted = True
-                break
-            if time.monotonic() >= deadline:
-                timed_out = True
-                break
-    if interrupted or timed_out:
-        _kill_tree(proc)
-        # Reap the dead process before reporting: otherwise the pipes stay open
-        # and every later read claims the command is still running.
-        try:
-            proc.wait(timeout=2)
-        except Exception:
-            pass
-    thread.join(timeout=1)
-    if timed_out:
-        session.output.append(
-            '<bash_tool_metadata>command execution timed out</bash_tool_metadata>')
-    if interrupted:
-        session.output.append('<bash_tool_metadata>command interrupted</bash_tool_metadata>')
-    if proc.poll() is not None:
-        _close_process_pipes(proc)
-        if session.proc is proc:
-            session.proc = None
-    if session.reader is thread:
-        session.reader = None
-    return _bash_read(args)
-
-
-def _bash_read(args: dict[str, Any]) -> str:
-    session = _bash_session()
-    new_lines = session.output[session.read_pos:]
-    session.read_pos = len(session.output)
-    if not new_lines:
-        if session.proc and session.proc.poll() is None:
-            return '(process still running, no new output)'
-        return '(no output)'
-    return '\n'.join(new_lines)
-
-
-def _bash_write(args: dict[str, Any]) -> str:
-    session = _bash_session()
-    if not session.proc or session.proc.stdin is None:
-        return 'Error: no running process'
-    text = str(args['input'])
-    try:
-        session.proc.stdin.write((text + '\n').encode('utf-8'))
-        session.proc.stdin.flush()
-        return f'Wrote {len(text)} bytes to stdin'
-    except Exception as error:
-        return f'Error writing to stdin: {error}'
-
-
-def _bash_terminate(args: dict[str, Any]) -> str:
-    session = _bash_session()
-    if not session.proc:
-        return '(no running process)'
-    _bash_kill(session)
-    return 'Process terminated'
-
-
-_BASH_SUBS = {
-    'execute': _bash_execute,
-    'read': _bash_read,
-    'write': _bash_write,
-    'terminate': _bash_terminate,
-}
-
-
-def _bash(args: dict[str, Any]) -> str:
-    sub = str(args.get('sub', 'execute'))
-    function = _BASH_SUBS.get(sub)
-    if function is None:
-        return f'Error: unknown bash sub-command: {sub}'
-    return function(args)
-
-
 def _fetch(args: dict[str, Any]) -> str:
     url = str(args['url'])
     method = str(args.get('method', 'GET')).upper()
@@ -522,10 +300,9 @@ def _fetch(args: dict[str, Any]) -> str:
 def _view_image(args: dict[str, Any]) -> str:
     """Copy an image into the session store and hand it to the model.
 
-    The returned marker is expanded into a native image part by the wire
-    adapter, so the picture reaches the model without any base64 in the stored
-    conversation.  Sub-agents share this tool, which is why the file lives in
-    the workspace rather than in a per-process cache.
+    The returned marker is expanded into a native image part while the next
+    request is built, so the picture reaches the model without any base64 in
+    the stored conversation.
     """
     raw_path = str(args.get('path') or '').strip().strip('"\'')
     if not raw_path:
@@ -547,7 +324,10 @@ def _view_image(args: dict[str, Any]) -> str:
     if media_type is None:
         return (f'Error: not a supported image: {raw_path} '
                 f'(png, jpeg, gif or webp)')
-    store = ImageStore(os.path.join(_base_dir(), 'sessions', 'images'), _base_dir())
+    # images live under the app state dir, never in the project
+    from adcode.paths import images_dir
+
+    store = ImageStore(str(images_dir()), _base_dir())
     try:
         reference = store.save(data)
     except (ValueError, OSError) as error:
@@ -560,7 +340,7 @@ def _view_image(args: dict[str, Any]) -> str:
 
 
 def _diff(args: dict[str, Any]) -> str:
-    from adcode.diff import git_worktree_diff
+    from harness.filediff import git_worktree_diff
     file_diff = git_worktree_diff(_base_dir(), str(args.get('path', '') or ''))
     if file_diff is None:
         return '(no working-tree changes)'
@@ -584,13 +364,22 @@ def _ls(args: dict[str, Any]) -> str:
     return '\n'.join(lines)
 
 
-def builtin_tools() -> list[dict[str, Any]]:
+def coding_tools(*, shell: ShellSessions | None = None) -> list[AnnotatedTool]:
+    """The ten built-in tools as sdk AnnotatedTool objects.
+
+    Args:
+        shell: a shared ShellSessions owner; a module default is created and
+            tracked when omitted, so shutdown_shell_sessions can reap it.
+    """
+    if shell is None:
+        shell = ShellSessions(metadata_tag='bash_tool_metadata')
+        _SHELL_OWNERS.append(shell)
     return [
-        {
-            'name': 'read',
-            'description': ('Read a file from the filesystem. Returns content with line numbers. '
-                            'Use offset/limit for large files.'),
-            'parameters': {
+        AnnotatedTool(
+            name='read', read_only=True,
+            description=('Read a file from the filesystem. Returns content with line '
+                         'numbers. Use offset/limit for large files.'),
+            parameters={
                 'type': 'object',
                 'properties': {
                     'path': {'type': 'string', 'description': 'File path to read'},
@@ -599,16 +388,15 @@ def builtin_tools() -> list[dict[str, Any]]:
                 },
                 'required': ['path'],
             },
-            'func': _read,
-            'read_only': True,
-        },
-        {
-            'name': 'view_image',
-            'description': ('Look at an image file yourself: a screenshot, a diagram, '
-                            'a photo. The picture is attached to the conversation so '
-                            'you can describe or reason about it. Supports png, jpeg, '
-                            'gif and webp up to 5 MB, plus http(s) image URLs.'),
-            'parameters': {
+            handler=_dict_handler(_read),
+        ),
+        AnnotatedTool(
+            name='view_image', read_only=True, vision_only=True,
+            description=('Look at an image file yourself: a screenshot, a diagram, '
+                         'a photo. The picture is attached to the conversation so '
+                         'you can describe or reason about it. Supports png, jpeg, '
+                         'gif and webp up to 5 MB, plus http(s) image URLs.'),
+            parameters={
                 'type': 'object',
                 'properties': {
                     'path': {'type': 'string',
@@ -616,14 +404,12 @@ def builtin_tools() -> list[dict[str, Any]]:
                 },
                 'required': ['path'],
             },
-            'func': _view_image,
-            'read_only': True,
-            'vision_only': True,
-        },
-        {
-            'name': 'write',
-            'description': 'Create or overwrite a file with the given content.',
-            'parameters': {
+            handler=_dict_handler(_view_image),
+        ),
+        AnnotatedTool(
+            name='write', snapshot=True,
+            description='Create or overwrite a file with the given content.',
+            parameters={
                 'type': 'object',
                 'properties': {
                     'path': {'type': 'string', 'description': 'File path to write'},
@@ -631,13 +417,13 @@ def builtin_tools() -> list[dict[str, Any]]:
                 },
                 'required': ['path', 'content'],
             },
-            'func': _write,
-        },
-        {
-            'name': 'edit',
-            'description': ('Replace an exact string in a file. The old string must appear '
-                            'exactly once in the file.'),
-            'parameters': {
+            handler=_dict_handler(_write),
+        ),
+        AnnotatedTool(
+            name='edit', snapshot=True,
+            description=('Replace an exact string in a file. The old string must appear '
+                         'exactly once in the file.'),
+            parameters={
                 'type': 'object',
                 'properties': {
                     'path': {'type': 'string'},
@@ -646,25 +432,24 @@ def builtin_tools() -> list[dict[str, Any]]:
                 },
                 'required': ['path', 'old', 'new'],
             },
-            'func': _edit,
-        },
-        {
-            'name': 'glob',
-            'description': 'Find files matching a glob pattern. Supports ** recursion.',
-            'parameters': {
+            handler=_dict_handler(_edit),
+        ),
+        AnnotatedTool(
+            name='glob', read_only=True,
+            description='Find files matching a glob pattern. Supports ** recursion.',
+            parameters={
                 'type': 'object',
                 'properties': {
                     'pattern': {'type': 'string', 'description': 'e.g. "src/**/*.py"'},
                 },
                 'required': ['pattern'],
             },
-            'func': _glob,
-            'read_only': True,
-        },
-        {
-            'name': 'grep',
-            'description': 'Search file contents with a regular expression.',
-            'parameters': {
+            handler=_dict_handler(_glob),
+        ),
+        AnnotatedTool(
+            name='grep', read_only=True,
+            description='Search file contents with a regular expression.',
+            parameters={
                 'type': 'object',
                 'properties': {
                     'pattern': {'type': 'string', 'description': 'Regex to search for'},
@@ -672,39 +457,14 @@ def builtin_tools() -> list[dict[str, Any]]:
                 },
                 'required': ['pattern'],
             },
-            'func': _grep,
-            'read_only': True,
-        },
-        {
-            'name': 'bash',
-            'description': (
-                'Persistent shell session with sub-commands:\n'
-                + ('- Platform: Windows cmd.exe. Use cd/dir, or invoke powershell '
-                   '-NoProfile -Command explicitly; do not use Unix pwd/ls.\n'
-                   if os.name == 'nt' else '- Platform: POSIX shell.\n')
-                + '- execute: run a command (kills the previous one). Default timeout 48s; '
-                  'a timeout is reported with <bash_tool_metadata>.\n'
-                + '- read: incremental output since the last read.\n'
-                + '- write: send input to stdin (a newline is appended).\n'
-                + '- terminate: kill the running process.'
-            ),
-            'parameters': {
-                'type': 'object',
-                'properties': {
-                    'sub': {'type': 'string', 'enum': ['execute', 'read', 'write', 'terminate']},
-                    'command': {'type': 'string', 'description': 'Shell command (execute)'},
-                    'workdir': {'type': 'string', 'description': 'Working directory (execute)'},
-                    'timeout': {'type': 'integer', 'description': 'Timeout seconds (execute)'},
-                    'input': {'type': 'string', 'description': 'Stdin text (write)'},
-                },
-                'required': ['sub'],
-            },
-            'func': _bash,
-        },
-        {
-            'name': 'fetch',
-            'description': 'Make an HTTP request and return the status and body.',
-            'parameters': {
+            handler=_dict_handler(_grep),
+        ),
+        session_shell_tool(name='bash', sessions=shell,
+                           metadata_tag='bash_tool_metadata'),
+        AnnotatedTool(
+            name='fetch', read_only=True,
+            description='Make an HTTP request and return the status and body.',
+            parameters={
                 'type': 'object',
                 'properties': {
                     'url': {'type': 'string'},
@@ -714,29 +474,43 @@ def builtin_tools() -> list[dict[str, Any]]:
                 },
                 'required': ['url'],
             },
-            'func': _fetch,
-            'read_only': True,
-        },
-        {
-            'name': 'diff',
-            'description': 'Show the current Git working-tree diff, optionally for one path.',
-            'parameters': {
+            handler=_dict_handler(_fetch),
+        ),
+        AnnotatedTool(
+            name='diff', read_only=True,
+            description='Show the current Git working-tree diff, optionally for one path.',
+            parameters={
                 'type': 'object',
                 'properties': {'path': {'type': 'string', 'description': 'Optional path'}},
                 'required': [],
             },
-            'func': _diff,
-            'read_only': True,
-        },
-        {
-            'name': 'ls',
-            'description': 'List directory entries.',
-            'parameters': {
+            handler=_dict_handler(_diff),
+        ),
+        AnnotatedTool(
+            name='ls', read_only=True,
+            description='List directory entries.',
+            parameters={
                 'type': 'object',
-                'properties': {'path': {'type': 'string', 'description': 'Directory (default .)'}},
+                'properties': {'path': {'type': 'string',
+                                        'description': 'Directory (default .)'}},
                 'required': [],
             },
-            'func': _ls,
-            'read_only': True,
-        },
+            handler=_dict_handler(_ls),
+        ),
     ]
+
+
+def install_coding_tools(registry, *, shell: ShellSessions | None = None) -> list[str]:
+    """Register the suite on a ManagedToolRegistry and return the names."""
+    installed = []
+    for tool in coding_tools(shell=shell):
+        registry.register(tool, replace=True, source='builtin')
+        installed.append(tool.name)
+    return installed
+
+
+def shutdown_shell_sessions() -> None:
+    """Kill every live shell session; called once at engine shutdown."""
+    for sessions in _SHELL_OWNERS:
+        sessions.shutdown()
+    _SHELL_OWNERS.clear()

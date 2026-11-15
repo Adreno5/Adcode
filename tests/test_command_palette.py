@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 
-from harness.app import AppHarness
+from bench.app import AppHarness
 
 
 def test_ctrl_p_opens_the_command_palette(harness):

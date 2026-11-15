@@ -7,7 +7,7 @@ a key that updates state but never reaches the screen still fails.
 
 from __future__ import annotations
 
-from harness.script import ScriptedResponder, Turn
+from bench.script import ScriptedResponder, Turn
 
 LONG_ANSWER = '\n'.join(
     f'{index + 1:02d}. streamed transcript row for scroll testing -- '

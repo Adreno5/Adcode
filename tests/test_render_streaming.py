@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 import adcode.tui.app as app_module
-from harness.script import ScriptedResponder, Turn
+from bench.script import ScriptedResponder, Turn
 from tests.test_render_equivalence import LegacyCanvas, grid
 
 

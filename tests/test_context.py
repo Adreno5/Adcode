@@ -6,6 +6,13 @@ from adcode.llm.context import (
 from adcode.llm.usage import TokenBudget, TokenBudgetExceeded, estimate_tokens
 
 
+def _agen(texts):
+    async def gen():
+        for text in texts:
+            yield text
+    return gen()
+
+
 def make_context(messages=None):
     prefix = StablePrefix.create(
         provider='P', endpoint='http://x', model='m', system='sys', tools=[],
@@ -54,14 +61,12 @@ def test_compaction_plan_and_apply():
 def test_stream_compact_uses_stream_and_falls_back():
     messages = [{'role': 'user', 'content': f'u{i} ' + 'x' * 400} for i in range(8)]
     context = make_context(messages)
-    removed = stream_compact(
+    import asyncio
+    removed = asyncio.run(stream_compact(
         context, 300,
-        lambda messages, **kwargs: iter([
-            {'kind': 'text', 'content': 'STREAMED SUMMARY'},
-            {'kind': 'finish', 'reason': 'stop'},
-        ]),
+        lambda messages, **kwargs: _agen(['STREAMED SUMMARY']),
         keep_recent_turns=1,
-    )
+    ))
     assert removed > 0
     assert 'STREAMED SUMMARY' in str(context.committed)
 
@@ -71,7 +76,8 @@ def test_stream_compact_uses_stream_and_falls_back():
     def failing(messages, **kwargs):
         raise RuntimeError('no network')
 
-    removed = stream_compact(context, 300, failing, keep_recent_turns=1)
+    removed = asyncio.run(stream_compact(context, 300, failing,
+                                         keep_recent_turns=1))
     assert removed > 0
     assert '<conversation_summary>' in context.committed[0]['content']
 

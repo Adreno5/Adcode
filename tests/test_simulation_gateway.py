@@ -17,8 +17,8 @@ import pytest
 from adcode import images
 from adcode.config import ModelConfig, ProviderConfig
 from adcode.llm.client import LLMClient
-from harness.gateway import FakeLLMGateway
-from harness.script import ScriptedResponder, ToolCall, Turn
+from bench.gateway import FakeLLMGateway
+from bench.script import ScriptedResponder, ToolCall, Turn
 
 WIRES = [
     'openai chat completions',
@@ -42,10 +42,10 @@ def tools(wire: str) -> list[dict]:
         return [{'name': 'write', 'description': 'Write a file',
                  'input_schema': {'type': 'object',
                                   'properties': {'path': {'type': 'string'}}}}]
-    return [{'type': 'function', 'function': {
-        'name': 'write', 'description': 'Write a file',
-        'parameters': {'type': 'object',
-                       'properties': {'path': {'type': 'string'}}}}}]
+    # flat schema, the sdk client's contract (it wraps for the wire itself)
+    return [{'name': 'write', 'description': 'Write a file',
+             'parameters': {'type': 'object',
+                            'properties': {'path': {'type': 'string'}}}}]
 
 
 def collect(client: LLMClient, wire: str, messages=None):

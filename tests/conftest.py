@@ -13,7 +13,7 @@ from adcode.config import (  # noqa: E402
     AppConfig, ModelConfig, ProviderConfig,
 )
 from adcode.theme import build_palette  # noqa: E402
-from harness.app import AppHarness  # noqa: E402
+from bench.app import AppHarness  # noqa: E402
 
 
 @pytest.fixture()

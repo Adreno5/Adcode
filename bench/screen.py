@@ -17,7 +17,7 @@ from typing import Any, Callable
 
 from adcode.tui.canvas import Canvas
 from adcode.tui.screen import TerminalSize
-from harness.vt import VTCell, VirtualScreen
+from bench.vt import VTCell, VirtualScreen
 
 _CURSOR_RE = re.compile(r'\x1b\[(\d+);(\d+)H')
 
@@ -77,7 +77,7 @@ class FrameSnapshot:
     def cells(self, y: int) -> tuple[CellView, ...]:
         return self.rows[y] if 0 <= y < self.height else ()
 
-    # ── screenshot payload (see harness.screenshots) ────────
+    # ── screenshot payload (see bench.screenshots) ────────
     def to_payload(self, label: str = '') -> dict[str, Any]:
         return {
             'label': label,

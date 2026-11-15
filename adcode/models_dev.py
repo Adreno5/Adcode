@@ -349,10 +349,6 @@ def get_catalog(wait: bool = False) -> ModelCatalog:
         return _catalog or ModelCatalog()
 
 
-def catalog_error() -> str:
-    return _fetch_error
-
-
 def wait_for_fetch(timeout: float = 25.0) -> ModelCatalog | None:
     thread = _fetch_thread
     if thread is not None:

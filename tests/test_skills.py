@@ -43,9 +43,9 @@ def test_registry_scan_and_tools(tmp_path):
     assert 'alpha: First skill' in preview
     specs = {spec.name: spec for spec in registry.tool_specs()}
     assert set(specs) == {'skill_list', 'skill_load'}
-    assert 'Alpha body' in specs['skill_load'].handler({'name': 'alpha'})
-    assert 'unknown skill' in specs['skill_load'].handler({'name': 'nope'})
-    assert 'beta' in specs['skill_list'].handler({'query': 'sec'})
+    assert 'Alpha body' in specs['skill_load'].handler(name='alpha')
+    assert 'unknown skill' in specs['skill_load'].handler(name='nope')
+    assert 'beta' in specs['skill_list'].handler(query='sec')
 
 
 def test_disabled_registry_has_no_tools(tmp_path):

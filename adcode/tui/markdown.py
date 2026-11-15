@@ -32,10 +32,6 @@ _INLINE_SPECIAL_RE = re.compile(r'[\\`\[<!*_~=$]')
 _BLOCK_LEAD = frozenset('#|`-+*_>0123456789')
 
 
-def _text_role(role: str | None = 'text') -> str | None:
-    return role
-
-
 def _parse_inline(text: str, base: str | None = None) -> Line:
     """Parse emphasis, code, links, HTML-ish tags and math into styled spans."""
     spans: Line = []
