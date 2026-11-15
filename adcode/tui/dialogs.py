@@ -93,6 +93,89 @@ def _draw_spans(canvas: Canvas, x: int, y: int, line: Line,
                                    span.attrs, span.alpha)
 
 
+def _draw_scroll_marker(canvas: Canvas, x: int, y: int, height: int,
+                        total: int, top: int, palette: Palette) -> None:
+    """A footer-less panel still gets a thumb when its body overflows."""
+    if height <= 0 or total <= height:
+        return
+    canvas.vline(x, y, height, palette.border, alpha=80, char='│')
+    thumb_height = max(1, height * height // total)
+    thumb_top = y + (height - thumb_height) * top // max(1, total - height)
+    for offset in range(thumb_height):
+        canvas.put(x, thumb_top + offset, '┃', palette.muted)
+
+
+# Rows one wheel notch moves a scrollable dialog body.
+_WHEEL_ROWS = 3
+
+
+class ScrollingBody:
+    """A wrapped markdown body that can be taller than its panel.
+
+    The dialog body is laid out only when it is drawn, so the scroll position
+    is kept in rows and clamped against the geometry of the last frame.
+    """
+
+    def __init__(self) -> None:
+        self.top = 0
+        self.total = 0
+        self.rows = 0
+        self._cache: tuple[int, list[Line]] | None = None
+
+    def lines(self, message: str, width: int) -> list[Line]:
+        width = max(10, width)
+        cached = self._cache
+        if cached is not None and cached[0] == width:
+            return cached[1]
+        wrapped = wrap_lines(render_markdown(message, width), width)
+        self._cache = (width, wrapped)
+        return wrapped
+
+    def layout(self, message: str, width: int, rows: int) -> list[Line]:
+        """Wrap the body for the current frame and clamp the scroll offset."""
+        lines = self.lines(message, width)
+        self.total = len(lines)
+        self.rows = max(1, rows)
+        self._clamp()
+        return lines
+
+    def scrollable(self) -> bool:
+        return self.total > self.rows
+
+    def _clamp(self) -> None:
+        self.top = max(0, min(self.top, max(0, self.total - self.rows)))
+
+    def _move(self, delta: int) -> None:
+        self.top += delta
+        self._clamp()
+
+    def handle(self, event: KeyEvent) -> bool:
+        """Scroll on the wheel and the page keys; True when it was one of them."""
+        step = wheel_step(event)
+        if step:
+            self._move(step * _WHEEL_ROWS)
+            return True
+        if event.kind != 'key':
+            return False
+        page = max(1, self.rows - 1)
+        if event.key == 'up':
+            self._move(-1)
+        elif event.key == 'down':
+            self._move(1)
+        elif event.key == 'pgup':
+            self._move(-page)
+        elif event.key == 'pgdn':
+            self._move(page)
+        elif event.key == 'home':
+            self.top = 0
+        elif event.key == 'end':
+            self.top = max(0, self.total - self.rows)
+        else:
+            return False
+        self._clamp()
+        return True
+
+
 class MessageDialog(Overlay):
     def __init__(self, title: str, message: str,
                  on_close: Callable[[], None] | None = None) -> None:
@@ -100,8 +183,12 @@ class MessageDialog(Overlay):
         self.title = title
         self.message = message
         self.on_close = on_close
+        self.body = ScrollingBody()
 
     def handle(self, event: KeyEvent) -> bool:
+        # The wheel and the page keys scroll a long message (/help, an
+        # explanation); enter, esc and q still close it.
+        self.body.handle(event)
         if event.kind == 'key' and event.key in ('enter', 'esc', 'q'):
             self.closed = True
             if self.on_close is not None:
@@ -111,15 +198,24 @@ class MessageDialog(Overlay):
 
     def render(self, canvas: Canvas, width: int, height: int,
                palette: Palette, now: float) -> None:
-        lines = wrap_lines(render_markdown(self.message, 64), 64)
+        # The panel height follows the content, which is measured at the
+        # standard width before the final wrap happens inside the panel.
+        preview = self.body.lines(self.message, 64)
         x, y, w, h = _panel_geometry(width, height, 72,
-                                     desired_height=min(6 + len(lines), height - 2))
+                                     desired_height=min(6 + len(preview), height - 2))
         _draw_backdrop(canvas, width, height, palette)
         _draw_frame(canvas, x, y, w, h, palette, self.title)
-        body = wrap_lines(render_markdown(self.message, max(10, w - 6)), max(10, w - 6))
-        for index, line in enumerate(body[:h - 5]):
+        body_rows = max(1, h - 5)
+        body = self.body.layout(self.message, max(10, w - 6), body_rows)
+        top = self.body.top
+        for index, line in enumerate(body[top:top + body_rows]):
             _draw_spans(canvas, x + 3, y + 2 + index, line, palette)
-        _draw_hint(canvas, x, y + h - 2, w, 'enter / esc close', palette)
+        _draw_scroll_marker(canvas, x + w - 1, y + 2, body_rows, len(body), top,
+                            palette)
+        hint = 'enter / esc close'
+        if self.body.scrollable():
+            hint = '↑↓ / wheel scroll · ' + hint
+        _draw_hint(canvas, x, y + h - 2, w, hint, palette)
 
 
 class SelectDialog(Overlay):
@@ -696,8 +792,11 @@ class ConfirmDialog(Overlay):
         self.title = title
         self.message = message
         self.on_result = on_result
+        self.body = ScrollingBody()
 
     def handle(self, event: KeyEvent) -> bool:
+        # A long question scrolls; the answer keys still close it.
+        self.body.handle(event)
         # Printable letters arrive as text events; accept y/n there too.
         if event.kind == 'text':
             if event.text.lower() == 'y':
@@ -724,13 +823,19 @@ class ConfirmDialog(Overlay):
 
     def render(self, canvas: Canvas, width: int, height: int,
                palette: Palette, now: float) -> None:
-        lines = wrap_lines(render_markdown(self.message, 56), 56)
+        preview = self.body.lines(self.message, 56)
         x, y, w, h = _panel_geometry(width, height, 64,
-                                     desired_height=min(8 + len(lines), height - 2))
+                                     desired_height=min(8 + len(preview), height - 2))
         _draw_backdrop(canvas, width, height, palette)
         _draw_frame(canvas, x, y, w, h, palette, self.title)
-        body = wrap_lines(render_markdown(self.message, max(10, w - 6)), max(10, w - 6))
-        for index, line in enumerate(body[:h - 5]):
+        body_rows = max(1, h - 5)
+        body = self.body.layout(self.message, max(10, w - 6), body_rows)
+        top = self.body.top
+        for index, line in enumerate(body[top:top + body_rows]):
             _draw_spans(canvas, x + 3, y + 2 + index, line, palette)
-        _draw_hint(canvas, x, y + h - 2, w, 'enter / y confirm · esc / n cancel',
-                   palette)
+        _draw_scroll_marker(canvas, x + w - 1, y + 2, body_rows, len(body), top,
+                            palette)
+        hint = 'enter / y confirm · esc / n cancel'
+        if self.body.scrollable():
+            hint = '↑↓ / wheel scroll · ' + hint
+        _draw_hint(canvas, x, y + h - 2, w, hint, palette)

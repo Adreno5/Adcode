@@ -186,6 +186,35 @@ def test_multiline_input_paste_and_the_portable_newline_gesture(harness):
         'line1\nline2\npasted'
 
 
+def test_the_help_dialog_scrolls_its_own_content(harness):
+    """The /help body is taller than the panel; the wheel must reach the rest."""
+    harness.wait_until(lambda: harness.app is not None and not harness.app.dirty,
+                       timeout=10.0, description='the first frame')
+    harness.run_command('/help')
+    harness.wait_until(lambda: harness.app is not None
+                       and harness.app.overlay is not None, timeout=10.0,
+                       description='the help dialog')
+    harness.wait_for_text('Show commands and key bindings')
+    # The key binding list starts below the fold on a 30 row screen.
+    assert 'pgup / pgdn' not in harness.screen_text()
+
+    for _ in range(8):
+        harness.wheel('wheel_down')
+    harness.wait_until(lambda: 'pgup / pgdn' in harness.screen_text(),
+                       timeout=10.0,
+                       description='the wheel to reach the key bindings')
+    assert harness.app.overlay is not None
+    assert harness.app.scroll == 0 and harness.app.follow
+
+    # The page keys scroll the same body, and esc still closes it.
+    harness.press('home')
+    harness.wait_for_text('Show commands and key bindings')
+    harness.press('esc')
+    harness.wait_until(lambda: harness.app is not None
+                       and harness.app.overlay is None, timeout=10.0,
+                       description='the help dialog to close')
+
+
 def test_modal_dialogs_own_the_wheel_and_the_keyboard(harness):
     """A floating dialog must not leak events to the page underneath it."""
     harness.gateway.responder = ScriptedResponder([

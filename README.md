@@ -114,8 +114,7 @@ maximum output, vision support, tool calling, and reasoning efforts.
 | `shift+home` / `shift+end` | Extend the selection to the line edge |
 | `ctrl+x` | Cut selection |
 | `ctrl+z` / `ctrl+y` | Undo / redo input edits |
-| `pgup` / `pgdn` | Scroll the transcript |
-| mouse wheel | Scroll the transcript |
+| `pgup` / `pgdn`, mouse wheel | Scroll the transcript, or the body of an open dialog |
 | mouse drag | Select text in the transcript |
 | `home` / `end` | Line start / end |
 | `ctrl+home` / `ctrl+end` | Input start / end |
@@ -138,7 +137,10 @@ the transcript clears it.
 
 While a dialog is open it owns the keyboard and the wheel: keys filter or edit
 inside the dialog, and the wheel moves the dialog's list instead of scrolling
-the transcript behind it.
+the transcript behind it.  A message dialog (the `/help` output, a long
+explanation) has no list, so the wheel, the arrow keys and PageUp/PageDown
+scroll its text; the panel grows a scrollbar and a hint as soon as the message
+is taller than the panel.
 
 ## Commands
 
