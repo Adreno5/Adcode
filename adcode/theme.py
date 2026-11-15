@@ -28,10 +28,6 @@ def parse_hex(value: str, fallback: RGB) -> RGB:
         return fallback
 
 
-def to_hex(color: RGB) -> str:
-    return '#{:02x}{:02x}{:02x}'.format(*color)
-
-
 def mix(source: RGB, target: RGB, amount: float) -> RGB:
     """Blend ``source`` towards ``target`` by ``amount`` (0..1)."""
     amount = max(0.0, min(1.0, amount))

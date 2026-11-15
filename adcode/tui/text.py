@@ -262,5 +262,3 @@ def slice_visual(lines: list[Line], from_index: int, to_index: int) -> list[Line
     return lines[start:end + 1]
 
 
-def render_to_strings(lines: list[Line]) -> list[str]:
-    return [plain_text(line) for line in lines]
