@@ -15,6 +15,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from adcode import net
 from typing import Any
 
 PROTOCOL_VERSION = '2025-06-18'
@@ -292,7 +294,7 @@ class HttpTransport(MCPTransport):
         request = urllib.request.Request(self.url, data=data,
                                          headers=self._headers(), method='POST')
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with net.urlopen(request, timeout=timeout) as response:
                 session = response.headers.get('Mcp-Session-Id')
                 if session:
                     self.session_id = session
@@ -326,7 +328,7 @@ class HttpTransport(MCPTransport):
                 request = urllib.request.Request(
                     self.url, headers={'Mcp-Session-Id': self.session_id},
                     method='DELETE')
-                urllib.request.urlopen(request, timeout=3).close()
+                net.urlopen(request, timeout=3).close()
             except Exception:
                 pass
         self.connected = False
@@ -357,6 +359,7 @@ class SseTransport(MCPTransport):
         self._reader: threading.Thread | None = None
         self._endpoint_ready = threading.Event()
         self._sock = None
+        self._closing = False
 
     def start(self) -> None:
         self._reader = threading.Thread(target=self._read_loop, daemon=True,
@@ -366,31 +369,18 @@ class SseTransport(MCPTransport):
             raise MCPError('did not receive an SSE endpoint event')
 
     def _read_loop(self) -> None:
-        import http.client
-        from urllib.parse import urlsplit
-        parts = urlsplit(self.url)
-        connection_class = (http.client.HTTPSConnection
-                            if parts.scheme == 'https' else http.client.HTTPConnection)
-        port = parts.port or (443 if parts.scheme == 'https' else 80)
-        path = parts.path or '/'
-        if parts.query:
-            path += '?' + parts.query
-        connection = connection_class(parts.hostname or '', port, timeout=600)
-        self._connection = connection
+        # The event stream is read through the shared network layer: the
+        # standard library has no streaming HTTP client, so a SOCKS proxy
+        # could not be used for server-sent events at all.
+        request = urllib.request.Request(self.url, headers={
+            **self.headers,
+            'Accept': 'text/event-stream', 'Cache-Control': 'no-cache',
+        }, method='GET')
+        event = ''
+        data_lines: list[str] = []
         try:
-            connection.request('GET', path, headers={
-                **self.headers,
-                'Accept': 'text/event-stream', 'Cache-Control': 'no-cache',
-            })
-            self._stream = connection.getresponse()
-            self._sock = connection.sock
-            event = ''
-            data_lines: list[str] = []
-            while True:
-                raw = self._stream.readline()
-                if not raw:
-                    break
-                line = raw.decode('utf-8', errors='replace').rstrip('\r\n')
+            for line in net.stream_lines(request, timeout=600,
+                                         on_open=self._stream_opened):
                 if line.startswith('event:'):
                     event = line[6:].strip()
                 elif line.startswith('data:'):
@@ -402,7 +392,9 @@ class SseTransport(MCPTransport):
                     event = ''
                     data_lines = []
         except Exception as error:
-            self.last_error = f'sse stream failed: {error}'
+            # A deliberate close ends the stream too; that is not a failure.
+            if not self._closing:
+                self.last_error = f'sse stream failed: {error}'
         finally:
             with self._lock:
                 pending = list(self._pending.items())
@@ -412,12 +404,12 @@ class SseTransport(MCPTransport):
                 self._pending.clear()
             for _, waiter in pending:
                 waiter.set()
-            try:
-                connection.close()
-            except Exception:
-                pass
             self._stream = None
             self._sock = None
+
+    def _stream_opened(self, response: Any) -> None:
+        """Remember the open response so ``close`` can unblock the reader."""
+        self._stream = response
 
     def _handle_event(self, event: str, payload: str) -> None:
         if event == 'endpoint':
@@ -454,7 +446,7 @@ class SseTransport(MCPTransport):
             headers={**self.headers, 'Content-Type': 'application/json'},
             method='POST')
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with net.urlopen(request, timeout=timeout) as response:
                 response.read()
         except urllib.error.HTTPError as error:
             if error.code >= 400:
@@ -491,6 +483,15 @@ class SseTransport(MCPTransport):
     def close(self) -> None:
         self.connected = False
         self.connected_at = None
+        self._closing = True
+        # Closing the open response unblocks the reader thread; it never waits
+        # for the read itself, so closing never blocks on a concurrent read.
+        stream = self._stream
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
         sock = self._sock
         if sock is not None:
             try:
@@ -498,8 +499,6 @@ class SseTransport(MCPTransport):
                 sock.shutdown(socket.SHUT_RDWR)
             except Exception:
                 pass
-        # The reader thread owns the response object and closes the connection
-        # when its read unblocks, so close() never blocks on a concurrent read.
         self._sock = None
 
     def diagnostics(self) -> dict[str, Any]:

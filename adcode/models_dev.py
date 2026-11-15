@@ -17,6 +17,8 @@ import tempfile
 import threading
 import time
 import urllib.request
+
+from adcode import net
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -292,7 +294,7 @@ def fetch_catalog(timeout: float = 25.0) -> ModelCatalog | None:
         'Accept': 'application/json',
     })
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with net.urlopen(request, timeout=timeout) as response:
             raw = json.loads(response.read().decode('utf-8'))
         models = parse_catalog(raw)
         if not models:

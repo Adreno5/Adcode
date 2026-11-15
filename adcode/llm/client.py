@@ -15,6 +15,7 @@ import anthropic
 import openai
 
 from adcode.config import ModelConfig, ProviderConfig
+from adcode.net import build_http_client
 from adcode.images import (
     FileIdCache, ImageRef, anthropic_source, data_url, has_image_marker,
     image_marker, iter_segments, resolve_image,
@@ -147,11 +148,17 @@ class LLMClient:
         self.warn: Callable[[str], None] | None = None
         self._upload_notes: set[str] = set()
         headers = dict(provider.extra_headers) if provider.extra_headers else None
+        # The SDKs build their own HTTP client from the environment, and that
+        # client refuses to start on a proxy scheme it does not know.  The
+        # client is built here instead, so a SOCKS proxy in the environment
+        # works for every wire protocol.
+        self._http = build_http_client(timeout=600.0)
         if 'openai' in self.wire:
             self._client: Any = openai.OpenAI(
                 base_url=provider.base_url,
                 api_key=provider.api_key or 'not-needed',
                 default_headers=headers,
+                http_client=self._http,
                 timeout=600.0,
                 max_retries=0,
             )
@@ -160,9 +167,17 @@ class LLMClient:
                 base_url=provider.base_url,
                 api_key=provider.api_key or 'not-needed',
                 default_headers=headers,
+                http_client=self._http,
                 timeout=600.0,
                 max_retries=0,
             )
+
+    def close(self) -> None:
+        """Release the underlying HTTP connection pool."""
+        try:
+            self._client.close()
+        except Exception:
+            pass
 
     # ── protocol-neutral entry point ────────────────────────
     def chat(self, messages: list[dict[str, Any]], model: ModelConfig, *,

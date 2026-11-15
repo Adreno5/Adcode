@@ -7,6 +7,7 @@ requires-python = ">=3.14"
 dependencies = [
     "anthropic>=0.116.0",
     "cryptography>=44.0.0",
+    "httpx2[socks]>=2.16.0",
     "keyring>=25.7.0",
     "openai>=2.45.0",
     "pyperclip>=1.11.0",

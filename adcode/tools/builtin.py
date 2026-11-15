@@ -17,6 +17,7 @@ import weakref
 from dataclasses import dataclass, field
 from typing import Any
 
+from adcode import net
 from adcode.tools.runtime import current_context, resolve_path
 
 _GREP_SKIP_DIRS = frozenset({
@@ -498,7 +499,7 @@ def _fetch(args: dict[str, Any]) -> str:
         body = body.encode('utf-8')
     try:
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with net.urlopen(request, timeout=30) as response:
             status = response.status
             raw = response.read(2_000_000)
         text = raw.decode('utf-8', errors='replace')
