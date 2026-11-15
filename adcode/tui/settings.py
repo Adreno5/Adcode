@@ -321,6 +321,39 @@ class SettingsOverlay(Overlay):
         walk(self.nodes, 0)
         return rows
 
+    def _sync_cursor(self, rows: list[Row]) -> None:
+        """Point ``row`` at the row remembered by ``row_key``.
+
+        The key, not the index, is the source of truth: expanding and
+        collapsing options inserts and removes rows, so an index captured
+        before a change can silently point at a different setting.
+        """
+        if not self.row_key:
+            return
+        selectable = self._selectable(rows)
+        if not selectable:
+            self.row = 0
+            return
+        positions = {rows[index].key: index for index in selectable}
+        key = self.row_key
+        while key:
+            index = positions.get(key)
+            if index is not None:
+                self.row = index
+                self.row_key = key
+                return
+            key = key.rsplit('::', 1)[0] if '::' in key else ''
+        # The remembered row is gone (an option collapsed into its parent):
+        # fall back to the closest selectable row that still exists.
+        position = sum(1 for index in selectable if index <= self.row)
+        self.row = selectable[max(0, position - 1)]
+        self.row_key = rows[self.row].key
+
+    def _refocus(self, key: str) -> None:
+        """Remember ``key`` and move the cursor onto it right away."""
+        self.row_key = key
+        self._sync_cursor(self._flatten())
+
     def _get(self, node: SettingNode) -> Any:
         if not node.path:
             return None
@@ -371,23 +404,20 @@ class SettingsOverlay(Overlay):
 
     def _move(self, delta: int) -> None:
         rows = self._flatten()
+        self._sync_cursor(rows)
         selectable = self._selectable(rows)
         if not selectable:
             return
-        if self.row_key:
-            for position, index in enumerate(selectable):
-                if rows[index].key == self.row_key:
-                    self.row = selectable[(position + delta) % len(selectable)]
-                    break
-            else:
-                self.row = selectable[0]
+        if self.row in selectable:
+            position = (selectable.index(self.row) + delta) % len(selectable)
         else:
-            self.row = selectable[0]
-        if rows and 0 <= self.row < len(rows):
-            self.row_key = rows[self.row].key
+            position = 0 if delta > 0 else len(selectable) - 1
+        self.row = selectable[position]
+        self.row_key = rows[self.row].key
 
     def handle(self, event: KeyEvent) -> bool:
         rows = self._flatten()
+        self._sync_cursor(rows)
         if self.editing:
             return self._handle_edit(event)
         if event.kind == 'paste':
@@ -403,6 +433,7 @@ class SettingsOverlay(Overlay):
                 snapshot = self.snapshots.pop(node_key, None)
                 if snapshot is not None:
                     self._restore(snapshot)
+                self._refocus(node_key)
                 self.on_change()
             else:
                 self.closed = True
@@ -445,6 +476,7 @@ class SettingsOverlay(Overlay):
                 snapshot = self.snapshots.pop(node_key, None)
                 if snapshot is not None:
                     self._restore(snapshot)
+                self._refocus(node_key)
             return True
         if key == 'ctrl+s':
             self.on_change()
@@ -465,7 +497,7 @@ class SettingsOverlay(Overlay):
                 if node.key not in self.expanded:
                     self.expanded.append(node.key)
                     self.snapshots.setdefault(node.key, self._snapshot_for(node))
-                self.row_key = f'{node.key}::{row.option.value}'
+                self._refocus(f'{node.key}::{row.option.value}')
             else:
                 self._confirm(node)
             return
@@ -493,6 +525,9 @@ class SettingsOverlay(Overlay):
         if node.key in self.expanded:
             self.expanded.remove(node.key)
             self.snapshots.pop(node.key, None)
+        # Keep the cursor on the item that was just confirmed instead of
+        # letting the stale option key fall back to the top of the tree.
+        self._refocus(node.key)
         self.on_change()
 
     def _edit_text_for(self, node: SettingNode) -> str:
@@ -619,14 +654,15 @@ class SettingsOverlay(Overlay):
         _draw_backdrop(canvas, width, height, palette)
         _draw_frame(canvas, x, y, w, h, palette, 'Settings')
         rows = self._flatten()
+        self._sync_cursor(rows)
         body_top = y + 2
         body_height = max(1, h - 5)
         if rows:
-            self.row = max(0, min(self.row, len(rows) - 1))
             if self.row < self.top:
                 self.top = self.row
             elif self.row >= self.top + body_height:
                 self.top = self.row - body_height + 1
+            self.top = max(0, min(self.top, len(rows) - 1))
         row_y = body_top
         for index in range(self.top, min(len(rows), self.top + body_height)):
             row = rows[index]
