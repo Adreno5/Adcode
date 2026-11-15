@@ -103,7 +103,7 @@ maximum output, vision support, tool calling, and reasoning efforts.
 | `tab` | Complete the selected command |
 | `esc` | Interrupt the current turn, or close the palette/overlay |
 | `ctrl+c` | Copy selection, else clear the input, else interrupt; press twice on an empty prompt to exit |
-| `ctrl+v` | Paste text, or attach a copied screenshot when the clipboard has no text |
+| `ctrl+v`, `shift+insert` | Paste text, or attach a copied screenshot when the clipboard has no text |
 | `alt+v` | Attach the clipboard image to the message |
 | `ctrl+a` | Select all |
 | `shift+left` / `shift+right` | Extend the selection by one character |
@@ -405,6 +405,7 @@ The UI consumes a thread-safe event queue and renders the live state.
 ```
 adcode/
 ├── cli.py            # console entry point
+├── net.py            # proxy-aware HTTP (SOCKS5, urllib fallbacks)
 ├── agent_loop.py     # streaming ReAct loop, events, persistence
 ├── config.py         # settings schema, migration, atomic save
 ├── crypto.py         # Fernet API-key encryption
@@ -435,6 +436,7 @@ adcode/
     ├── canvas.py     # software renderer and alpha compositing
     ├── screen.py     # terminal modes and frame output
     ├── input.py      # cross-platform key/paste/mouse parser
+    ├── clipboard.py  # clipboard access and the paste bindings
     ├── markdown.py   # incremental Markdown -> styled spans
     ├── text.py       # spans and width-aware wrapping
     ├── transcript.py # transcript and live-state rendering
@@ -516,10 +518,41 @@ have it, the harness automatically looks for an interpreter that does
 (`ADCODE_RASTER_PYTHON`, then `python`/`python3`/`py`).  Scenarios: `chat`,
 `tool-call`, `keyboard`, `commands`, `scroll`, `resize`, `interrupt`.
 
+## Clipboard
+
+`ctrl+v` and `shift+insert` paste the clipboard into the prompt, into the
+settings editor, into the provider wizard and into every dialog that takes
+text (the model list filter, the manual model id field, the text prompts).
+Terminals that send a bracketed paste are supported as well.
+
+The clipboard is read through the first mechanism that works:
+
+| Platform | Mechanisms |
+|---|---|
+| Windows | `pyperclip`, PowerShell `Get-Clipboard` |
+| macOS | `pyperclip`, `pbpaste` |
+| Linux | `pyperclip`, `wl-paste`, `xclip`, `xsel`, Tk |
+
+A copy made inside AdCode is also kept in memory, so pasting it back works
+even on a machine without any clipboard tool. When the clipboard holds no
+text, `ctrl+v` falls back to attaching the clipboard image, and `alt+v`
+attaches it directly.
+
+## Proxies
+
+`HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` are honoured for the model APIs,
+the models.dev catalogue, the `fetch` tool and the HTTP/SSE MCP transports.
+SOCKS proxies (`socks5://` and `socks5h://`) are supported as well; the
+`httpx2[socks]` extra is installed with the project, so the SOCKS transport
+is always available. A `socks://` value is treated as `socks5://`, and an
+unsupported scheme is reported with a message that names the problem instead
+of crashing the app.
+
 ## Dependencies
 
 - `openai` -- OpenAI-compatible Chat Completions and Responses clients
 - `anthropic` -- Messages API client
+- `httpx2[socks]` -- HTTP transport, including the SOCKS5 proxy support
 - `cryptography` -- Fernet encryption for API keys
 - `keyring` -- OS credential storage
 - `pyperclip` -- clipboard access
