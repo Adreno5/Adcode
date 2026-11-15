@@ -21,6 +21,8 @@ import threading
 import time
 from dataclasses import dataclass
 
+from adcode.tui import clipboard
+
 _IS_WIN = os.name == 'nt'
 
 if _IS_WIN:
@@ -645,41 +647,9 @@ class InputThread(threading.Thread):
 
 # ── clipboard helpers ──────────────────────────────────────
 
-
-def get_clipboard() -> str:
-    try:
-        import pyperclip
-        return pyperclip.paste()
-    except Exception:
-        pass
-    try:
-        import subprocess
-        import sys
-        if _IS_WIN:
-            result = subprocess.check_output(
-                ['powershell', '-NoProfile', '-Command', 'Get-Clipboard'],
-                text=True, encoding='utf-8-sig', stderr=subprocess.DEVNULL,
-                timeout=5,
-            )
-        elif sys.platform == 'darwin':
-            result = subprocess.check_output(
-                ['pbpaste'], text=True, encoding='utf-8-sig',
-                stderr=subprocess.DEVNULL, timeout=5,
-            )
-        else:
-            result = subprocess.check_output(
-                ['xclip', '-selection', 'clipboard', '-o'], text=True,
-                encoding='utf-8-sig', stderr=subprocess.DEVNULL, timeout=5,
-            )
-        return result.rstrip('\n')
-    except Exception:
-        return ''
-
-
-def set_clipboard(text: str) -> bool:
-    try:
-        import pyperclip
-        pyperclip.copy(text)
-        return True
-    except Exception:
-        return False
+# The clipboard lives in its own module; the names are re-exported here so
+# every input surface can reach them through the input layer.
+get_clipboard = clipboard.get_clipboard
+set_clipboard = clipboard.set_clipboard
+is_paste_key = clipboard.is_paste_key
+PASTE_KEYS = clipboard.PASTE_KEYS

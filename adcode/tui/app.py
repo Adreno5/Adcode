@@ -32,7 +32,9 @@ from adcode.tui.dialogs import (
     ConfirmDialog, DialogItem, MessageDialog, Overlay,
     SelectDialog, TextPrompt,
 )
-from adcode.tui.input import InputThread, KeyEvent, get_clipboard, set_clipboard
+from adcode.tui.input import (
+    InputThread, KeyEvent, get_clipboard, is_paste_key, set_clipboard,
+)
 from adcode.tui.markdown import MarkdownRenderer
 from adcode.tui.screen import TerminalScreen
 from adcode.tui.settings import SettingsOverlay
@@ -718,7 +720,8 @@ class AdCodeApp:
         if key == 'ctrl+c':
             if self.prompt.selection()[0] != self.prompt.selection()[1]:
                 copied = self.prompt.copy()
-                set_clipboard(copied)
+                if copied and not set_clipboard(copied):
+                    self.status_hint = 'the clipboard is not available'
                 self.prompt.anchor = None
             elif self.prompt.text:
                 self.prompt.set_text('')
@@ -735,22 +738,16 @@ class AdCodeApp:
             if not self.prompt.text:
                 self.request_exit()
             return
-        if key == 'ctrl+v':
-            text = get_clipboard()
-            if text:
-                self.prompt.insert(text)
-            else:
-                # A copied screenshot has no text form; attach it instead.
-                self.attach_clipboard_image()
-            self.dirty = True
+        if is_paste_key(key):
+            self._paste_from_clipboard()
             return
         if key == 'alt+v':
             self.attach_clipboard_image()
             return
         if key == 'ctrl+x':
             cut = self.prompt.cut()
-            if cut:
-                set_clipboard(cut)
+            if cut and not set_clipboard(cut):
+                self.status_hint = 'the clipboard is not available'
             self.dirty = True
             return
         if key == 'ctrl+a':
@@ -876,6 +873,16 @@ class AdCodeApp:
         if self.btw_mode:
             self.btw_mode = False
         self.loop.submit(text, mode)
+        self.dirty = True
+
+    def _paste_from_clipboard(self) -> None:
+        """Insert the clipboard text, or attach the clipboard image."""
+        text = get_clipboard()
+        if text:
+            self.prompt.insert(text)
+        else:
+            # A copied screenshot has no text form; attach it instead.
+            self.attach_clipboard_image()
         self.dirty = True
 
     # ── image attachments ───────────────────────────────────

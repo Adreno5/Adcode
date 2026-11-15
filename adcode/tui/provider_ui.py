@@ -15,7 +15,7 @@ from adcode.tui.dialogs import (
     _draw_backdrop, _draw_frame, _draw_hint,
     _panel_geometry,
 )
-from adcode.tui.input import KeyEvent
+from adcode.tui.input import KeyEvent, get_clipboard, is_paste_key
 
 
 WIRE_LABELS = [
@@ -102,6 +102,10 @@ class ModelEditorOverlay(Overlay):
                     self.editing = False
                 elif event.key == 'backspace':
                     self.edit_text = self.edit_text[:-1]
+                elif is_paste_key(event.key):
+                    pasted = get_clipboard()
+                    if pasted:
+                        self.edit_text += pasted.replace('\n', ' ')
                 elif event.key == 'enter':
                     self._apply_edit()
             return True

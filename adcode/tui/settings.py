@@ -20,7 +20,7 @@ from adcode.config import (
 from adcode.theme import ACCENT_PRESETS, Palette
 from adcode.tui.canvas import BOLD, DIM, Canvas, text_width, truncate_text
 from adcode.tui.dialogs import Overlay, _draw_backdrop, _draw_frame, _draw_hint, _panel_geometry
-from adcode.tui.input import KeyEvent
+from adcode.tui.input import KeyEvent, get_clipboard, is_paste_key
 
 
 @dataclass
@@ -552,6 +552,14 @@ class SettingsOverlay(Overlay):
                 self.edit_select_all = False
             else:
                 self.edit_value += text
+            return True
+        if event.kind == 'key' and is_paste_key(event.key):
+            pasted = get_clipboard().replace('\n', ' ')
+            if self.edit_select_all:
+                self.edit_value = pasted
+                self.edit_select_all = False
+            else:
+                self.edit_value += pasted
             return True
         if event.kind == 'text':
             if self.edit_select_all:

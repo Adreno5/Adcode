@@ -92,7 +92,7 @@ def cmd_help(app: Any, args: str) -> None:
         'tab                complete the selected command',
         'esc                interrupt the current turn / close overlays',
         'ctrl+c             copy selection, clear input, or press twice to exit',
-        'ctrl+v             paste text, or attach a copied screenshot',
+        'ctrl+v / shift+ins paste text, or attach a copied screenshot',
         'alt+v              attach the clipboard image to the message',
         'ctrl+a select all · ctrl+z undo · ctrl+y redo',
         'pgup / pgdn        scroll the transcript · mouse wheel scrolls too',

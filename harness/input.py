@@ -29,6 +29,7 @@ _KEY_SEQUENCES = {
     'home': '\x1b[H',
     'end': '\x1b[F',
     'insert': '\x1b[2~',
+    'shift+insert': '\x1b[2;2~',
     'delete': '\x1b[3~',
     'pgup': '\x1b[5~',
     'pgdn': '\x1b[6~',

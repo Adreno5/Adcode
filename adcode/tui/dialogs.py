@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from adcode.theme import Palette
 from adcode.tui.canvas import BOLD, DIM, Canvas, text_width, truncate_text
-from adcode.tui.input import KeyEvent, get_clipboard
+from adcode.tui.input import KeyEvent, get_clipboard, is_paste_key
 from adcode.tui.markdown import render_markdown
 from adcode.tui.text import Line, wrap_lines
 
@@ -183,7 +183,20 @@ class SelectDialog(Overlay):
                 self.filter = self.filter[:-1]
                 self.index = 0
             return True
+        if is_paste_key(key):
+            self._paste_into_filter()
+            return True
         return True
+
+    def _paste_into_filter(self) -> None:
+        """Paste the clipboard into the filter box."""
+        if not self.allow_filter:
+            return
+        text = get_clipboard()
+        if not text:
+            return
+        self.filter += text.replace('\r', '').replace('\n', ' ')
+        self.index = 0
 
     def render(self, canvas: Canvas, width: int, height: int,
                palette: Palette, now: float) -> None:
@@ -289,6 +302,10 @@ class MultiSelectDialog(Overlay):
                     self.manual_text = ''
                 elif event.key == 'backspace':
                     self.manual_text = self.manual_text[:-1]
+                elif is_paste_key(event.key):
+                    pasted = get_clipboard()
+                    if pasted:
+                        self.manual_text += pasted.replace('\r', '').replace('\n', '')
                 elif event.key == 'enter':
                     value = self.manual_text.strip()
                     if value:
@@ -335,6 +352,13 @@ class MultiSelectDialog(Overlay):
                 if self.filter:
                     self.filter = self.filter[:-1]
                     self.index = 0
+                return True
+            if is_paste_key(key):
+                if self.allow_filter:
+                    pasted = get_clipboard()
+                    if pasted:
+                        self.filter += pasted.replace('\r', '').replace('\n', ' ')
+                        self.index = 0
                 return True
             if key == 'pgup':
                 self.index = max(0, self.index - 10)
@@ -481,7 +505,7 @@ class TextPrompt(Overlay):
         elif key == 'ctrl+u':
             self.text = ''
             self.cursor_pos = 0
-        elif key == 'ctrl+v':
+        elif is_paste_key(key):
             self._insert(get_clipboard())
         return True
 
