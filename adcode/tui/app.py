@@ -1315,8 +1315,10 @@ class AdCodeApp:
         if now - self.last_render < self._render_interval():
             return
         self.last_render = now
-        self.dirty = False
         self._render()
+        # The flag goes down after the frame is drawn, so a reader that waits
+        # for a clean app also waits for the picture it describes.
+        self.dirty = False
 
     def _render(self) -> None:
         # The snapshot belongs to one frame; the next frame reads it again.
