@@ -199,7 +199,14 @@ def test_interrupt(loop):
     wait_idle(loop)
     assert any(item.kind == 'notice' and '[interrupted]' in item.text
                for item in loop.items)
-    assert loop.context.committed == []
+    # Esc keeps the work that already happened: the user message and the tokens
+    # that were already on screen stay in the history.  Dropping them made the
+    # next request disagree with the transcript and lost the whole turn.
+    assert [message['role'] for message in loop.context.committed] == [
+        'user', 'assistant']
+    assert loop.context.committed[0]['content'] == 'slow'
+    assert loop.context.committed[1]['content'].startswith('chunk0')
+    assert loop.context.draft == []
 
 
 def test_aside_does_not_touch_history(loop):

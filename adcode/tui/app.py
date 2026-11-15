@@ -289,6 +289,10 @@ class AdCodeApp:
         self.live_tool_output: list[str] = []
         self.active_tool = ''
         self.status_hint = ''
+        # Wall clock start of the current connection attempt, so the footer can
+        # show how long the provider has been silent.
+        self.connect_started = 0.0
+        self.connect_retrying = False
         self._resume = resume
         self._started_at = time.time()
         self._tool_signature = self._tool_config_signature()
@@ -620,7 +624,9 @@ class AdCodeApp:
     def _apply_event(self, kind: str, payload: dict[str, Any]) -> None:
         if kind == 'turn_start':
             self._reset_live()
-            self.phase = 'thinking'
+            # A turn opens by sending a request; no model output exists yet, so
+            # the honest phase is "connecting" until the first stream event.
+            self._enter_connecting()
             self.follow = True
             self.scroll = 0
         elif kind == 'thinking_delta':
@@ -696,7 +702,14 @@ class AdCodeApp:
             self._reset_live()
             self.phase = 'idle'
         elif kind == 'status':
-            self.phase = payload.get('status', self.phase)
+            status = payload.get('status', self.phase)
+            if status == 'connecting':
+                self._enter_connecting(bool(payload.get('retrying')))
+            else:
+                if self.phase == 'connecting':
+                    self.connect_started = 0.0
+                    self.connect_retrying = False
+                self.phase = status
         elif kind == 'session_loaded' or kind == 'session_rewound':
             self.transcript.invalidate()
             self._reset_live()
@@ -728,8 +741,25 @@ class AdCodeApp:
         self.live_tool_output = []
         self.active_tool = ''
 
+    def _enter_connecting(self, retrying: bool = False) -> None:
+        """Show the wait before the first streamed byte.
+
+        A retry restarts the clock but keeps the same phase, so a flapping
+        connection reads as one wait instead of a flicker between states.
+        """
+        if self.phase != 'connecting' or retrying or not self.connect_started:
+            self.connect_started = time.time()
+        self.connect_retrying = bool(retrying)
+        self.phase = 'connecting'
+
+    def _connect_elapsed(self) -> float:
+        if not self.connect_started:
+            return 0.0
+        return max(0.0, time.time() - self.connect_started)
+
     def _needs_animation(self) -> bool:
-        return self.phase in ('thinking', 'answering', 'tool', 'compacting', 'aside')
+        return self.phase in ('connecting', 'thinking', 'answering', 'tool',
+                              'compacting', 'aside')
 
     def _tick_animation(self) -> None:
         if self._needs_animation():
@@ -1476,7 +1506,14 @@ class AdCodeApp:
         snap = self.snapshot()
         frame = SPINNER[int(time.time() * 10) % len(SPINNER)]
         phase = self.phase
-        if phase == 'thinking':
+        if phase == 'connecting':
+            # Reconnecting is the same wait, but the user deserves to know the
+            # first attempt already failed.
+            verb = 'reconnecting' if self.connect_retrying else 'connecting'
+            elapsed = self._connect_elapsed()
+            suffix = f' {elapsed:.1f}s' if elapsed >= 1.0 else ''
+            status = f'{frame} {verb}{suffix}'
+        elif phase == 'thinking':
             status = f'{frame} thinking'
         elif phase == 'answering':
             status = f'{frame} writing'
@@ -1489,8 +1526,9 @@ class AdCodeApp:
         else:
             status = 'ready'
         color = {
-            'thinking': 'subtext', 'answering': 'text', 'tool': 'accent',
-            'compacting': 'info', 'aside': 'accent', 'idle': 'muted',
+            'connecting': 'info', 'thinking': 'subtext', 'answering': 'text',
+            'tool': 'accent', 'compacting': 'info', 'aside': 'accent',
+            'idle': 'muted',
         }.get(phase, 'muted')
         x = 1
         x += self.canvas.draw_text(x, y, status, self._color(color, 'muted'))

@@ -26,7 +26,8 @@ from adcode.images import (
 )
 from adcode.llm.client import LLMClient
 from adcode.llm.context import (
-    ConversationContext, StablePrefix, TokenBudgetExceeded, stream_compact,
+    ConversationContext, StablePrefix, TokenBudgetExceeded, messages_need_repair,
+    repair_messages, stream_compact,
 )
 from adcode.llm.usage import (
     TokenBudget, effective_reserved, estimate_tokens, merge_usage,
@@ -321,9 +322,9 @@ class AgentLoop:
             self.turn_out = 0
             self._turn_started = time.time()
             self.items.append(TranscriptItem(kind='user', turn=turn, text=text))
-            self.status = 'thinking'
+            self.status = 'connecting'
         self._emit('turn_start', turn=turn, text=text)
-        self._emit('status', status='thinking')
+        self._emit('status', status='connecting')
         context = self.context
         context.stage({'role': 'user', 'content': text})
         tool_context = ToolContext(cwd=self.cwd, interrupt=self._interrupt,
@@ -390,11 +391,15 @@ class AgentLoop:
                 if not committed and not interrupted and self._interrupt.is_set():
                     interrupted = True
         except TokenBudgetExceeded as error:
+            # Nothing in this turn can be sent: the history does not fit even
+            # after compaction, so keeping the draft would break every later
+            # request.  The already committed rounds stay.
             context.rollback()
             self._append_notice(f'Token budget exceeded: {error}', level='error')
             self._emit('error', text=str(error))
         except Exception as error:
-            context.rollback()
+            # A failed request is not a reason to forget the work that already
+            # happened; keep the user message and every completed tool round.
             self._append_notice(f'Request failed: {error}', level='error')
             self._emit('error', text=str(error))
         finally:
@@ -402,10 +407,15 @@ class AgentLoop:
             with self._lock:
                 self.status = 'idle'
             if not committed:
-                # The whole turn is atomic: restore the consumed mailbox so the
-                # next turn still sees sub-agent results that were never sent.
-                context.rollback()
-                self.agents.requeue_mailbox(pending_mailbox)
+                # Money in the transcript -- tool calls that ran, an answer that
+                # was already streaming -- must survive the turn.  Dropping the
+                # whole draft on Esc used to erase minutes of investigation.
+                if not self._commit_partial(context):
+                    # Nothing survived (for example the budget check refused the
+                    # request before it was sent): restore the consumed mailbox
+                    # so the next turn still sees sub-agent results.
+                    context.rollback()
+                    self.agents.requeue_mailbox(pending_mailbox)
             if interrupted:
                 self._append_notice('[interrupted]', level='warning')
                 self._emit('interrupted')
@@ -460,9 +470,30 @@ class AgentLoop:
                 self._emit('thinking_end', text=thinking,
                            duration=round(time.time() - thinking_started, 2))
 
-        with self._lock:
-            self.status = 'thinking'
-        self._emit('status', status='thinking')
+        # Nothing is on the wire yet: the request is only sent when the
+        # generator below is first advanced, and the provider can take a while
+        # to produce its first byte (DNS, TLS, proxy, a cold or queued model).
+        # That wait is a phase of its own -- ``connecting`` -- and it ends when
+        # real model output arrives, not when the turn is scheduled.
+        connecting = True
+
+        def enter_connecting(retrying: bool = False) -> None:
+            nonlocal connecting
+            connecting = True
+            with self._lock:
+                self.status = 'connecting'
+            self._emit('status', status='connecting', retrying=retrying)
+
+        def start_streaming() -> None:
+            nonlocal connecting
+            if not connecting:
+                return
+            connecting = False
+            with self._lock:
+                self.status = 'thinking'
+            self._emit('status', status='thinking')
+
+        enter_connecting()
         stream_started = time.perf_counter()
         for event in self.client.chat(
             context.request_messages(), self.model,
@@ -476,6 +507,15 @@ class AgentLoop:
             if self._interrupt.is_set() or self._stop.is_set():
                 break
             kind = event.get('kind', '')
+            if kind == 'retry':
+                # The attempt failed before anything streamed, so the next one
+                # is still a connection attempt, not model output.
+                enter_connecting(retrying=True)
+                self._append_notice(
+                    f'Reconnecting ({event.get("attempt", 1)}): '
+                    f'{str(event.get("content", ""))[:160]}', level='warning')
+                continue
+            start_streaming()
             if kind == 'thinking':
                 delta = str(event.get('content', ''))
                 if delta:
@@ -502,10 +542,6 @@ class AgentLoop:
                     request_usage = merge_usage(request_usage, normalized)
             elif kind == 'finish':
                 finish_reason = str(event.get('reason', ''))
-            elif kind == 'retry':
-                self._append_notice(
-                    f'Reconnecting ({event.get("attempt", 1)}): '
-                    f'{str(event.get("content", ""))[:160]}', level='warning')
         close_thinking()
         if full:
             self._append_assistant(turn, full)
@@ -584,9 +620,27 @@ class AgentLoop:
             if name == 'update_goal':
                 self._refresh_system_and_prefix(force=True)
             if self._interrupt.is_set() or self._stop.is_set():
+                # Persist the calls that did run before the interrupt, so the
+                # model does not have to repeat them next turn.
+                self._stage_tool_round(context, tool_calls[:index + 1],
+                                       call_ids[:index + 1], draft, thinking,
+                                       full, image_markers)
                 return False
 
         # Persist the assistant tool-call message together with its results.
+        self._stage_tool_round(context, tool_calls, call_ids, draft, thinking,
+                               full, image_markers)
+        with self._lock:
+            self.status = 'connecting'
+        self._emit('status', status='connecting')
+        return True
+
+    def _stage_tool_round(self, context: ConversationContext,
+                          tool_calls: list[dict[str, Any]],
+                          call_ids: list[str], results: list[dict[str, Any]],
+                          thinking: str, full: str,
+                          image_markers: list[str]) -> None:
+        """Stage one assistant tool-call message and its results."""
         assistant_message: dict[str, Any] = {
             'role': 'assistant',
             'content': full or None,
@@ -600,7 +654,7 @@ class AgentLoop:
             } for index, call in enumerate(tool_calls)],
         }
         context.stage(assistant_message)
-        context.stage(*draft)
+        context.stage(*results)
         if image_markers:
             # Tool results are plain text on every wire, so the picture travels
             # in its own user block right after them.  The leading tag keeps
@@ -610,9 +664,41 @@ class AgentLoop:
                 'content': '<tool_images>\n' + '\n'.join(image_markers)
                            + '\n</tool_images>',
             })
-        with self._lock:
-            self.status = 'thinking'
-        self._emit('status', status='thinking')
+
+    # ── partial turns ───────────────────────────────────────
+    def _commit_partial(self, context: ConversationContext) -> bool:
+        """Commit the completed part of a turn that never reached its answer.
+
+        A turn that ran tools and then failed or was interrupted used to be
+        rolled back whole: the model lost every file it had read, every command
+        it had run and every result it had seen, so it started the next turn
+        from scratch (and often repeated the same work).  Only *complete* tool
+        rounds survive -- a half-streamed reply or a call that never ran is
+        dropped, because neither can be sent to a provider as-is.
+
+        Returns False when nothing worth keeping was staged.
+        """
+        draft = context.draft
+        if not draft:
+            return False
+        # Keep the longest prefix that ends with a tool result: that is exactly
+        # the part where every tool call has an answer.
+        cut = -1
+        for index, message in enumerate(draft):
+            if message.get('role') == 'tool':
+                cut = index
+        if cut < 0:
+            return False
+        kept = draft[:cut + 1]
+        repaired, changed = repair_messages(kept)
+        if changed:
+            # A batch that was cut in half leaves calls without results; the
+            # synthetic result keeps the history sendable.
+            self._append_notice(
+                f'Kept {len(kept)} message(s) of the interrupted turn; '
+                f'{changed} unfinished step(s) were closed.', level='warning')
+        draft[:] = repaired
+        context.commit()
         return True
 
     # ── compaction ──────────────────────────────────────────
@@ -660,9 +746,11 @@ class AgentLoop:
             f'Context compacted: {removed} messages summarized.', level='info')
         self._emit('compaction_end', text=summary, removed=removed)
         self._refresh_prefix(force=True)
+        # The follow-up request has not been sent yet, so the turn returns to
+        # the connection phase rather than to "thinking".
         with self._lock:
-            self.status = 'thinking'
-        self._emit('status', status='thinking')
+            self.status = 'connecting'
+        self._emit('status', status='connecting')
 
     def _run_compact(self) -> None:
         if self._interrupt.is_set() or self._stop.is_set():

@@ -12,11 +12,107 @@ from adcode.llm.usage import TokenBudget, TokenBudgetExceeded, estimate_tokens
 
 PROMPT_VERSION = 'adcode-v2'
 
+# Text used to answer a tool call that never produced a result.  Providers
+# reject an assistant message whose tool calls have no matching results, and a
+# turn that is interrupted (or a checkpoint written mid-turn) leaves exactly
+# that shape behind.
+INTERRUPTED_TOOL_RESULT = (
+    '[interrupted] this tool call did not run to completion; no result is '
+    'available. Re-run it if the result is still needed.'
+)
+
 
 def canonical_json(value: Any) -> str:
     return json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(',', ':'),
     ).replace('\r\n', '\n').replace('\r', '\n')
+
+
+def repair_messages(messages: Iterable[dict[str, Any]]
+                    ) -> tuple[list[dict[str, Any]], int]:
+    """Return a provider-safe copy of ``messages`` plus how many repairs it took.
+
+    Two shapes break every wire in a different way and both are reachable here:
+    an assistant message whose ``tool_calls`` were never answered (the turn was
+    interrupted, the app crashed, or a checkpoint was written between the call
+    and its result), and a ``tool`` message whose call no longer exists (a
+    rewind or a compaction removed the assistant message but kept the result).
+    The first gets a synthetic result so the conversation stays answerable; the
+    second is dropped.
+    """
+    repaired: list[dict[str, Any]] = []
+    changed = 0
+    pending: list[str] = []
+
+    def answer_pending() -> None:
+        nonlocal changed
+        for call_id in pending:
+            repaired.append({'role': 'tool', 'tool_call_id': call_id,
+                             'content': INTERRUPTED_TOOL_RESULT})
+            changed += 1
+        pending.clear()
+
+    for message in messages:
+        if not isinstance(message, dict):
+            changed += 1
+            continue
+        role = message.get('role')
+        if role == 'tool':
+            call_id = str(message.get('tool_call_id') or '')
+            if call_id and call_id in pending:
+                pending.remove(call_id)
+                repaired.append(dict(message))
+            else:
+                # No assistant call owns this result; sending it would be
+                # rejected as an unknown tool_use_id.
+                changed += 1
+            continue
+        answer_pending()
+        copy = dict(message)
+        calls = copy.get('tool_calls')
+        if role == 'assistant' and isinstance(calls, list):
+            # Rebuild the list so repairing an id never edits the caller's
+            # history in place.
+            rebuilt: list[Any] = []
+            for index, call in enumerate(calls):
+                if not isinstance(call, dict):
+                    changed += 1
+                    continue
+                call = dict(call)
+                call_id = str(call.get('id') or '')
+                if not call_id:
+                    changed += 1
+                    call_id = f'call_repair_{index}'
+                    call['id'] = call_id
+                rebuilt.append(call)
+                if call_id not in pending:
+                    pending.append(call_id)
+            copy['tool_calls'] = rebuilt
+        repaired.append(copy)
+    answer_pending()
+    return repaired, changed
+
+
+def messages_need_repair(messages: Iterable[dict[str, Any]]) -> bool:
+    """Cheap structural check, so the common case never copies the history."""
+    pending: set[str] = set()
+    for message in messages:
+        if not isinstance(message, dict):
+            return True
+        role = message.get('role')
+        if role == 'tool':
+            call_id = str(message.get('tool_call_id') or '')
+            if call_id not in pending:
+                return True
+            pending.discard(call_id)
+            continue
+        if pending:
+            return True
+        if role == 'assistant':
+            for call in message.get('tool_calls') or []:
+                if isinstance(call, dict):
+                    pending.add(str(call.get('id') or ''))
+    return bool(pending)
 
 
 def normalized_endpoint(endpoint: str) -> str:
