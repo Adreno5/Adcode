@@ -121,6 +121,25 @@ def test_typing_after_escape_is_not_swallowed():
     assert ''.join(event.text for event in events) == '[hello'
 
 
+@pytest.mark.parametrize('typed', ['/', '3', ';', '?', '=', 'text'])
+def test_printables_after_escape_reach_the_prompt(typed):
+    """Esc closes a dialog; the next key typed there must not vanish."""
+    parser = KeyParser()
+    parser.feed('\x1b', now=0.0)
+    assert parser.flush_due(now=0.2)[0].key == 'esc'
+    events = parser.feed(typed, now=0.25)
+    assert ''.join(event.text for event in events) == typed
+
+
+def test_split_report_parameters_after_escape_are_swallowed():
+    parser = KeyParser()
+    parser.feed('\x1b', now=0.0)
+    parser.flush_due(now=0.2)
+    assert parser.feed('1;5', now=0.25) == []
+    assert parser.feed('A', now=0.3) == []
+    assert parser.feed('q', now=0.35)[0].text == 'q'   # typing resumes
+
+
 def test_escape_flush_waits_for_its_window():
     parser = KeyParser()
     assert parser.feed('\x1b', now=0.0) == []

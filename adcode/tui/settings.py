@@ -19,7 +19,9 @@ from adcode.config import (
 )
 from adcode.theme import ACCENT_PRESETS, Palette
 from adcode.tui.canvas import BOLD, DIM, Canvas, text_width, truncate_text
-from adcode.tui.dialogs import Overlay, _draw_backdrop, _draw_frame, _draw_hint, _panel_geometry
+from adcode.tui.dialogs import (
+    Overlay, _draw_backdrop, _draw_frame, _draw_hint, _panel_geometry, wheel_step,
+)
 from adcode.tui.input import KeyEvent, get_clipboard, is_paste_key
 
 
@@ -424,6 +426,9 @@ class SettingsOverlay(Overlay):
         if event.kind == 'paste':
             return True
         if event.kind == 'mouse':
+            step = wheel_step(event)
+            if step:
+                self._move(step)
             return True
         if event.kind != 'key':
             return True

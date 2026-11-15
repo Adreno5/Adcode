@@ -13,7 +13,7 @@ from adcode.tui.canvas import BOLD, Canvas, text_width, truncate_text
 from adcode.tui.dialogs import (
     DialogItem, MessageDialog, MultiSelectDialog, Overlay,
     _draw_backdrop, _draw_frame, _draw_hint,
-    _panel_geometry,
+    _panel_geometry, wheel_step,
 )
 from adcode.tui.input import KeyEvent, get_clipboard, is_paste_key
 
@@ -110,6 +110,9 @@ class ModelEditorOverlay(Overlay):
                     self._apply_edit()
             return True
         if event.kind == 'mouse':
+            step = wheel_step(event)
+            if step:
+                self.index = (self.index + step) % len(self._fields)
             return True
         if event.kind == 'key':
             if event.key == 'esc':
@@ -283,7 +286,9 @@ class ProviderWizard:
 
             def done() -> None:
                 if self.app.overlay is message:
-                    self.app.overlay = None
+                    # The spinner vanishes on its own: keys the user pressed at
+                    # it must not spill into the prompt or the next dialog.
+                    self.app.dismiss_overlay(message, drop_input=True)
                 if error or not models:
                     self._fetch_failed(base_url, api_key, name, wire, error,
                                        fetch_wire or wire)

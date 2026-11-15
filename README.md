@@ -128,6 +128,10 @@ maximum output, vision support, tool calling, and reasoning efforts.
 `enter` to run the command and `esc` to close. It lists the same commands the
 `/` prefix and the `/help` output show.
 
+While a dialog is open it owns the keyboard and the wheel: keys filter or edit
+inside the dialog, and the wheel moves the dialog's list instead of scrolling
+the transcript behind it.
+
 ## Commands
 
 Type `/` to open the command palette. Up/Down selects a candidate, Tab or
