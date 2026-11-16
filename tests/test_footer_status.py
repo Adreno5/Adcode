@@ -141,3 +141,86 @@ def test_the_progress_is_forgotten_with_the_command(app):
     app._apply_event('tool_output', {'call_id': 'c1', 'text': 'step [ 45%]'})
     app._apply_event('tool_end', {'call_id': 'c1', 'name': 'bash'})
     assert app._footer_progress(time.time()) is None
+
+
+# ── the light walks with the tokens ────────────────────────
+def test_the_light_walks_with_the_tokens(app):
+    """One cycle of the light per N tokens."""
+    app.config.footer.sweep_tokens_per_cycle = 100
+    app._stream_tokens = 0
+    assert app._sweep_position('answering', 0.0) == pytest.approx(0.0)
+    app._stream_tokens = 25
+    assert app._sweep_position('answering', 0.0) == pytest.approx(0.25)
+    app._stream_tokens = 100
+    assert app._sweep_position('answering', 0.0) == pytest.approx(0.0)
+    app._stream_tokens = 150
+    assert app._sweep_position('answering', 0.0) == pytest.approx(0.5)
+
+
+def test_the_token_mode_only_moves_while_the_model_generates(app):
+    app.config.footer.sweep_tokens_per_cycle = 100
+    app._stream_tokens = 30
+    # A running command has no tokens: the light keeps its own rhythm.
+    position = app._sweep_position('tool', 0.25)
+    assert position != pytest.approx(0.3)
+
+
+def test_the_streamed_tokens_are_counted(app):
+    app._apply_event('turn_start', {'turn': 1, 'text': 'hi'})
+    app._apply_event('text_delta', {'text': 'hello world'})
+    assert app._stream_tokens > 0
+    before = app._stream_tokens
+    app._apply_event('text_delta', {'text': 'more'})
+    assert app._stream_tokens > before
+
+
+def test_the_token_rate_follows_the_usage(app):
+    app._apply_event('turn_start', {'turn': 1, 'text': 'hi'})
+    app._token_samples = [(time.time() - 2.0, 0), (time.time(), 120)]
+    assert app._token_rate() == pytest.approx(60.0, abs=2.0)
+
+
+def test_the_light_follows_the_token_rate(app):
+    app.config.footer.sweep_tok_speed = True
+    app.config.footer.sweep_period = 1.0
+    app.config.footer.sweep_tok_rate = 60.0
+    app._token_samples = [(time.time() - 2.0, 0), (time.time(), 120)]
+    assert app._sweep_period('answering') == pytest.approx(1.0, rel=0.05)
+    app._token_samples = [(time.time() - 2.0, 0), (time.time(), 600)]
+    assert app._sweep_period('answering') == pytest.approx(0.2, rel=0.05)
+
+
+def test_without_a_rate_the_light_moves_slowly(app):
+    app.config.footer.sweep_tok_speed = True
+    app.config.footer.sweep_period = 1.0
+    app.config.footer.sweep_slow_factor = 6.0
+    assert app._token_rate() == 0.0
+    assert app._sweep_period('answering') == pytest.approx(6.0, rel=0.01)
+
+
+def test_the_line_breathes_while_connecting(app):
+    levels = []
+    for step in range(12):
+        app.canvas.clear()
+        app._draw_connect_breath(60, 9, step * 0.1)
+        cells = [app.canvas.cell(x, 9) for x in range(60)]
+        levels.append(max(sum(abs(a - b) for a, b in zip(c.bg,
+                                                         app.palette.background))
+                         for c in cells))
+    # It fades in and out instead of staying flat.
+    assert max(levels) > min(levels) * 2
+
+
+def test_the_rate_is_measured_while_the_model_writes(app):
+    """The speed of the model, measured from the tokens that stream."""
+    app._apply_event('turn_start', {'turn': 1, 'text': 'hi'})
+    app._apply_event('text_delta', {'text': 'word ' * 200})
+    assert app._stream_rate() > 0
+    # The rate of the fake clock: the sample is old enough to be measured.
+    app._stream_started = time.time() - 2.0
+    assert app._token_rate() == pytest.approx(100.0, rel=0.5)
+
+
+def test_without_tokens_there_is_no_rate(app):
+    app._apply_event('turn_start', {'turn': 1, 'text': 'hi'})
+    assert app._token_rate() == 0.0

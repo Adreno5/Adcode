@@ -8,6 +8,7 @@ event queue consumed here.
 
 from __future__ import annotations
 
+import math
 import os
 import queue
 import re
@@ -57,6 +58,8 @@ _DEFAULT_FPS = 60
 SWEEP_PERIOD = 1.0
 # The UI error log is capped; a bug that fires every frame would fill it.
 _LOG_MAX_BYTES = 2 * 1024 * 1024
+#: How far back the token rate is measured, in seconds.
+_TOKEN_RATE_WINDOW = 3.0
 # How wide the light is, in cells.
 SWEEP_SPAN = 12
 # How long the event loop sleeps when there is nothing to draw. A keypress
@@ -329,6 +332,15 @@ class AdCodeApp:
         self.footer_state_at = 0.0
         # The percentages the running command reported, with their time.
         self._progress: list[tuple[float, int]] = []
+        # The output tokens of the model, with their time: they say how fast
+        # it generates.
+        self._token_samples: list[tuple[float, int]] = []
+        # The tokens the model produced in this turn, counted while they
+        # stream: they move the light in the token driven mode.
+        self._stream_tokens = 0
+        # When the first token of the turn arrived: the speed is measured
+        # from there, so the wait for the provider is not part of it.
+        self._stream_started = 0.0
         # Wall clock start of the current connection attempt, so the footer can
         # show how long the provider has been silent.
         self.connect_started = 0.0
@@ -704,6 +716,10 @@ class AdCodeApp:
 
     def _apply_event(self, kind: str, payload: dict[str, Any]) -> None:
         if kind == 'turn_start':
+            # The token samples survive the turn: the output counter is a
+            # session total, so two turns are comparable.
+            self._stream_tokens = 0
+            self._stream_started = 0.0
             self._reset_live()
             # A turn opens by sending a request; no model output exists yet, so
             # the honest phase is "connecting" until the first stream event.
@@ -717,6 +733,7 @@ class AdCodeApp:
             if not self.live_thinking_text:
                 self.live_thinking_started = time.time()
             self.live_thinking_text += payload.get('text', '')
+            self._count_stream_tokens(payload.get('text', ''))
             self.live_thinking.feed(payload.get('text', ''))
         elif kind == 'thinking_end':
             self.live_thinking_text = ''
@@ -729,6 +746,7 @@ class AdCodeApp:
                 self.live_answer_text = ''
                 self.phase = 'answering'
             self.live_answer_text += payload.get('text', '')
+            self._count_stream_tokens(payload.get('text', ''))
             self.live_answer.feed(payload.get('text', ''))
         elif kind == 'text_end':
             self.live_answer = MarkdownRenderer(self._content_width())
@@ -767,6 +785,7 @@ class AdCodeApp:
             self.live_compaction = MarkdownRenderer(self._content_width())
             self.phase = 'thinking'
         elif kind == 'usage':
+            self._sample_tokens()
             self.dirty = True
         elif kind == 'notice':
             level = payload.get('level', 'info')
@@ -1667,6 +1686,9 @@ class AdCodeApp:
         if progress is not None and not done:
             filled = max(1, int(columns * progress / 100))
             self.canvas.fill_row(y, self.palette.accent, 120, 0, filled)
+        if phase == 'connecting' and not done:
+            # Waiting for the provider: the whole line breathes.
+            self._draw_connect_breath(columns, y, now)
         if phase == 'connecting':
             # Reconnecting is the same wait, but the user deserves to know the
             # first attempt already failed.
@@ -1715,6 +1737,9 @@ class AdCodeApp:
         x += self.canvas.draw_text(x, y, status, self._footer_color(color),
                                    None, 0, 255, room)
         extras: list[str] = []
+        rate = self._token_rate()
+        if rate > 0 and phase in ('thinking', 'answering'):
+            extras.append(f'{rate:.0f} tok/s')
         queued = snap.queued
         if queued:
             extras.append(f'{queued} queued')
@@ -1882,6 +1907,108 @@ class AdCodeApp:
             return 'pytest'
         return base or first
 
+    # ── the speed of the model ─────────────────────────────
+    def _count_stream_tokens(self, text: str) -> None:
+        """Count the tokens the model produces while they stream.
+
+        The usage report only arrives when a request ends, which is too late
+        for a light that has to move with the tokens.  The estimate of the
+        streamed text is good enough to walk the light along.
+        """
+        if not text:
+            return
+        from adcode.llm.usage import estimate_text_tokens
+        if not self._stream_started:
+            self._stream_started = time.time()
+        self._stream_tokens += estimate_text_tokens(text)
+
+    def _sample_tokens(self) -> None:
+        """Remember how many tokens the model has produced, and when.
+
+        The difference between two samples is the speed of the model.
+        """
+        try:
+            total = int(self.snapshot().total_out)
+        except Exception:
+            return
+        self._token_samples.append((time.time(), total))
+        del self._token_samples[:-16]
+
+    def _token_rate(self) -> float:
+        """The output tokens per second of the model, as far as it is known.
+
+        The usage report is exact but only arrives when a request ends, and
+        the time between two requests includes the tools and the thinking
+        that ran in between -- that is not the speed of the model.  While the
+        model writes, the streamed tokens and the time since the first one
+        measure it directly.
+        """
+        if len(self._token_samples) >= 2:
+            now, total = self._token_samples[-1]
+            window = [sample for sample in self._token_samples
+                      if now - sample[0] <= _TOKEN_RATE_WINDOW]
+            if len(window) >= 2:
+                stamp, value = window[0]
+                elapsed = now - stamp
+                if elapsed > 0:
+                    exact = (total - value) / elapsed
+                    if exact > 0:
+                        return exact
+        return self._stream_rate()
+
+    def _stream_rate(self) -> float:
+        """The speed of the model, measured while it writes."""
+        if not self._stream_started or not self._stream_tokens:
+            return 0.0
+        elapsed = time.time() - self._stream_started
+        if elapsed <= 0:
+            return 0.0
+        return self._stream_tokens / elapsed
+
+    def _sweep_period(self, phase: str) -> float:
+        """How long the light takes to cross the line.
+
+        While the model generates, the light follows its speed: a fast model
+        gets a fast light.  Without a measurement the light keeps moving,
+        slowly.
+        """
+        footer = self.config.footer
+        base = max(0.05, footer.sweep_period)
+        if not footer.sweep_tok_speed:
+            return base
+        if phase not in ('thinking', 'answering'):
+            return base
+        rate = self._token_rate()
+        if rate <= 0:
+            # Nothing is known yet: the light crawls.
+            return base * max(1.0, footer.sweep_slow_factor)
+        reference = max(1.0, footer.sweep_tok_rate)
+        return max(base / 8.0, min(base * 8.0, base * reference / rate))
+
+    def _sweep_position(self, phase: str, now: float) -> float:
+        """Where the light is on its way, in 0..1.
+
+        In the token driven mode the light walks with the tokens: one cycle
+        of the line per ``sweep_tokens_per_cycle`` tokens.  Otherwise the
+        time decides.
+        """
+        per_cycle = int(self.config.footer.sweep_tokens_per_cycle)
+        if per_cycle > 0 and phase in ('thinking', 'answering'):
+            return (self._stream_tokens % per_cycle) / per_cycle
+        period = self._sweep_period(phase)
+        return (now % period) / period
+
+    def _draw_connect_breath(self, columns: int, y: int, now: float) -> None:
+        """The line breathes while the provider is contacted.
+
+        Nothing happens yet, so the line does not run: it fades in and out
+        instead, which says "waiting" without pretending to be busy.
+        """
+        period = max(0.1, self.config.footer.connect_pulse)
+        phase = (now % period) / period
+        wave = (1.0 - math.cos(phase * 2 * math.pi)) / 2
+        self.canvas.fill_row(y, self.palette.accent, int(18 + 74 * wave))
+
     def _draw_status_sweep(self, columns: int, y: int, phase: str) -> None:
         """The light that runs along the status line while the agent works.
 
@@ -1895,11 +2022,11 @@ class AdCodeApp:
             return
         if phase not in ('thinking', 'answering', 'tool', 'compacting', 'aside'):
             return
-        period = max(0.05, footer.sweep_period)
         span = max(1, footer.sweep_span)
         # The light enters from beyond the left edge and leaves beyond the
         # right one, so it is never half on screen.
-        head = ((time.time() % period) / period * (columns + span) - span)
+        position = self._sweep_position(phase, time.time())
+        head = position * (columns + span) - span
         for offset in range(span):
             x = int(head) - offset
             if not (0 <= x < columns):

@@ -302,8 +302,22 @@ The line under the input carries the state of the session.  `/config` has a
 **Footer status** group for it; almost every part is configurable.
 
 **While the agent works.** A light runs along the line: it enters at the left
-edge, crosses the screen once per second and leaves at the right one.  The
-wait for the provider (`connecting`) has no light.
+edge, crosses the screen once per second and leaves at the right one.
+
+The light can follow the speed of the model (`footer.sweep_tok_speed`): the
+period is scaled by the output tokens per second, so a fast model gets a fast
+light.  `footer.sweep_tok_rate` is the rate at which the light keeps the
+configured period, and `footer.sweep_slow_factor` says how much slower it
+moves while there is no measurement yet (tok/s of zero).
+
+Or it can walk with the tokens themselves (`footer.sweep_tokens_per_cycle`):
+the number is how many tokens the model has to produce for the light to
+cross the line once.  A value of zero keeps the time based speed.  The
+tokens per second of the model show up on the line while it writes.
+
+**While the provider is contacted.** The whole line breathes -- it fades in
+and out (`footer.connect_pulse`) instead of running a light: nothing is
+happening yet.
 
 **A command that reports its progress.**  When the running command prints a
 percentage -- a pytest run, a build, a download -- the line becomes a
@@ -325,6 +339,11 @@ second.
 | `footer.sweep_enabled` | The light that runs along the line |
 | `footer.sweep_period` | Seconds per crossing |
 | `footer.sweep_span` | The width of the light, in cells |
+| `footer.sweep_tok_speed` | The light follows the tokens per second |
+| `footer.sweep_tok_rate` | The tokens per second at `sweep_period` |
+| `footer.sweep_slow_factor` | How much slower it moves without a rate |
+| `footer.sweep_tokens_per_cycle` | Tokens per cycle of the light (0 = by time) |
+| `footer.connect_pulse` | Seconds per breath while connecting |
 | `footer.progress_enabled` | The progress bar |
 | `footer.progress_window` | How long a percentage stays fresh |
 | `footer.progress_samples` | Samples needed before the bar shows |

@@ -296,6 +296,14 @@ class FooterSettings:
     sweep_enabled: bool = True
     sweep_period: float = 1.0      # seconds per crossing
     sweep_span: int = 12           # the width of the light, in cells
+    # the light follows the speed of the model while it generates
+    sweep_tok_speed: bool = False
+    sweep_tok_rate: float = 60.0   # tokens per second at ``sweep_period``
+    sweep_slow_factor: float = 6.0  # how much slower it moves without a rate
+    # One cycle of the light per N tokens; 0 keeps the time based speed.
+    sweep_tokens_per_cycle: int = 0
+    # the breathing line while the provider is contacted
+    connect_pulse: float = 1.2     # seconds per breath
     # the progress bar
     progress_enabled: bool = True
     progress_window: float = 10.0  # how long a sample stays fresh
@@ -314,6 +322,12 @@ class FooterSettings:
             sweep_enabled=_bool(raw.get('sweep_enabled'), True),
             sweep_period=_bounded_float(raw.get('sweep_period'), 0.05, 60, 1.0),
             sweep_span=_bounded_int(raw.get('sweep_span'), 1, 200, 12),
+            sweep_tok_speed=_bool(raw.get('sweep_tok_speed'), False),
+            sweep_tok_rate=_bounded_float(raw.get('sweep_tok_rate'), 1, 100_000, 60.0),
+            sweep_slow_factor=_bounded_float(raw.get('sweep_slow_factor'), 1, 100, 6.0),
+            sweep_tokens_per_cycle=_bounded_int(
+                raw.get('sweep_tokens_per_cycle'), 0, 1_000_000, 0),
+            connect_pulse=_bounded_float(raw.get('connect_pulse'), 0.1, 60, 1.2),
             progress_enabled=_bool(raw.get('progress_enabled'), True),
             progress_window=_bounded_float(raw.get('progress_window'), 0.5, 600, 10.0),
             progress_samples=_bounded_int(raw.get('progress_samples'), 1, 100, 2),
