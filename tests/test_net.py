@@ -5,7 +5,7 @@ import urllib.request
 
 import pytest
 
-from adcode import net
+from infra import net
 from adcode.config import ModelConfig, ProviderConfig
 from adcode.llm.client import LLMClient
 

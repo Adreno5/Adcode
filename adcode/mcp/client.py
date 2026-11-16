@@ -16,7 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from adcode import net
+from infra import net
 from typing import Any
 
 PROTOCOL_VERSION = '2025-06-18'

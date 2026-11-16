@@ -18,7 +18,7 @@ import threading
 import time
 import urllib.request
 
-from adcode import net
+from infra import net
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
