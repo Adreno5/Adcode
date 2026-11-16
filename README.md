@@ -649,9 +649,7 @@ stops learning from the tools and repeats them until the turn is interrupted.
 ```
 adcode/
 ├── cli.py            # console entry point
-├── net.py            # proxy-aware HTTP (SOCKS5, urllib fallbacks)
 ├── agent_loop.py     # the engine facade: events, sessions, control plane
-├── engine.py         # the engine itself: interruptions, hold, reasoning
 ├── config.py         # settings schema, migration, atomic save
 ├── crypto.py         # Fernet API-key encryption
 ├── models_dev.py     # models.dev catalogue and cache
@@ -795,12 +793,15 @@ of crashing the app.
 
 ## Dependencies
 
+- `aicf-core` -- the engine sdk: conversation engine, wire clients, tools,
+  sessions, sub-agent collaboration
 - `openai` -- OpenAI-compatible Chat Completions and Responses clients
 - `anthropic` -- Messages API client
 - `httpx2[socks]` -- HTTP transport, including the SOCKS5 proxy support
 - `cryptography` -- Fernet encryption for API keys
 - `keyring` -- OS credential storage
 - `pyperclip` -- clipboard access
+- `pyyaml` -- skill frontmatter
 
 ## License
 
