@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import threading
 import time
 from pathlib import Path
@@ -141,6 +142,26 @@ class PromptState:
     def copy(self) -> str:
         start, end = self.selection()
         return self.text[start:end] if start != end else ''
+
+
+#: A percentage in a line of command output.
+_PERCENT_RE = re.compile(r'(\d{1,3})\s*%')
+
+
+def _percent_in(text: str) -> int | None:
+    """The last percentage a line of output mentions."""
+    if not text:
+        return None
+    matches = _PERCENT_RE.findall(text)
+    if not matches:
+        return None
+    try:
+        value = int(matches[-1])
+    except ValueError:
+        return None
+    if value < 0 or value > 100:
+        return None
+    return value
 
 
 def _format_tokens(value: int) -> str:
@@ -302,6 +323,12 @@ class AdCodeApp:
         # level shows them next to the tool name as the current action.
         self.status_args: dict[str, Any] = {}
         self.status_tool_name = ''
+        # The state of the status line: normal, done (the task finished) or
+        # fading (the user typed, the green leaves again).
+        self.footer_state = 'normal'
+        self.footer_state_at = 0.0
+        # The percentages the running command reported, with their time.
+        self._progress: list[tuple[float, int]] = []
         # Wall clock start of the current connection attempt, so the footer can
         # show how long the provider has been silent.
         self.connect_started = 0.0
@@ -709,6 +736,7 @@ class AdCodeApp:
             if self.phase == 'answering':
                 self.phase = 'idle'
         elif kind == 'tool_start':
+            self._progress = []
             self.live_answer = MarkdownRenderer(self._content_width())
             self.live_answer_text = ''
             self.active_tool = payload.get('call_id', '')
@@ -719,9 +747,12 @@ class AdCodeApp:
             self.status_tool_name = payload.get('name', '') or ''
         elif kind == 'tool_output':
             if payload.get('call_id') == self.active_tool:
-                self.live_tool_output.append(payload.get('text', ''))
+                text = payload.get('text', '')
+                self.live_tool_output.append(text)
                 del self.live_tool_output[:-30]
+                self._sample_progress(text)
         elif kind == 'tool_end':
+            self._progress = []
             self.active_tool = ''
             self.live_tool_output = []
             self.status_args = {}
@@ -750,6 +781,8 @@ class AdCodeApp:
             self._reset_live()
             self.phase = 'idle'
             self.status_hint = ''
+            if payload.get('status', 'done') == 'done':
+                self._footer_done()
         elif kind == 'aside_start':
             self.phase = 'aside'
             self.live_aside_question = payload.get('question', '')
@@ -817,10 +850,21 @@ class AdCodeApp:
         return max(0.0, time.time() - self.connect_started)
 
     def _needs_animation(self) -> bool:
-        return self.phase in ('connecting', 'thinking', 'answering', 'tool',
-                              'compacting', 'aside')
+        if self.phase in ('connecting', 'thinking', 'answering', 'tool',
+                          'compacting', 'aside'):
+            return True
+        # The green wipe in and out need frames of their own.
+        if self.footer_state in ('done', 'fading'):
+            wipe = max(0.0, self.config.footer.done_wipe)
+            if wipe <= 0:
+                return False
+            return (time.time() - self.footer_state_at) < wipe
+        return False
 
     def _tick_animation(self) -> None:
+        # The green state leaves on its own; the tick runs every loop, not
+        # only when a frame is drawn.
+        self._footer_tick(time.time())
         if self._needs_animation():
             self.dirty = True
 
@@ -875,12 +919,14 @@ class AdCodeApp:
             return
         if event.kind == 'paste':
             self.prompt.insert(event.text)
+            self._footer_input()
             self.dirty = True
             return
         if event.kind == 'text':
             # Route typing through PromptState so the selection and undo stacks
             # stay consistent.
             self.prompt.insert(event.text)
+            self._footer_input()
             self.dirty = True
             return
         if event.kind != 'key':
@@ -1606,8 +1652,21 @@ class AdCodeApp:
 
     def _draw_footer(self, columns: int, y: int, max_scroll: int) -> None:
         snap = self.snapshot()
-        frame = SPINNER[int(time.time() * 10) % len(SPINNER)]
+        now = time.time()
+        frame = SPINNER[int(now * 10) % len(SPINNER)]
         phase = self.phase
+        # The background of the line: the green of a finished task, or the
+        # bar of a command that reports its progress.
+        self._footer_tick(now)
+        cover = self._footer_done_cover(columns, now)
+        done = self.footer_state in ('done', 'fading')
+        done_background, done_foreground = self._footer_colors()
+        if cover:
+            self.canvas.fill_row(y, done_background, 255, 0, cover)
+        progress = self._footer_progress(now)
+        if progress is not None and not done:
+            filled = max(1, int(columns * progress / 100))
+            self.canvas.fill_row(y, self.palette.accent, 120, 0, filled)
         if phase == 'connecting':
             # Reconnecting is the same wait, but the user deserves to know the
             # first attempt already failed.
@@ -1620,7 +1679,12 @@ class AdCodeApp:
         elif phase == 'answering':
             status = f'{frame} writing'
         elif phase == 'tool':
-            status = f'{frame} {self._current_action()}'
+            if progress is not None:
+                # The command reports its progress: the line says what runs
+                # and how far it is.
+                status = f'{frame} {self._progress_label()} {progress}%'
+            else:
+                status = f'{frame} {self._current_action()}'
         elif phase == 'compacting':
             status = f'{frame} compacting'
         elif phase == 'aside':
@@ -1632,6 +1696,9 @@ class AdCodeApp:
             'tool': 'accent', 'compacting': 'info', 'aside': 'accent',
             'idle': 'muted',
         }.get(phase, 'muted')
+        if done:
+            # On the green the font is white.
+            color = done_foreground
         # The token status sits at the right edge; the status line and the
         # extras get the room that is left of it.
         right = ''
@@ -1645,7 +1712,7 @@ class AdCodeApp:
             right_x = max(1, columns - 1 - text_width(right))
         room = max(0, right_x - 1)
         x = 1
-        x += self.canvas.draw_text(x, y, status, self._color(color, 'muted'),
+        x += self.canvas.draw_text(x, y, status, self._footer_color(color),
                                    None, 0, 255, room)
         extras: list[str] = []
         queued = snap.queued
@@ -1686,13 +1753,134 @@ class AdCodeApp:
                 break
             fitting.append(extra)
         if fitting:
-            x += self.canvas.draw_text(x, y, separator, self.palette.border,
+            x += self.canvas.draw_text(x, y, separator, self._footer_color('border'),
                                        None, 0, 255, right_x - x)
-            self.canvas.draw_text(x, y, '  ·  '.join(fitting), self.palette.muted,
+            self.canvas.draw_text(x, y, '  ·  '.join(fitting),
+                                  self._footer_color('muted'),
                                   None, 0, 255, right_x - x)
-        self._draw_status_sweep(columns, y, phase)
+        if progress is None:
+            # The light only runs when there is no progress bar to show.
+            self._draw_status_sweep(columns, y, phase)
         if right:
-            self.canvas.draw_text(right_x, y, right, self.palette.muted)
+            self.canvas.draw_text(right_x, y, right, self._footer_color('muted'))
+
+    # ── the status line ────────────────────────────────────
+    def _footer_done(self) -> None:
+        """The task finished: the status line turns green."""
+        if not self.config.footer.done_enabled:
+            return
+        self.footer_state = 'done'
+        self.footer_state_at = time.time()
+
+    def _footer_input(self) -> None:
+        """The user typed: the green leaves the status line again."""
+        if self.footer_state != 'done':
+            return
+        if not self.config.footer.done_hold:
+            self.footer_state = 'normal'
+            self.dirty = True
+            return
+        self.footer_state = 'fading'
+        self.footer_state_at = time.time()
+        self.dirty = True
+
+    def _sample_progress(self, text: str) -> None:
+        """Remember the percentage the running command reported.
+
+        A percentage on its own means nothing: pip prints one per package,
+        a build tool one per file.  Only a value that keeps climbing is a
+        total progress, so the samples are kept and compared.
+        """
+        if not self.config.footer.progress_enabled:
+            return
+        value = _percent_in(text)
+        if value is None:
+            return
+        now = time.time()
+        self._progress.append((now, value))
+        # The samples of a run are bounded; the oldest ones say nothing about
+        # the current value anyway.
+        del self._progress[:-64]
+
+    def _footer_progress(self, now: float) -> int | None:
+        """The trustworthy progress of the running command, if there is one.
+
+        A percentage that jumps around is not a total progress: the samples
+        have to climb steadily.  Anything else falls back to the light.
+        """
+        footer = self.config.footer
+        if not footer.progress_enabled or not self._progress:
+            return None
+        values = [value for _, value in self._progress]
+        for older, newer in zip(values, values[1:]):
+            if newer < older:
+                return None
+        if len(values) < footer.progress_samples:
+            return None
+        stamp, value = self._progress[-1]
+        if now - stamp > footer.progress_window:
+            return None
+        return max(0, min(100, value))
+
+    def _footer_tick(self, now: float) -> None:
+        """Leave the green state once the fade is over."""
+        if self.footer_state != 'fading':
+            return
+        wipe = max(0.0, self.config.footer.done_wipe)
+        if wipe <= 0 or now - self.footer_state_at >= wipe:
+            self.footer_state = 'normal'
+            self.footer_state_at = 0.0
+
+    def _footer_done_cover(self, columns: int, now: float) -> int:
+        """How many columns of the status line the green covers."""
+        footer = self.config.footer
+        if self.footer_state == 'normal':
+            return 0
+        wipe = max(0.0, footer.done_wipe)
+        elapsed = now - self.footer_state_at
+        if self.footer_state == 'done':
+            if wipe <= 0:
+                return columns
+            # The green runs in from the left edge.
+            return min(columns, int(columns * min(1.0, elapsed / wipe)))
+        # Fading: the green leaves from the left edge to the right one.
+        if wipe <= 0:
+            return 0
+        gone = min(1.0, elapsed / wipe)
+        return max(0, int(columns * (1.0 - gone)))
+
+    def _footer_colors(self) -> tuple[Any, Any]:
+        """The background and the font colour of the status line."""
+        from adcode.theme import parse_hex
+        footer = self.config.footer
+        background = (parse_hex(footer.done_color, self.palette.success)
+                      if footer.done_color else self.palette.success)
+        foreground = (parse_hex(footer.done_text_color, (255, 255, 255))
+                      if footer.done_text_color else (255, 255, 255))
+        return background, foreground
+
+    def _footer_color(self, role: Any) -> Any:
+        """The colour of the status line.
+
+        On the green of a finished task every text is white, so the line
+        reads as one block instead of a mix of roles.
+        """
+        if self.footer_state in ('done', 'fading'):
+            return self._footer_colors()[1]
+        return self._color(role, 'muted')
+
+    def _progress_label(self) -> str:
+        """The first word of the running command: what the bar is about."""
+        command = str(self.status_args.get('command', '')).strip()
+        if not command:
+            return self.status_tool_name or self.status_hint or 'tool'
+        first = command.split()[0]
+        # A path or a wrapper hides the real program: "python -m pytest" is
+        # a pytest run, "/usr/bin/pytest" is a pytest run.
+        base = first.rsplit('/', 1)[-1]
+        if base in ('python', 'python3') and 'pytest' in command:
+            return 'pytest'
+        return base or first
 
     def _draw_status_sweep(self, columns: int, y: int, phase: str) -> None:
         """The light that runs along the status line while the agent works.
@@ -1702,13 +1890,17 @@ class AdCodeApp:
         the text.  The wait for the provider (``connecting``) has no light:
         nothing is happening yet.
         """
+        footer = self.config.footer
+        if not footer.sweep_enabled:
+            return
         if phase not in ('thinking', 'answering', 'tool', 'compacting', 'aside'):
             return
+        period = max(0.05, footer.sweep_period)
+        span = max(1, footer.sweep_span)
         # The light enters from beyond the left edge and leaves beyond the
         # right one, so it is never half on screen.
-        head = ((time.time() % SWEEP_PERIOD) / SWEEP_PERIOD
-                * (columns + SWEEP_SPAN) - SWEEP_SPAN)
-        for offset in range(SWEEP_SPAN):
+        head = ((time.time() % period) / period * (columns + span) - span)
+        for offset in range(span):
             x = int(head) - offset
             if not (0 <= x < columns):
                 continue

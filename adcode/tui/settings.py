@@ -199,6 +199,27 @@ def build_settings_tree(config: AppConfig) -> list[SettingNode]:
         ]),
     ])
 
+    footer = [
+        _bool('footer.sweep', 'Running light', 'footer.sweep_enabled'),
+        _number('footer.sweep_period', 'Light period (s)', 'footer.sweep_period',
+                1, 60),
+        _number('footer.sweep_span', 'Light width (cells)', 'footer.sweep_span',
+                1, 200),
+        _bool('footer.progress', 'Progress bar', 'footer.progress_enabled'),
+        _number('footer.progress_window', 'Sample freshness (s)',
+                'footer.progress_window', 1, 600),
+        _number('footer.progress_samples', 'Samples before the bar',
+                'footer.progress_samples', 1, 100),
+        _bool('footer.done', 'Green when finished', 'footer.done_enabled'),
+        _number('footer.done_wipe', 'Wipe duration (s)', 'footer.done_wipe',
+                0, 60),
+        _bool('footer.done_hold', 'Stay green until input', 'footer.done_hold'),
+        _text('footer.done_color', 'Green colour (#rrggbb)', 'footer.done_color',
+              'Empty uses the palette green'),
+        _text('footer.done_text_color', 'Font colour (#rrggbb)',
+              'footer.done_text_color', 'Empty uses white'),
+    ]
+
     hold = [
         _bool('hold.enabled', 'Keep retrying', 'hold.enabled'),
         _number('hold.retries', 'Maximum retries', 'hold.max_retries',
@@ -273,6 +294,9 @@ def build_settings_tree(config: AppConfig) -> list[SettingNode]:
         thinking_item,
         tool_item,
         chain_item,
+        SettingNode(key='group:Footer', label='Footer status', kind='group',
+                    choices=[]),
+        *footer,
         SettingNode(key='group:Hold', label='Hold', kind='group', choices=[]),
         *hold,
         SettingNode(key='group:Reasoning', label='Reasoning', kind='group', choices=[]),

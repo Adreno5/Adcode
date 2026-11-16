@@ -59,6 +59,16 @@ def _choice(value: Any, choices: tuple[str, ...], default: str) -> str:
     return value if isinstance(value, str) and value in choices else default
 
 
+def _bounded_float(value: Any, low: float, high: float, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number:      # NaN
+        return default
+    return max(low, min(high, number))
+
+
 def _bool(value: Any, default: bool) -> bool:
     return value if isinstance(value, bool) else default
 
@@ -268,6 +278,50 @@ class ToolDisplay:
             ellipsis_label=_str(raw.get('ellipsis_label'), '...'),
             show_diff=_bool(raw.get('show_diff'), True),
             max_result_lines=_bounded_int(raw.get('max_result_lines'), 0, 10_000, 0),
+        )
+
+
+@dataclass
+class FooterSettings:
+    """How the status line under the input behaves.
+
+    Three things live on that line:
+
+    - a light that runs along it while the agent works;
+    - a progress bar when the running command reports a percentage;
+    - the green "the task is done" state, which stays until the user types.
+    """
+
+    # the running light
+    sweep_enabled: bool = True
+    sweep_period: float = 1.0      # seconds per crossing
+    sweep_span: int = 12           # the width of the light, in cells
+    # the progress bar
+    progress_enabled: bool = True
+    progress_window: float = 10.0  # how long a sample stays fresh
+    progress_samples: int = 2      # samples needed before the bar shows
+    # the done state
+    done_enabled: bool = True
+    done_wipe: float = 0.5         # seconds for the wipe in and out
+    done_color: str = ''           # '' = the palette's success green
+    done_text_color: str = ''      # '' = white
+    done_hold: bool = True         # stay green until the user types
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> 'FooterSettings':
+        raw = raw if isinstance(raw, dict) else {}
+        return cls(
+            sweep_enabled=_bool(raw.get('sweep_enabled'), True),
+            sweep_period=_bounded_float(raw.get('sweep_period'), 0.05, 60, 1.0),
+            sweep_span=_bounded_int(raw.get('sweep_span'), 1, 200, 12),
+            progress_enabled=_bool(raw.get('progress_enabled'), True),
+            progress_window=_bounded_float(raw.get('progress_window'), 0.5, 600, 10.0),
+            progress_samples=_bounded_int(raw.get('progress_samples'), 1, 100, 2),
+            done_enabled=_bool(raw.get('done_enabled'), True),
+            done_wipe=_bounded_float(raw.get('done_wipe'), 0.0, 60, 0.5),
+            done_color=_str(raw.get('done_color'), ''),
+            done_text_color=_str(raw.get('done_text_color'), ''),
+            done_hold=_bool(raw.get('done_hold'), True),
         )
 
 
@@ -534,6 +588,7 @@ class AppConfig:
     thinking: ThinkingDisplay = field(default_factory=ThinkingDisplay)
     tools: ToolDisplay = field(default_factory=ToolDisplay)
     hold: HoldSettings = field(default_factory=HoldSettings)
+    footer: FooterSettings = field(default_factory=FooterSettings)
     context: ContextSettings = field(default_factory=ContextSettings)
     reasoning: ReasoningSettings = field(default_factory=ReasoningSettings)
     agents: AgentsSettings = field(default_factory=AgentsSettings)
@@ -665,6 +720,7 @@ def config_from_dict(raw: dict[str, Any]) -> AppConfig:
     config.thinking = ThinkingDisplay.from_dict(raw.get('thinking'))
     config.tools = ToolDisplay.from_dict(raw.get('tools'))
     config.hold = HoldSettings.from_dict(raw.get('hold'))
+    config.footer = FooterSettings.from_dict(raw.get('footer'))
     config.context = ContextSettings.from_dict(raw.get('context'))
     config.reasoning = ReasoningSettings.from_dict(raw.get('reasoning'))
     config.agents = AgentsSettings.from_dict(raw.get('agents'))

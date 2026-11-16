@@ -293,9 +293,43 @@ Two of them do the heavy lifting:
 | `standard` | `thinking.mode = partial`, `tools.chain = separate` |
 | `detailed` | `thinking.mode = full`, `tools.chain = separate`, `tools.result_mode = full` |
 
-While the agent works, a light runs along the status line under the input:
-it enters at the left edge, crosses the screen once per second and leaves at
-the right one.  The wait for the provider (`connecting`) has no light.
+### The status line
+
+The line under the input carries the state of the session.  `/config` has a
+**Footer status** group for it; almost every part is configurable.
+
+**While the agent works.** A light runs along the line: it enters at the left
+edge, crosses the screen once per second and leaves at the right one.  The
+wait for the provider (`connecting`) has no light.
+
+**A command that reports its progress.**  When the running command prints a
+percentage -- a pytest run, a build, a download -- the line becomes a
+progress bar: the background fills up to the percentage and the text names
+the command and the number (`pytest 45%`).
+
+A percentage on its own means nothing: pip prints one per package, a build
+tool one per file.  Only a value that keeps climbing is a total progress, so
+the samples are compared -- a value that jumps around is not one, and the
+light comes back instead of a bar that lies.
+
+**When the task is done.**  The line turns green with white text: the green
+runs in from the left edge in half a second, stays until the user types
+something, and then leaves again from the left to the right in half a
+second.
+
+| Setting | Meaning |
+|---|---|
+| `footer.sweep_enabled` | The light that runs along the line |
+| `footer.sweep_period` | Seconds per crossing |
+| `footer.sweep_span` | The width of the light, in cells |
+| `footer.progress_enabled` | The progress bar |
+| `footer.progress_window` | How long a percentage stays fresh |
+| `footer.progress_samples` | Samples needed before the bar shows |
+| `footer.done_enabled` | The green state of a finished task |
+| `footer.done_wipe` | Seconds for the wipe in and out |
+| `footer.done_hold` | Stay green until the user types |
+| `footer.done_color` | The green (`#rrggbb`, empty = the palette green) |
+| `footer.done_text_color` | The font (`#rrggbb`, empty = white) |
 
 ### Tool display
 
@@ -351,6 +385,9 @@ there automatically on first load. A minimal file looks like this:
     "thinking": {"mode": "partial", "style": "gradient"},
     "tools": {"mode": "both", "chain": "separate", "result_mode": "partial"},
     "hold": {"enabled": false, "max_retries": 20, "delay": 2},
+    "footer": {"sweep_enabled": true, "sweep_period": 1, "sweep_span": 12,
+               "progress_enabled": true, "done_enabled": true,
+               "done_wipe": 0.5, "done_hold": true},
     "agents": {"enabled": true, "max_concurrent": 10, "max_depth": 4},
     "agent_types": {},
     "agent_teams": {}
