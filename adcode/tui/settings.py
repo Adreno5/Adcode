@@ -530,6 +530,8 @@ class SettingsOverlay(Overlay):
                 self._refocus(node_key)
             return True
         if key == 'ctrl+s':
+            # Every change is already saved; the chord only closes the
+            # panel, which is what esc does as well.
             self.on_change()
             self.closed = True
             if self.on_close is not None:
@@ -782,7 +784,7 @@ class SettingsOverlay(Overlay):
         if self.edit_error:
             canvas.draw_text(x + 2, y + h - 3, self.edit_error, palette.error)
         hint = ('type a value · enter apply · esc cancel' if self.editing
-                else '↑↓ move · enter expand/select · esc back · ctrl+s save')
+                else '↑↓ move · enter expand/select · esc back')
         _draw_hint(canvas, x, y + h - 2, w, hint, palette)
 
     def _display_value(self, node: SettingNode) -> str:

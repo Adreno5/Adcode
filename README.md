@@ -94,7 +94,9 @@ filterable multi-select table appears (`space` toggles, `enter` confirms, `+`
 adds a custom id). If fetching fails, you can retry, probe with another wire,
 or enter model ids manually. Metadata is matched against models.dev when
 available. A final step lets you review the selected model's context window,
-maximum output, vision support, tool calling, and reasoning efforts.
+maximum output, vision support, tool calling, and reasoning efforts. Every
+value in the model editor is written to `config.json` as soon as it changes,
+so there is nothing to save by hand.
 
 ## Keyboard
 
@@ -210,11 +212,12 @@ Enter completes it, and Enter runs the command.
 - **Esc** cancels the item: it restores the values captured when the item was
   expanded, then collapses it. At the top level it closes the panel.
 - **Enter on an expanded setting's title** confirms it and collapses it.
-- **Ctrl+S** saves and closes.
+- **Ctrl+S** closes the panel.
 
 Selecting an option that has children expands its sub-settings automatically.
 Changes apply to the running app immediately (theme and accent included) and
-are persisted to `config.json`.
+are persisted to `config.json` the moment they are made -- there is nothing
+to save by hand.
 
 ### Thinking display
 
