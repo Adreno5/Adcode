@@ -5,7 +5,9 @@ from pathlib import Path
 import pytest
 
 from adcode import images
-from adcode.llm.client import LLMClient, _file_id_rejected, _has_file_id, _image_parts
+from adcode.llm.client import LLMClient, _image_parts
+from infra.orchestrator.files import references_file as _has_file_id
+from infra.orchestrator.files import file_reference_rejected as _file_id_rejected
 from adcode.llm.usage import estimate_text_tokens, estimate_tokens
 
 
@@ -208,7 +210,9 @@ def test_an_unsupported_scope_wins_over_cached_file_ids(tmp_path):
                        file_cache=images.FileIdCache(tmp_path / 'files.json'))
     scope = client._file_scope()
 
-    client.file_cache.set_id(scope, client._file_key(resolved), 'file-cached')
+    client.file_cache.set_id(
+        scope, client._files._file_key(resolved.path, resolved.size),
+        'file-cached')
     assert client._file_id(resolved) == 'file-cached'
 
     # Once the provider rejected the reference, the cached ids are not reused.
@@ -271,12 +275,10 @@ def make_client(tmp_path, wire='anthropic messages', sdk=None) -> LLMClient:
     provider = ProviderConfig(
         name='Files', base_url='http://localhost:9999/v1', api_key='k',
         wire=wire, models=[ModelConfig(id='harness-model')])
-    client = LLMClient(provider, ModelConfig(id='harness-model'),
-                       base_dir=str(tmp_path),
-                       file_cache=images.FileIdCache(tmp_path / 'files.json'))
-    if sdk is not None:
-        client._sdk = sdk
-    return client
+    return LLMClient(provider, ModelConfig(id='harness-model'),
+                     base_dir=str(tmp_path),
+                     file_cache=images.FileIdCache(tmp_path / 'files.json'),
+                     sdk=sdk)
 
 
 def test_file_id_cache_roundtrip(tmp_path):
@@ -386,7 +388,6 @@ def test_transient_upload_failure_is_retried(tmp_path):
     assert first[1]['image_url']['url'].startswith('data:image/png;base64,')
     assert not client.file_cache.unsupported(client._file_scope())
     sdk.error = None
-    client._sdk = sdk
     second = parts(f'see [image: {reference}]')
     assert second[1] == {'type': 'image_url',
                          'image_url': {'file_id': 'file-123'}}
