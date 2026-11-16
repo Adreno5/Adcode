@@ -51,6 +51,9 @@ def test_key_and_mouse_sequence_builders():
     assert key_sequence('ctrl+a') == '\x01'
     assert key_sequence('up') == '\x1b[A'
     assert key_sequence('ctrl+home') == '\x1b[1;5H'
+    # A chord on punctuation has no control byte; it uses the kitty
+    # keyboard protocol.
+    assert key_sequence('ctrl+,') == '\x1b[44;5u'
     assert mouse_sequence('wheel_down', 3, 4) == '\x1b[<65;3;4M'
     assert mouse_sequence('release', 3, 4) == '\x1b[<0;3;4m'
 

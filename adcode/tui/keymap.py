@@ -27,6 +27,12 @@ _SPECIAL_KEYS = frozenset({
 # Control-character keys the parser can emit beyond the letters.
 _CTRL_SYMBOLS = frozenset({'\\', ']', '^', '_', 'space'})
 
+# Punctuation a chord can carry.  These keys have no control byte in the
+# legacy encoding, so they only reach the app through the kitty keyboard
+# protocol (``ctrl+,`` is reported as ``CSI 44;5 u``).
+_CTRL_PUNCTUATION = frozenset(
+    '`~!@#$%^&*()-_=+[{]}\\|;\':",.<>/?')
+
 # Fixed gestures and the sentinel the panel writes to clear a binding.
 _RESERVED_KEYS = frozenset({'enter', 'esc', 'space'})
 UNBOUND = 'none'
@@ -50,6 +56,8 @@ BINDINGS: tuple[Binding, ...] = (
             'ctrl+q'),
     Binding('palette', 'Command palette', 'open the / command palette',
             'ctrl+p'),
+    Binding('config', 'Settings', 'open the settings browser',
+            'ctrl+,'),
     Binding('sessions', 'Sessions', 'browse and load saved sessions',
             'ctrl+h'),
     Binding('exit_chord', 'Copy, clear or exit',
@@ -154,10 +162,16 @@ def validate_key_name(name: str) -> str | None:
         return None
     symbol = base in _CTRL_SYMBOLS
     word = len(base) == 1 and (base.isalpha() or base.isdigit())
+    punctuation = len(base) == 1 and base in _CTRL_PUNCTUATION
     if symbol:
         return None if 'ctrl' in modifiers else \
             f'{name!r} needs the ctrl modifier'
     if word and ('ctrl' in modifiers or 'alt' in modifiers):
+        return None
+    if punctuation and ('ctrl' in modifiers or 'alt' in modifiers):
+        # Punctuation carries no legacy control byte, so only a chord can
+        # reach the app -- and only a terminal that speaks the kitty
+        # keyboard protocol can report one.
         return None
     if not word:
         return f'{name!r} is not a key name'

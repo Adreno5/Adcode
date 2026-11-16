@@ -59,6 +59,12 @@ _KEY_SEQUENCES = {
     'ctrl+end': '\x1b[1;5F',
     'shift+home': '\x1b[1;2H',
     'shift+end': '\x1b[1;2F',
+    # Chords on punctuation have no legacy control byte; a terminal that
+    # speaks the kitty keyboard protocol reports them as CSI <code>;<mods> u.
+    'ctrl+,': '\x1b[44;5u',
+    'ctrl+.': '\x1b[46;5u',
+    'ctrl+/': '\x1b[47;5u',
+    'ctrl+shift+v': '\x1b[118;6u',
 }
 
 # Keys with no portable byte sequence; delivered as a typed KeyEvent.

@@ -420,6 +420,7 @@ class KeysSettings:
 
     quit: str = 'ctrl+q'
     palette: str = 'ctrl+p'
+    config: str = 'ctrl+,'
     sessions: str = 'ctrl+h'
     exit_chord: str = 'ctrl+c'
     exit_eof: str = 'ctrl+d'

@@ -113,6 +113,7 @@ class TerminalScreen:
             '\x1b[?2004h'       # bracketed paste
             '\x1b[?1000h'       # basic mouse reporting
             '\x1b[?1006h'       # SGR extended mouse coordinates
+            '\x1b[>1u'          # kitty keyboard protocol: disambiguate codes
             '\x1b[2J\x1b[H'
         )
 
@@ -122,6 +123,7 @@ class TerminalScreen:
         self._entered = False
         self.write(
             '\x1b[?1006l\x1b[?1000l\x1b[?2004l'
+            '\x1b[<u'           # pop the kitty keyboard protocol flags
             '\x1b[?25h'
             '\x1b[0m'
             '\x1b[?1049l'

@@ -44,6 +44,20 @@ def test_ctrl_h_without_sessions_notifies(app):
                for item in app.standalone_items if item.kind == 'notice')
 
 
+def test_ctrl_comma_opens_the_settings_browser(app):
+    app._handle_event(key('ctrl+,'))
+    assert type(app.overlay).__name__ == 'SettingsOverlay'
+
+
+def test_ctrl_comma_is_rebindable(app):
+    app.config.keys.config = 'ctrl+g'
+    app.config_changed()
+    app._handle_event(key('ctrl+,'))
+    assert app.overlay is None
+    app._handle_event(key('ctrl+g'))
+    assert type(app.overlay).__name__ == 'SettingsOverlay'
+
+
 def test_rebind_through_the_panel_takes_effect_immediately(app):
     app.open_keybindings()
     panel = app.overlay

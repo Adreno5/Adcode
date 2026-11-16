@@ -923,6 +923,9 @@ class AdCodeApp:
         if action == 'palette':
             self.open_command_palette()
             return
+        if action == 'config':
+            self.open_settings()
+            return
         if action == 'sessions':
             self.open_sessions_browser()
             return

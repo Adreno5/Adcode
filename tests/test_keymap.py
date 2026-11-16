@@ -18,6 +18,8 @@ def test_default_resolution_and_reverse_lookup():
     assert keymap.action_of('ctrl+p') == 'palette'
     assert keymap.action_of('ctrl+h') == 'sessions'
     assert keymap.action_of('ctrl+q') == 'quit'
+    assert keymap.key_of('config') == 'ctrl+,'
+    assert keymap.action_of('ctrl+,') == 'config'
 
 
 def test_rebind_moves_the_action():
@@ -67,6 +69,16 @@ def test_validate_accepts_chords_and_special_keys():
     for name in ('ctrl+h', 'alt+v', 'ctrl+shift+s', 'f5', 'pgdn', 'up',
                  'shift+insert', 'ctrl+space', 'ctrl+]', 'alt+7', 'backspace'):
         assert validate_key_name(name) is None, name
+
+def test_validate_accepts_a_chord_on_punctuation():
+    # The punctuation keys carry no control byte, so only a chord can
+    # reach the app.
+    for name in ('ctrl+,', 'ctrl+.', 'ctrl+/', 'ctrl+shift+,', 'alt+,'):
+        assert validate_key_name(name) is None, name
+
+def test_validate_rejects_bare_punctuation():
+    for name in (',', '.', '/'):
+        assert validate_key_name(name) is not None, name
 
 
 def test_validate_rejects_bare_and_reserved_names():

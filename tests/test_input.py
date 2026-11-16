@@ -89,6 +89,30 @@ def test_surrogate_sequence_is_ignored():
     assert parser.feed('\x1b]0;title\x07') == []
 
 
+# ── kitty keyboard protocol ────────────────────────────────
+# Chords on punctuation have no legacy control byte, so a terminal reports
+# them through the kitty keyboard protocol: CSI <code> ; <mods> u.
+
+def test_kitty_protocol_reports_a_chord_on_punctuation():
+    events = parse('\x1b[44;5u')
+    assert [event.key for event in events] == ['ctrl+,']
+    assert events[0].ctrl
+
+def test_kitty_protocol_reports_letters_and_keys():
+    assert parse('\x1b[99;5u')[0].key == 'ctrl+c'
+    assert parse('\x1b[27u')[0].key == 'esc'
+    assert parse('\x1b[13u')[0].key == 'enter'
+    assert parse('\x1b[127;5u')[0].key == 'ctrl+backspace'
+
+def test_kitty_protocol_reports_shifted_and_alternate_keys():
+    assert parse('\x1b[118;6u')[0].key == 'ctrl+shift+v'
+    assert parse('\x1b[97;3u')[0].key == 'alt+a'
+    # The alternate key codes after a colon are ignored.
+    assert parse('\x1b[97:65;6u')[0].key == 'ctrl+shift+a'
+
+def test_kitty_protocol_ignores_an_unknown_code():
+    assert parse('\x1b[999999u') == []
+
 # ── split / truncated control sequences ────────────────────
 # A terminal may deliver one report in several writes.  The tail must never be
 # typed into the prompt, and a truncated report must not fire a stray Esc

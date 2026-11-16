@@ -143,6 +143,13 @@ class ScrollingBody:
         return self.total > self.rows
 
     def _clamp(self) -> None:
+        if self.rows <= 0:
+            # The body has not been measured yet: the first frame is still
+            # on its way.  Keeping the offset keeps the scroll intent of a
+            # wheel event that arrived before the dialog was drawn; the
+            # geometry of that frame clamps it.
+            self.top = max(0, self.top)
+            return
         self.top = max(0, min(self.top, max(0, self.total - self.rows)))
 
     def _move(self, delta: int) -> None:

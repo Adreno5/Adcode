@@ -154,3 +154,14 @@ def test_the_body_is_wrapped_once_per_width():
     first = body.lines(MESSAGE, 60)
     assert body.lines(MESSAGE, 60) is first
     assert body.lines(MESSAGE, 80) is not first
+
+def test_a_wheel_before_the_first_frame_still_scrolls():
+    # The body is measured while the dialog is drawn.  A wheel event that
+    # arrives before that first frame must not be swallowed: the offset is
+    # kept and the geometry of the frame clamps it.
+    dialog = MessageDialog('Help', MESSAGE)
+    dialog.handle(wheel('wheel_down'))
+    assert dialog.body.top > 0
+    frame = render(dialog)
+    assert 'paragraph 00' not in frame
+    assert dialog.body.top <= dialog.body.total - dialog.body.rows

@@ -188,6 +188,20 @@ _CSI_TILDE_KEYS = {
     17: 'f6', 18: 'f7', 19: 'f8', 20: 'f9', 21: 'f10', 23: 'f11', 24: 'f12',
 }
 
+# Keys the kitty keyboard protocol reports by code point instead of by
+# character (``CSI <code> ; <mods> u``).  Every other code is the printable
+# character itself, so ``ctrl+,`` arrives as ``CSI 44;5 u``: the legacy
+# control-byte table has no entry for the comma, so no terminal can deliver
+# that chord any other way.
+_KITTY_KEYS = {
+    27: 'esc',
+    13: 'enter',
+    9: 'tab',
+    8: 'backspace',
+    127: 'backspace',
+    32: 'space',
+}
+
 _LEGACY_WIN_KEYS = {
     'H': '\x1b[A', 'P': '\x1b[B', 'K': '\x1b[D', 'M': '\x1b[C',
     'G': '\x1b[H', 'O': '\x1b[F', 'I': '\x1b[5~', 'Q': '\x1b[6~',
@@ -217,6 +231,43 @@ def _modified_key(name: str, mods: int) -> tuple[str, bool, bool, bool]:
     if shift and name not in ('shift+tab',):
         prefix += 'shift+'
     return prefix + name, ctrl, alt, shift
+
+
+def _kitty_key_event(params: str) -> KeyEvent | None:
+    """Turn a kitty keyboard protocol sequence into a key event.
+
+    The protocol reports a key as ``CSI <code>[:<shifted>][:<base>] [;<mods>] u``
+    where ``<code>`` is the code point of the key (always the unshifted one)
+    and ``<mods>`` is 1 plus a bitmask of the modifiers that are down.
+
+    This is the only way a terminal can deliver a chord like ``ctrl+,``: the
+    legacy control-byte table has no entry for the comma, so a terminal that
+    only speaks the legacy encoding sends a plain comma instead and the chord
+    is indistinguishable from typing.
+    """
+    if not params:
+        return None
+    fields = params.split(';')
+    code_field = fields[0].split(':')[0]
+    try:
+        code = int(code_field)
+    except ValueError:
+        return None
+    base = _KITTY_KEYS.get(code)
+    if base is None:
+        if 33 <= code <= 126:
+            base = chr(code)
+        else:
+            return None
+    mods = 1
+    if len(fields) > 1:
+        try:
+            mods = int(fields[1].split(':')[0])
+        except ValueError:
+            mods = 1
+    name, ctrl, alt, shift = _modified_key(base, mods)
+    return KeyEvent(kind='key', key=name, ctrl=ctrl, alt=alt, shift=shift,
+                    mods=mods)
 
 
 class KeyParser:
@@ -460,6 +511,13 @@ class KeyParser:
         params = buffer[2:index]
         final_byte = buffer[index]
         consumed = index + 1
+
+        if final_byte == 'u':
+            # The kitty keyboard protocol: CSI <code>[:alt][:base] [;mods] u.
+            event = _kitty_key_event(params)
+            if event is not None:
+                events.append(event)
+            return consumed
 
         if final_byte == '~':
             # Bracketed paste.

@@ -120,6 +120,7 @@ maximum output, vision support, tool calling, and reasoning efforts.
 | `ctrl+home` / `ctrl+end` | Input start / end |
 | `ctrl+l` | Redraw the screen |
 | `ctrl+p` | Open the command palette (type to filter, enter to run) |
+| `ctrl+,` | Open the settings browser |
 | `ctrl+h` | Browse and load saved sessions |
 | `ctrl+q` | Quit |
 
@@ -130,6 +131,19 @@ already used by another action can take it over (the other action becomes
 unbound). Bindings are stored in `~/.adcode/config.json` under `keys` and take
 effect immediately. `enter`, `esc`, and the dialog navigation keys stay fixed;
 `/help` always shows the live bindings.
+
+### Chords on punctuation
+
+`ctrl+,` and the other chords on punctuation (`ctrl+.`, `ctrl+/`, ...) have no
+control byte in the legacy terminal encoding, so a terminal cannot report
+them the old way. AdCode asks for the
+[kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
+(`CSI > 1 u`, the "disambiguate escape codes" flag) when it starts, and
+terminals that speak it (kitty, Ghostty, WezTerm, alacritty, foot, iTerm2,
+Microsoft Terminal, rio, Warp, xterm.js) deliver the chord. Terminals that do
+not support the protocol ignore the request and keep sending plain
+characters, so on those the chord does not fire -- rebind it with `/keys` if
+you need it there.
 
 ## Selecting text
 
