@@ -163,9 +163,11 @@ class KeyEvent:
 
 
 _CTRL_NAMES = {
+    # Backspace is \x7f (DEL) on modern terminals; \x08 is ctrl+h, so it can
+    # be bound like any other chord.
     '\x00': 'ctrl+space',
     '\x01': 'ctrl+a', '\x02': 'ctrl+b', '\x03': 'ctrl+c', '\x04': 'ctrl+d',
-    '\x05': 'ctrl+e', '\x06': 'ctrl+f', '\x07': 'ctrl+g', '\x08': 'backspace',
+    '\x05': 'ctrl+e', '\x06': 'ctrl+f', '\x07': 'ctrl+g', '\x08': 'ctrl+h',
     '\x09': 'tab', '\x0a': 'ctrl+j', '\x0b': 'ctrl+k', '\x0c': 'ctrl+l',
     '\x0d': 'enter', '\x0e': 'ctrl+n', '\x0f': 'ctrl+o', '\x10': 'ctrl+p',
     '\x11': 'ctrl+q', '\x12': 'ctrl+r', '\x13': 'ctrl+s', '\x14': 'ctrl+t',

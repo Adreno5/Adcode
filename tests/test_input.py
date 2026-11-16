@@ -26,6 +26,13 @@ def test_control_keys():
     assert [event.key for event in events] == ['ctrl+c', 'ctrl+a', 'backspace', 'tab']
 
 
+def test_ctrl_h_is_a_chord_not_backspace():
+    # Modern terminals send \x7f (DEL) for Backspace; \x08 is ctrl+h so it
+    # can be bound like any other chord.
+    assert parse('\x08')[0].key == 'ctrl+h'
+    assert parse('\x7f')[0].key == 'backspace'
+
+
 def test_arrows_and_modified():
     events = parse('\x1b[A\x1b[B\x1b[C\x1b[D')
     assert [event.key for event in events] == ['up', 'down', 'right', 'left']

@@ -42,7 +42,7 @@ def current(overlay):
 def test_tree_contains_all_groups(config):
     tree = build_settings_tree(config)
     groups = [node.label for node in tree if node.kind == 'group']
-    assert groups == ['Appearance', 'Thinking', 'Tools', 'Reasoning',
+    assert groups == ['Appearance', 'Work steps', 'Hold', 'Reasoning',
                       'Context', 'Sub-agents and teams', 'Skills', 'MCP']
 
 

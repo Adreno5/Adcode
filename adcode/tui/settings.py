@@ -157,6 +157,11 @@ def build_settings_tree(config: AppConfig) -> list[SettingNode]:
             _bool('thinking.show_completed', 'Keep after completion',
                   'thinking.show_completed'),
         ]),
+        SettingChoice('summary', 'Token count',
+                      'Keep the reasoning, but only say how much there was', [
+            _bool('thinking.show_completed', 'Keep after completion',
+                  'thinking.show_completed'),
+        ]),
     ]
     thinking_item = _choice('thinking.mode', 'Thinking display', 'thinking.mode',
                             thinking_choices)
@@ -176,6 +181,12 @@ def build_settings_tree(config: AppConfig) -> list[SettingNode]:
         ]),
         _bool('tools.diff', 'Show file diffs', 'tools.show_diff'),
     ]
+    chain_item = _choice('tools.chain', 'Chain of calls', 'tools.chain', [
+        SettingChoice('separate', 'One per row', 'Every call gets its own row'),
+        SettingChoice('merged', 'Merged',
+                      'A chain of calls folds into one row with the tool '
+                      'names and their counts'),
+    ])
     tool_item = _choice('tools.mode', 'Tool display', 'tools.mode', [
         SettingChoice('hidden', 'Hidden', 'Execute silently', []),
         SettingChoice('call', 'Call line only', 'One compact call line', [
@@ -187,6 +198,13 @@ def build_settings_tree(config: AppConfig) -> list[SettingNode]:
             *result_children,
         ]),
     ])
+
+    hold = [
+        _bool('hold.enabled', 'Keep retrying', 'hold.enabled'),
+        _number('hold.retries', 'Maximum retries', 'hold.max_retries',
+                0, 10_000),
+        _number('hold.delay', 'Seconds between retries', 'hold.delay', 0, 600),
+    ]
 
     reasoning = [
         _choice('reasoning.effort', 'Reasoning effort', 'reasoning.effort',
@@ -250,10 +268,13 @@ def build_settings_tree(config: AppConfig) -> list[SettingNode]:
         SettingNode(key='group:Appearance', label='Appearance', kind='group',
                     choices=[], value_text=None),
         *appearance,
-        SettingNode(key='group:Thinking', label='Thinking', kind='group', choices=[]),
+        SettingNode(key='group:Work steps', label='Work steps', kind='group',
+                    choices=[]),
         thinking_item,
-        SettingNode(key='group:Tools', label='Tools', kind='group', choices=[]),
         tool_item,
+        chain_item,
+        SettingNode(key='group:Hold', label='Hold', kind='group', choices=[]),
+        *hold,
         SettingNode(key='group:Reasoning', label='Reasoning', kind='group', choices=[]),
         *reasoning,
         SettingNode(key='group:Context', label='Context', kind='group', choices=[]),

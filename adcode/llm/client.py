@@ -83,6 +83,73 @@ def _image_parts(text: Any, *, base_dir: str = '', wire: str = 'chat',
     return parts if replaced else None
 
 
+def _reasoning_as_text(message: dict[str, Any], wire: str) -> dict[str, Any]:
+    """Carry the reasoning as the text on the wires without a reasoning field.
+
+    The chat wire has ``reasoning_content``; the Responses and the Anthropic
+    wire have no such field, and an assistant turn without text is either
+    dropped or rejected.  A turn that only carries reasoning therefore
+    carries it as its text.
+    """
+    if wire == 'chat':
+        return message
+    reasoning = message.get('reasoning_content')
+    content = message.get('content')
+    if not reasoning or (content is not None and content != ''):
+        return message
+    copy = dict(message)
+    copy['content'] = reasoning
+    copy.pop('reasoning_content', None)
+    return copy
+
+
+def _responses_items(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Translate one chat-shaped message into Responses input items.
+
+    The Responses API takes a flat list of items.  A tool round is three
+    kinds of item -- the assistant's ``function_call``, one
+    ``function_call_output`` per result, and the plain text turns in between
+    -- and a chat-shaped ``{"role": "tool"}`` message means nothing to it.
+
+    The ``reasoning_content`` of a previous turn is dropped on purpose: it is
+    a chat-completions field, and the Responses endpoint rejects unknown
+    fields.
+    """
+    role = str(message.get('role') or 'user')
+    content = message.get('content')
+    if role == 'tool':
+        return [{
+            'type': 'function_call_output',
+            'call_id': str(message.get('tool_call_id') or ''),
+            'output': content if isinstance(content, str) else str(content or ''),
+        }]
+
+    items: list[dict[str, Any]] = []
+    text_type = 'output_text' if role == 'assistant' else 'input_text'
+    if isinstance(content, list):
+        # Image parts keep the chat shape; the sdk rewrites them for this wire.
+        items.append({'role': role, 'content': content})
+    elif isinstance(content, str) and content:
+        items.append({'role': role, 'content': [{'type': text_type,
+                                                  'text': content}]})
+    calls = message.get('tool_calls') or []
+    if role == 'assistant' and isinstance(calls, list):
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            function = call.get('function') or {}
+            arguments = function.get('arguments', '{}')
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            items.append({
+                'type': 'function_call',
+                'call_id': str(call.get('id') or ''),
+                'name': str(function.get('name') or ''),
+                'arguments': arguments,
+            })
+    return items
+
+
 def _has_file_id(payload: Any) -> bool:
     """True when a built request references an uploaded file."""
     if isinstance(payload, dict):
@@ -130,6 +197,10 @@ class LLMClient:
         self.warn = warn
         self._model_config = model
         self._upload_notes: set[str] = set()
+        # Set by the engine: a threading.Event that is set when the user
+        # interrupts.  The stream stops at the next chunk, so an interrupt is
+        # not stuck behind a slow or endless provider response.
+        self.interrupt: Any = None
         headers = dict(provider.extra_headers) if provider.extra_headers else None
         self._reasoning_extra_body = dict(provider.reasoning_extra_body or {})
         # The SDKs build their own HTTP client from the environment, and that
@@ -296,12 +367,19 @@ class LLMClient:
         A provider that refuses a Files API reference (400/403/404/422)
         triggers exactly one inline rebuild, before anything reached the
         caller.
+
+        The stream also stops at the next chunk when the turn was
+        interrupted, so an interrupt is not stuck behind a slow or endless
+        provider response.
         """
         prepared = self._prepared(messages)
         kwargs = self._with_provider_extras(kwargs)
         try:
             async for event in self._client.stream(prepared, tools, **kwargs):
                 yield event
+                if self._interrupted():
+                    # The user stopped the turn: stop the stream too.
+                    return
             return
         except (openai.APIError, anthropic.APIError) as error:
             if not _has_file_id(prepared) or not _file_id_rejected(error):
@@ -310,6 +388,18 @@ class LLMClient:
             prepared = self._prepared(messages)
             async for event in self._client.stream(prepared, tools, **kwargs):
                 yield event
+                if self._interrupted():
+                    return
+
+    def _interrupted(self) -> bool:
+        """True when the user asked to stop."""
+        event = self.interrupt
+        if event is None:
+            return False
+        try:
+            return bool(event.is_set())
+        except Exception:
+            return False
 
     def invoke(self, messages: list[Any], tools: Any = None,
                **kwargs: Any) -> Any:
@@ -325,11 +415,20 @@ class LLMClient:
         return 'chat'
 
     def _prepared(self, messages: list[Any]) -> list[Any]:
-        """Expand image markers in string contents into native parts.
+        """Expand image markers and shape the messages for the wire.
 
         The engine hands over ChatMessage objects; normalize them first, or
         the markers inside their contents would never be expanded.
+
+        The Responses wire needs more than that: its input is a list of
+        *items* (``function_call`` / ``function_call_output``), not of chat
+        messages.  The sdk converter only rewrites ChatMessage objects and
+        passes plain dicts through unchanged, so the chat shape has to be
+        translated here.  Sending ``{"role": "tool", ...}`` to the Responses
+        endpoint leaves the model without a tool result it can pair with its
+        own call: it stops learning from the tools and starts repeating them.
         """
+        wire = self._wire_kind()
         prepared: list[Any] = []
         for message in messages:
             if not isinstance(message, dict):
@@ -346,11 +445,14 @@ class LLMClient:
             if (copy.get('role') == 'user' and isinstance(content, str)
                     and has_image_marker(content)):
                 parts = _image_parts(content, base_dir=self.base_dir,
-                                     wire=self._wire_kind(),
+                                     wire=wire,
                                      file_ids=self._file_id)
                 if parts is not None:
                     copy['content'] = parts
-            prepared.append(copy)
+            if wire == 'responses':
+                prepared.extend(_responses_items(copy))
+            else:
+                prepared.append(_reasoning_as_text(copy, wire))
         return prepared
 
     def _with_provider_extras(self, kwargs: dict[str, Any]) -> dict[str, Any]:

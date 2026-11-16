@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from adcode import system_prompt
-from adcode.config import AppConfig
+from adcode.config import AppConfig, ModelConfig, ProviderConfig
 
 
 def _write(path: Path, text: str, encoding: str = 'utf-8') -> None:
@@ -87,3 +87,60 @@ def test_build_system_prompt_injects_both(tmp_path, monkeypatch):
     assert 'Global build rule.' in prompt
     assert 'Project build rule.' in prompt
     assert prompt.index('Global build rule.') < prompt.index('Project build rule.')
+
+
+def _config_with_model(model_id: str, provider: str = 'demo') -> AppConfig:
+    config = AppConfig()
+    provider_config = ProviderConfig(
+        name=provider, base_url='https://example.com/v1',
+        models=[ModelConfig(id=model_id)])
+    config.providers = [provider_config]
+    config.select(provider, model_id)
+    return config
+
+
+def test_identity_block_states_the_model_id_and_runtime():
+    config = _config_with_model('gpt-5-codex')
+
+    prompt = system_prompt.build_system_prompt(config, None, None, '/tmp')
+
+    assert '<identity>' in prompt
+    assert 'model id: gpt-5-codex' in prompt
+    assert 'AdCode' in prompt
+    assert 'AICF' in prompt
+    assert 'harness' in prompt
+
+
+def test_identity_block_uses_the_explicit_model():
+    config = _config_with_model('gpt-5-codex')
+
+    prompt = system_prompt.build_system_prompt(
+        config, None, None, '/tmp', model_id='other-model', provider='other')
+
+    assert 'model id: other-model' in prompt
+    assert 'gpt-5-codex' not in prompt
+
+
+def test_identity_block_without_a_model_says_unknown():
+    prompt = system_prompt.build_system_prompt(AppConfig(), None, None, '/tmp')
+
+    assert 'model id: unknown' in prompt
+
+
+def test_replace_identity_swaps_the_model_id():
+    prompt = ('<environment>\ncwd: /tmp\n</environment>\n\n'
+              + system_prompt.identity_block('parent-model', 'demo'))
+
+    replaced = system_prompt.replace_identity(
+        prompt, 'child-model', 'demo', role='sub-agent')
+
+    assert 'model id: child-model' in replaced
+    assert 'parent-model' not in replaced
+    assert 'role: sub-agent' in replaced
+    assert replaced.startswith('<environment>')
+
+
+def test_replace_identity_leaves_a_prompt_without_identity_alone():
+    prompt = 'no identity here'
+
+    assert system_prompt.replace_identity(prompt, 'x') == prompt

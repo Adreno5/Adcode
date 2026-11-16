@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from adcode.crypto import decrypt_secret, encrypt_secret
+from adcode.tui.keymap import BINDINGS, validate_key_name
 
 CONFIG_DIR = Path.home() / '.adcode'
 CONFIG_PATH = CONFIG_DIR / 'config.json'
@@ -30,12 +31,14 @@ API_WIRES = (
     'anthropic messages',
 )
 REASONING_EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max', 'ultra')
-THINKING_MODES = ('hidden', 'label', 'partial', 'full')
+THINKING_MODES = ('hidden', 'label', 'partial', 'full', 'summary')
 THINKING_ANIMATIONS = ('fixed', 'rotating')
 THINKING_STYLES = ('normal', 'gradient')
 ELLIPSIS_STYLES = ('none', 'label', 'count')
 TOOL_MODES = ('hidden', 'call', 'result', 'both')
 RESULT_MODES = ('partial', 'full')
+#: How a chain of consecutive tool calls is shown.
+TOOL_CHAINS = ('separate', 'merged')
 THEMES = ('dark', 'light')
 
 
@@ -235,6 +238,9 @@ class ThinkingDisplay:
 @dataclass
 class ToolDisplay:
     mode: str = 'both'
+    # 'separate': every call on its own row; 'merged': a chain of calls
+    # collapses into one row with the tool names and their counts.
+    chain: str = 'separate'
     show_args: bool = True
     result_mode: str = 'partial'
     from_index: int = -5
@@ -251,6 +257,7 @@ class ToolDisplay:
         raw = raw if isinstance(raw, dict) else {}
         return cls(
             mode=_choice(raw.get('mode'), TOOL_MODES, 'both'),
+            chain=_choice(raw.get('chain'), TOOL_CHAINS, 'separate'),
             show_args=_bool(raw.get('show_args'), True),
             result_mode=_choice(raw.get('result_mode'), RESULT_MODES, 'partial'),
             from_index=_bounded_int(raw.get('from_index'), -500, -1, -5),
@@ -261,6 +268,31 @@ class ToolDisplay:
             ellipsis_label=_str(raw.get('ellipsis_label'), '...'),
             show_diff=_bool(raw.get('show_diff'), True),
             max_result_lines=_bounded_int(raw.get('max_result_lines'), 0, 10_000, 0),
+        )
+
+
+@dataclass
+class HoldSettings:
+    """Keep retrying a request that was cut short.
+
+    With ``enabled`` the client re-sends a request whose stream broke (a
+    provider error, a dropped connection, a response that ended without a
+    finish signal) instead of ending the turn.  The only things that stop
+    the retry loop are an explicit interrupt from the user and a response
+    that actually finished.
+    """
+
+    enabled: bool = False
+    max_retries: int = 20
+    delay: float = 2.0
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> 'HoldSettings':
+        raw = raw if isinstance(raw, dict) else {}
+        return cls(
+            enabled=_bool(raw.get('enabled'), False),
+            max_retries=_bounded_int(raw.get('max_retries'), 0, 10_000, 20),
+            delay=_bounded_int(raw.get('delay'), 0, 600, 2),
         )
 
 
@@ -378,6 +410,58 @@ class UiSettings:
 
 
 @dataclass
+class KeysSettings:
+    """Application-level key bindings.
+
+    One field per :class:`adcode.tui.keymap.Binding` action; the values are
+    canonical key names.  The bindings panel (``/keys``) writes ``none`` to
+    clear a binding that another action took over.
+    """
+
+    quit: str = 'ctrl+q'
+    palette: str = 'ctrl+p'
+    sessions: str = 'ctrl+h'
+    exit_chord: str = 'ctrl+c'
+    exit_eof: str = 'ctrl+d'
+    redraw: str = 'ctrl+l'
+    paste: str = 'ctrl+v'
+    attach_image: str = 'alt+v'
+    cut: str = 'ctrl+x'
+    select_all: str = 'ctrl+a'
+    undo: str = 'ctrl+z'
+    redo: str = 'ctrl+y'
+    newline: str = 'ctrl+j'
+    complete: str = 'tab'
+    delete_backward: str = 'backspace'
+    delete_forward: str = 'delete'
+    scroll_up: str = 'pgup'
+    scroll_down: str = 'pgdn'
+    history_up: str = 'up'
+    history_down: str = 'down'
+    move_left: str = 'left'
+    move_right: str = 'right'
+    line_start: str = 'home'
+    line_end: str = 'end'
+    jump_start: str = 'ctrl+home'
+    jump_end: str = 'ctrl+end'
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> 'KeysSettings':
+        raw = raw if isinstance(raw, dict) else {}
+        values: dict[str, str] = {}
+        for item in BINDINGS:
+            value = raw.get(item.action)
+            if value == 'none':
+                values[item.action] = 'none'
+                continue
+            name = value.strip().lower() if isinstance(value, str) else ''
+            values[item.action] = (
+                name if name and validate_key_name(name) is None
+                else item.default)
+        return cls(**values)
+
+
+@dataclass
 class AgentTypeConfig:
     name: str
     description: str = ''
@@ -448,11 +532,13 @@ class AppConfig:
     mcp_servers: list[dict[str, Any]] = field(default_factory=list)
     thinking: ThinkingDisplay = field(default_factory=ThinkingDisplay)
     tools: ToolDisplay = field(default_factory=ToolDisplay)
+    hold: HoldSettings = field(default_factory=HoldSettings)
     context: ContextSettings = field(default_factory=ContextSettings)
     reasoning: ReasoningSettings = field(default_factory=ReasoningSettings)
     agents: AgentsSettings = field(default_factory=AgentsSettings)
     skills: SkillsSettings = field(default_factory=SkillsSettings)
     ui: UiSettings = field(default_factory=UiSettings)
+    keys: KeysSettings = field(default_factory=KeysSettings)
     max_output_tokens: int = 8_192
     agent_types: dict[str, AgentTypeConfig] = field(default_factory=dict)
     agent_teams: dict[str, list[str]] = field(default_factory=dict)
@@ -577,11 +663,13 @@ def config_from_dict(raw: dict[str, Any]) -> AppConfig:
     ]
     config.thinking = ThinkingDisplay.from_dict(raw.get('thinking'))
     config.tools = ToolDisplay.from_dict(raw.get('tools'))
+    config.hold = HoldSettings.from_dict(raw.get('hold'))
     config.context = ContextSettings.from_dict(raw.get('context'))
     config.reasoning = ReasoningSettings.from_dict(raw.get('reasoning'))
     config.agents = AgentsSettings.from_dict(raw.get('agents'))
     config.skills = SkillsSettings.from_dict(raw.get('skills'))
     config.ui = UiSettings.from_dict(raw.get('ui'))
+    config.keys = KeysSettings.from_dict(raw.get('keys'))
     config.max_output_tokens = _bounded_int(
         raw.get('max_output_tokens'), 256, 2_000_000, 8_192)
     types = raw.get('agent_types')

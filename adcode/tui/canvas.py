@@ -587,7 +587,7 @@ class Canvas:
             width = char_width(ch)
             if width == 0:
                 # Combining mark: append to the previous cell when possible.
-                if col > start:
+                if col > start and x0 <= col - 1 < x1:
                     index = row_base + col - 1
                     if stamps[index] == frame and not (fls[index] & _CONT):
                         chs[index] = chs[index] + ch
@@ -595,6 +595,11 @@ class Canvas:
                 continue
             if limit is not None and col + width > limit:
                 break
+            if not (x0 <= col < x1):
+                # Past the right edge: the ascii lane skips the cell, the
+                # wide one has to as well -- the buffer ends there.
+                col += width
+                continue
             index = row_base + col
             self._blit(
                 col, y, ch,

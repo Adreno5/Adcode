@@ -118,3 +118,27 @@ def test_attributes_serialized(palette):
     canvas.clear()
     canvas.draw_text(0, 0, 'B', palette.text, attrs=BOLD)
     assert '\x1b[' in canvas.render()
+
+
+def test_text_past_the_right_edge_is_dropped(palette):
+    """Drawing past the last cell must not raise.
+
+    The ascii lane skips the cells it cannot use, and the wide lane has to
+    do the same: the status line of a narrow terminal ends up writing one
+    cell too far, and the buffer does not extend past the canvas.
+    """
+    canvas = Canvas(10, 1, palette)
+    canvas.clear()
+    advance = canvas.draw_text(8, 0, '  ·  and more', canvas.palette.text)
+    assert advance > 0
+    # Nothing was written outside the canvas.
+    assert canvas.cell(9, 0).ch == '·' or canvas.cell(9, 0).ch == ' '
+    assert canvas.render_row(0).count('·') <= 1
+
+
+def test_a_wide_glyph_past_the_right_edge_is_dropped(palette):
+    canvas = Canvas(6, 1, palette)
+    canvas.clear()
+    canvas.draw_text(5, 0, '中中', canvas.palette.text)
+    # The first glyph does not fit either; the canvas stays as it was.
+    assert canvas.cell(5, 0).ch == ' '

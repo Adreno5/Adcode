@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import random
 import shlex
 import threading
 from dataclasses import dataclass, field
@@ -12,6 +13,7 @@ from adcode.config import REASONING_EFFORTS
 from adcode.diff import git_worktree_diff
 from adcode.theme import ACCENT_PRESETS, THEMES
 from adcode.tui.dialogs import DialogItem
+from adcode.tui.keymap import BINDINGS
 from adcode.tui.provider_ui import ProviderWizard
 
 
@@ -36,6 +38,16 @@ def command(name: str, description: str, usage: str = '',
         ))
         return function
     return decorate
+
+
+# Commands the welcome screen never suggests.
+_TIP_DENYLIST = frozenset({'/quit'})
+
+
+def random_tip() -> Command:
+    """A random command for the empty-session welcome screen."""
+    candidates = [item for item in COMMANDS if item.name not in _TIP_DENYLIST]
+    return random.choice(candidates)
 
 
 def find(name: str) -> Command | None:
@@ -87,20 +99,31 @@ def completion_candidates(text: str) -> list[tuple[str, str, str]]:
 def cmd_help(app: Any, args: str) -> None:
     rows = [f'{item.usage or item.name:<22} {item.description}' for item in COMMANDS]
     keys = [
-        'enter              send · shift+enter / alt+enter newline',
-        '↑ / ↓              history, or navigate the / command palette',
-        'tab                complete the selected command',
-        'esc                interrupt the current turn / close overlays',
-        'ctrl+c             copy selection, clear input, or press twice to exit',
-        'ctrl+v / shift+ins paste text, or attach a copied screenshot',
-        'alt+v              attach the clipboard image to the message',
-        'ctrl+a select all · ctrl+z undo · ctrl+y redo',
-        'pgup / pgdn        scroll the transcript · mouse wheel scrolls too',
-        'mouse drag        select text in the transcript',
-        'ctrl+home / end    jump in the input',
-        'ctrl+p             open the command palette',
-        'ctrl+q             quit',
+        'enter              send · esc  interrupt the turn / close overlays',
+        'mouse drag         select text in the transcript',
+        '',
     ]
+    # Live bindings when the real app provides them; defaults otherwise.
+    keymap = getattr(app, 'keymap', None)
+    if keymap is None and getattr(app, 'config', None) is not None:
+        from adcode.tui.keymap import KeyMap
+        keymap = KeyMap(app.config.keys)
+    chords = []
+    for item in BINDINGS:
+        chord = keymap.key_of(item.action) if keymap is not None \
+            else item.default
+        chord = chord or '(unbound)'
+        if item.aliases:
+            chord += ' / ' + ' / '.join(item.aliases)
+        chords.append(chord)
+    chord_width = min(26, max(len(chord) for chord in chords) + 2)
+    group = None
+    for item, chord in zip(BINDINGS, chords):
+        if item.group != group:
+            group = item.group
+            keys.append(f'— {group} —')
+        keys.append(f'{chord:<{chord_width}} {item.label} — {item.description}')
+    keys += ['', 'rebind any of these with /keys.']
     app.open_message('Help', '**Commands**\n' + '\n'.join(rows)
                      + '\n\n**Keys**\n' + '\n'.join(keys))
 
@@ -124,6 +147,11 @@ def cmd_new(app: Any, args: str) -> None:
 @command('/config', 'Open the settings browser')
 def cmd_config(app: Any, args: str) -> None:
     app.open_settings()
+
+
+@command('/keys', 'Configure key bindings')
+def cmd_keys(app: Any, args: str) -> None:
+    app.open_keybindings()
 
 
 @command('/quit', 'Exit AdCode')
@@ -228,10 +256,11 @@ def cmd_effort(app: Any, args: str) -> None:
 
 @command('/thinking', 'Set the thinking display mode', usage='/thinking <mode>',
          subcommands=[(mode, f'Thinking display: {mode}')
-                      for mode in ('hidden', 'label', 'partial', 'full')])
+                      for mode in ('hidden', 'label', 'partial', 'full',
+                                   'summary')])
 def cmd_thinking(app: Any, args: str) -> None:
     value = args.strip().lower()
-    modes = ('hidden', 'label', 'partial', 'full')
+    modes = ('hidden', 'label', 'partial', 'full', 'summary')
     if value not in modes:
         items = [DialogItem(mode, mode, '') for mode in modes]
 
@@ -244,6 +273,83 @@ def cmd_thinking(app: Any, args: str) -> None:
     app.config.thinking.mode = value
     app.config_changed()
     app.notify(f'Thinking display: {value}', 'success')
+
+
+#: The work-step presets.  Each one writes the thinking and tool settings
+#: that belong to it; the settings themselves stay the source of truth.
+STEP_PRESETS: dict[str, dict[str, Any]] = {
+    'concise': {'thinking.mode': 'summary', 'tools.chain': 'merged'},
+    'standard': {'thinking.mode': 'partial', 'tools.chain': 'separate'},
+    'detailed': {'thinking.mode': 'full', 'tools.chain': 'separate',
+                 'tools.result_mode': 'full'},
+}
+
+
+@command('/steps', 'Set how much of the work chain is shown',
+         usage='/steps <level>',
+         subcommands=[('concise', 'The tools of a chain in one row, the '
+                                   'reasoning as a token count'),
+                      ('standard', 'Every step on its own, the usual windows'),
+                      ('detailed', 'Every step, fully expanded')])
+def cmd_steps(app: Any, args: str) -> None:
+    value = args.strip().lower()
+    if value not in STEP_PRESETS:
+        items = [DialogItem(mode, mode, description)
+                 for mode, description in (
+                     ('concise', 'Tools in one row, reasoning as a token count'),
+                     ('standard', 'Every step on its own'),
+                     ('detailed', 'Every step, fully expanded'))]
+
+        def choose(mode: Any) -> None:
+            _apply_step_preset(app, str(mode))
+        app.open_select('Work steps', items, choose)
+        return
+    _apply_step_preset(app, value)
+
+
+def _apply_step_preset(app: Any, level: str) -> None:
+    """Write the thinking and tool settings of one work-step level."""
+    for path, value in STEP_PRESETS.get(level, {}).items():
+        target = app.config
+        parts = path.split('.')
+        for part in parts[:-1]:
+            target = getattr(target, part)
+        setattr(target, parts[-1], value)
+    app.config_changed()
+    app.notify(f'Work steps: {level}', 'success')
+
+
+@command('/hold', 'Keep retrying a request that was cut short',
+         usage='/hold [on|off|<retries>]',
+         subcommands=[('on', 'Retry a broken request until it works'),
+                      ('off', 'Give up on the first broken request'),
+                      ('status', 'Show the retry settings')])
+def cmd_hold(app: Any, args: str) -> None:
+    value = args.strip().lower()
+    hold = app.config.hold
+    if value in ('on', 'off'):
+        hold.enabled = value == 'on'
+        app.config_changed()
+        app.notify(f'Hold: {"on" if hold.enabled else "off"} '
+                   f'({hold.max_retries} retries)', 'success')
+        return
+    if value in ('status', ''):
+        app.notify(f'Hold: {"on" if hold.enabled else "off"}, '
+                   f'{hold.max_retries} retries, {hold.delay:g}s apart', 'info')
+        if not value:
+            hold.enabled = not hold.enabled
+            app.config_changed()
+            app.notify(f'Hold: {"on" if hold.enabled else "off"}', 'success')
+        return
+    try:
+        retries = int(value)
+    except ValueError:
+        app.notify('Usage: /hold [on|off|<retries>]', 'warning')
+        return
+    hold.max_retries = max(0, retries)
+    app.config_changed()
+    app.notify(f'Hold: {hold.max_retries} retries '
+               f'({"on" if hold.enabled else "off"})', 'success')
 
 
 @command('/max_tokens', 'Set the maximum output tokens', usage='/max_tokens <n>')
@@ -697,19 +803,7 @@ def cmd_skills(app: Any, args: str) -> None:
 
 @command('/sessions', 'Browse and load saved sessions')
 def cmd_sessions(app: Any, args: str) -> None:
-    rows = app.session_store.list()
-    if not rows:
-        app.notify('No saved sessions.', 'info')
-        return
-
-    def choose(name: Any) -> None:
-        app.load_session(str(name))
-    app.open_select(
-        'Sessions',
-        [DialogItem(row['name'], row['title'] or row['name'],
-                    f'{row["updated"]} · {row["messages"]} messages')
-         for row in rows],
-        choose, width=86)
+    app.open_sessions_browser()
 
 
 @command('/save', 'Save the current session', usage='/save [name]')

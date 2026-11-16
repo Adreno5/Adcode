@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from adcode.config import AppConfig, ThinkingDisplay
+from adcode.llm.usage import estimate_text_tokens
 from adcode.images import summarize_image_markers
 from adcode.session import TranscriptItem
 from adcode.theme import RGB, Palette, lead_in_gradient
@@ -39,7 +40,21 @@ class LiveRender:
     tool_output: list[str] = field(default_factory=list)
 
 
-def _tool_arg_brief(name: str, args: dict[str, Any]) -> str:
+def _chain_names(chain: list[TranscriptItem]) -> list[tuple[str, int]]:
+    """The tools a chain used, in the order they first appear, with counts."""
+    names: list[str] = []
+    counts: list[int] = []
+    for item in chain:
+        name = item.display or item.name or 'tool'
+        if name in names:
+            counts[names.index(name)] += 1
+            continue
+        names.append(name)
+        counts.append(1)
+    return list(zip(names, counts))
+
+
+def tool_arg_brief(name: str, args: dict[str, Any]) -> str:
     if name == 'read':
         path = str(args.get('path', ''))
         offset = args.get('offset')
@@ -211,11 +226,25 @@ class TranscriptRenderer:
                palette: Palette | None = None) -> list[Line]:
         now = time.time() if now is None else now
         width = max(16, width)
+        merged = config.tools.chain == 'merged'
         output: list[Line] = []
         previous = ''
-        for item in items:
-            block = self._item_lines(item, width, config, config_version, now,
-                                     palette)
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if merged and item.kind == 'tool':
+                # A chain of calls collapses into one row with the tool names
+                # and their counts; the details stay in the history.
+                chain = [item]
+                index += 1
+                while index < len(items) and items[index].kind == 'tool':
+                    chain.append(items[index])
+                    index += 1
+                block = self._chain_lines(chain, width, config, now, palette)
+            else:
+                block = self._item_lines(item, width, config, config_version,
+                                         now, palette)
+                index += 1
             if not block:
                 continue
             if output and output[-1] and self._needs_gap(previous, item.kind):
@@ -314,6 +343,13 @@ class TranscriptRenderer:
             return []
         if not config.thinking.show_completed:
             return []
+        if mode == 'summary':
+            # The reasoning is kept, but not spelled out: the row says how
+            # much there was.
+            tokens = estimate_text_tokens(item.text or '')
+            return [[Span('thought of ', 'subtext'),
+                     Span(f'{tokens} token{"s" if tokens != 1 else ""}',
+                          'muted')]]
         if mode == 'label':
             label = config.thinking.label or 'Thinking'
             suffix = '' if not item.duration else f' · {item.duration:.1f}s'
@@ -346,6 +382,42 @@ class TranscriptRenderer:
                 output.extend(self._render_diff(item.diff, width))
         return output
 
+    def _chain_lines(self, chain: list[TranscriptItem], width: int,
+                     config: AppConfig, now: float,
+                     palette: Palette | None = None) -> list[Line]:
+        """One line for a whole chain of steps.
+
+        The line names the tools the chain used and how often: ``bash x2,
+        grep, write``.  The details stay in the history -- the row is the
+        summary, not the work.
+        """
+        if not chain:
+            return []
+        if config.tools.mode == 'hidden':
+            return []
+        row_width = width + ROW_BLEED
+        line: Line = [Span(ROW_BAR + ' ', 'accent', 'panel')]
+        names = _chain_names(chain)
+        for index, (name, count) in enumerate(names):
+            if index:
+                add_span(line, Span(', ', 'muted', 'panel'))
+            add_span(line, Span(name, 'text', 'panel', attrs=BOLD))
+            if count > 1:
+                add_span(line, Span(f' x{count}', 'muted', 'panel'))
+        last = chain[-1]
+        if last.status == 'running':
+            dots = '...'[:1 + int(now * 2) % 3]
+            add_span(line, Span(' ' + dots, 'muted', 'panel'))
+        elif last.status == 'error':
+            add_span(line, Span('  !', 'error', 'panel'))
+        line = truncate_line(line, row_width, ellipsis='…')
+        if palette is not None:
+            line = _paint_lead_in(line, lead_in_gradient(palette))
+        used = line_width(line)
+        if used < row_width:
+            add_span(line, Span(' ' * (row_width - used), None, 'panel'))
+        return [Row(line, ROW_BLEED)]
+
     def _tool_call_line(self, item: TranscriptItem, width: int, config: AppConfig,
                         now: float, palette: Palette | None = None) -> list[Line]:
         # The row bleeds one cell left of the transcript margin, so it is one
@@ -356,7 +428,7 @@ class TranscriptRenderer:
         line: Line = [Span(ROW_BAR + ' ', 'accent', 'panel')]
         add_span(line, Span(item.display or item.name, 'text', 'panel', attrs=BOLD))
         if config.tools.show_args:
-            brief = _tool_arg_brief(item.name, item.args)
+            brief = tool_arg_brief(item.name, item.args)
             if brief:
                 add_span(line, Span('  ', None, 'panel'))
                 add_span(line, Span(brief, 'muted', 'panel'))
@@ -481,7 +553,9 @@ class TranscriptRenderer:
         phase = live.phase
         if phase == 'thinking':
             mode = config.thinking.mode
-            if mode == 'label':
+            if mode in ('label', 'summary'):
+                # The summary mode keeps the running thought out of the way as
+                # well: the label is enough while it is in flight.
                 label = config.thinking.label or 'Thinking'
                 output.append([
                     Span(label, 'subtext', attrs=BOLD),
@@ -502,8 +576,10 @@ class TranscriptRenderer:
         elif phase == 'tool':
             mode = config.tools.mode
             # The tool call line itself is a transcript item; only the running
-            # output tail is rendered live here.
-            if mode in ('result', 'both') and live.tool_output:
+            # output tail is rendered live here.  A merged chain shows no
+            # details at all.
+            if (mode in ('result', 'both') and live.tool_output
+                    and config.tools.chain != 'merged'):
                 tail = live.tool_output[-3:]
                 for raw in tail:
                     output.extend(wrap_line(

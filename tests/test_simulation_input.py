@@ -196,11 +196,14 @@ def test_the_help_dialog_scrolls_its_own_content(harness):
                        description='the help dialog')
     harness.wait_for_text('Show commands and key bindings')
     # The key binding list starts below the fold on a 30 row screen.
-    assert 'pgup / pgdn' not in harness.screen_text()
+    assert 'Scroll up' not in harness.screen_text()
 
-    for _ in range(8):
+    # Wheel to the bottom of the (fairly long) keys list.
+    for _ in range(40):
+        if 'rebind any of these with /keys' in harness.screen_text():
+            break
         harness.wheel('wheel_down')
-    harness.wait_until(lambda: 'pgup / pgdn' in harness.screen_text(),
+    harness.wait_until(lambda: 'rebind any of these with /keys' in harness.screen_text(),
                        timeout=10.0,
                        description='the wheel to reach the key bindings')
     assert harness.app.overlay is not None

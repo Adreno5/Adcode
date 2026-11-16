@@ -34,6 +34,7 @@ from harness.images import FileIdCache
 from harness.transcript import SessionPayload, TranscriptItem
 
 from adcode.agents.manager import AgentManager, AgentStatus
+from adcode.engine import AdCodeEngine
 from adcode.config import AppConfig, ModelConfig, ProviderConfig
 from adcode.llm.client import LLMClient
 from adcode import paths
@@ -114,7 +115,7 @@ class AgentLoop:
         self._wake = emit or (lambda kind, payload: None)
         self._stop = False
         self._work = _WorkQueue()
-        self._sink = EventSink(emit=lambda kind, payload: self._wake(kind, payload))
+        self._sink = EventSink(emit=self._on_engine_event)
         # The bench's wait_idle samples these; both are plain queues.
         self._events = self._sink._events
 
@@ -140,6 +141,32 @@ class AgentLoop:
         self._loop: asyncio.AbstractEventLoop | None = None
 
     # ── construction helpers ────────────────────────────────
+    def _on_engine_event(self, kind: str, payload: dict[str, Any]) -> None:
+        """Every engine event passes through here before the UI sees it."""
+        if kind == 'turn_end':
+            # The turn is over: the engine has committed or rolled back, so it
+            # is known which sub-agent updates reached the history.
+            self._settle_mailbox()
+        try:
+            self._wake(kind, payload)
+        except Exception:
+            pass
+
+    def _settle_mailbox(self) -> None:
+        """Return sub-agent updates a failed turn never delivered."""
+        manager = self.agents
+        engine = self._engine
+        if manager is None or engine is None:
+            return
+        try:
+            lost = manager.settle_mailbox(engine)
+        except Exception:
+            return
+        if lost:
+            self._emit('notice',
+                       text=f'{lost} sub-agent update(s) were kept for the '
+                            f'next turn.', level='warning')
+
     def _make_client(self, provider: ProviderConfig, model: ModelConfig) -> LLMClient:
         return LLMClient(provider, model, base_dir=self.cwd or '.',
                          file_cache=self._file_cache, warn=self._warn)
@@ -187,10 +214,23 @@ class AgentLoop:
             max_output_tokens=config.max_output_tokens,
         )
 
+    def apply_hold(self) -> None:
+        """Push the ``/hold`` settings into the engine."""
+        engine = self._engine
+        if engine is None or not isinstance(engine, AdCodeEngine):
+            return
+        hold = self.config.hold
+        engine.configure_hold(hold.enabled, hold.max_retries, hold.delay)
+
     def _system_provider(self) -> str:
+        # The model id is the live one: a model change must be reflected in
+        # the next request's system prompt.
+        model = self.model
+        provider = self.provider
         return build_system_prompt(self.config, self.goals, self.skills,
                                    cwd=self.cwd or '.',
-                                   vision=bool(self.model.vision))
+                                   vision=bool(model.vision),
+                                   model_id=model.id, provider=provider.name)
 
     # ── lifecycle ───────────────────────────────────────────
     def start(self) -> None:
@@ -208,13 +248,17 @@ class AgentLoop:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         self._loop = loop
-        engine = ConversationEngine(
+        engine = AdCodeEngine(
             client=self.client, registry=self._registry,
             store=self._store,
             sink=self._sink, system_provider=self._system_provider,
             cwd=self.cwd or '.', model=self._model_info(self.provider, self.model),
             config=self._engine_config(self.config))
         self._engine = engine
+        # The client stops the stream at the next chunk when the turn is
+        # interrupted, so an interrupt is not stuck behind a slow response.
+        self.client.interrupt = engine._interrupt
+        self.apply_hold()
         if self.config.agents.enabled:
             self.agents = AgentManager(
                 self.config, self.config.agents, self._registry,
@@ -480,7 +524,13 @@ class AgentLoop:
 
     def clear(self) -> None:
         self._require_idle('session clear')
-        self._sync_call(lambda: self._engine.clear())
+
+        def reset() -> None:
+            self._engine.clear()
+            # The pane is empty again; the header bar starts clean too.
+            self._engine.session_title = ''
+
+        self._sync_call(reset)
 
     def rewind(self, turn: int) -> str:
         self._require_idle('rewind')

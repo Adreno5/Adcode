@@ -5,6 +5,7 @@ import pytest
 
 import adcode.agent_loop as agent_loop
 from adcode.agent_loop import AgentLoop
+from adcode.config import ModelConfig
 from adcode.goals import GoalStore
 from adcode.session import DbSessionStore
 from adcode.skills import SkillRegistry
@@ -206,8 +207,13 @@ def test_interrupt(config, tmp_path, monkeypatch):
         assert 'interrupted' in kinds
         turn_end = [payload for kind, payload in events if kind == 'turn_end'][-1]
         assert turn_end['status'] == 'interrupted'
-        # a text-only draft is rolled back: nothing half-finished is committed
-        assert loop.context.committed == []
+        # The interrupted turn keeps what it produced: the request and the
+        # text that was already on screen.  Throwing it away made the model
+        # start the next turn from a blank slate.
+        committed = loop.context.committed
+        assert [message['role'] for message in committed] == ['user', 'assistant']
+        assert committed[0]['content'] == 'hello there'
+        assert 'partial answer' in committed[1]['content']
     finally:
         loop.shutdown()
 
@@ -287,3 +293,44 @@ def test_tools_and_agent_tools_registered(loop):
     loop.refresh_tools()
     assert set(loop._registry.names()) >= names
     loop.drain_ui_events()
+
+
+def test_the_system_prompt_carries_the_model_identity(loop):
+    """The model learns its own id and the runtime it runs on."""
+    system = loop._system_provider()
+    assert '<identity>' in system
+    assert 'model id: test-model' in system
+    assert 'provider: Test' in system
+    assert 'AdCode' in system
+    assert 'AICF' in system
+
+    # a model change is reflected in the next request
+    provider, _ = loop.config.selected()
+    other = ModelConfig(id='other-model')
+    provider.models.append(other)
+    loop.set_model(provider, other)
+    system = loop._system_provider()
+    assert 'model id: other-model' in system
+    assert 'model id: test-model' not in system
+
+
+def test_the_turn_end_settles_the_sub_agent_mailbox(loop):
+    """The adapter returns undelivered sub-agent updates when a turn ends."""
+    manager = loop.agents
+    assert manager is not None
+    engine = loop._engine
+    # A sub-agent update sits in the inbox and the turn takes it over.
+    record = manager.records()['root']
+    record.inbox.append('<subagent_update agent="scout" status="completed">'
+                         '\nfound it\n</subagent_update>')
+    updates = manager.consume_mailbox(engine)
+    assert len(updates) == 1
+    assert not record.inbox
+
+    # The turn ends without committing the update: it must come back.
+    loop._on_engine_event('turn_end', {'turn': 1, 'status': 'interrupted'})
+    assert len(record.inbox) == 1
+    assert 'found it' in record.inbox[0]
+    # And the user is told about it.
+    kinds = [kind for kind, _ in loop.drain_ui_events()]
+    assert 'notice' in kinds

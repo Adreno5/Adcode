@@ -35,8 +35,9 @@ from adcode.tui.dialogs import (
     SelectDialog, TextPrompt,
 )
 from adcode.tui.input import (
-    InputThread, KeyEvent, get_clipboard, is_paste_key, set_clipboard,
+    InputThread, KeyEvent, get_clipboard, set_clipboard,
 )
+from adcode.tui.keymap import KeyMap
 from adcode.tui.markdown import MarkdownRenderer
 from adcode.tui.screen import TerminalScreen
 from adcode.tui.settings import SettingsOverlay
@@ -51,6 +52,12 @@ SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 _ALL_COLUMNS = 1 << 30
 # Fallback frame rate when the configuration carries no value.
 _DEFAULT_FPS = 60
+# The status light crosses the status line once per second.
+SWEEP_PERIOD = 1.0
+# The UI error log is capped; a bug that fires every frame would fill it.
+_LOG_MAX_BYTES = 2 * 1024 * 1024
+# How wide the light is, in cells.
+SWEEP_SPAN = 12
 # How long the event loop sleeps when there is nothing to draw. A keypress
 # wakes it up right away, so this only bounds the poll.
 _IDLE_POLL = 0.15
@@ -229,6 +236,7 @@ class AdCodeApp:
         self.cwd = cwd or os.getcwd()
         self.store = ConfigStore(config_path)
         self.config: AppConfig = self.store.load()
+        self.keymap = KeyMap(self.config.keys)
         # The terminal pieces are injectable so a harness can drive the real
         # application loop without owning a console (see the test harness).
         self.screen = screen if screen is not None else TerminalScreen()
@@ -290,6 +298,10 @@ class AdCodeApp:
         self.live_tool_output: list[str] = []
         self.active_tool = ''
         self.status_hint = ''
+        # The arguments of the tool that is running right now; the concise
+        # level shows them next to the tool name as the current action.
+        self.status_args: dict[str, Any] = {}
+        self.status_tool_name = ''
         # Wall clock start of the current connection attempt, so the footer can
         # show how long the provider has been silent.
         self.connect_started = 0.0
@@ -297,6 +309,10 @@ class AdCodeApp:
         self._resume = resume
         self._started_at = time.time()
         self._tool_signature = self._tool_config_signature()
+        # The tip shown under the welcome logo; re-rolled whenever the
+        # conversation is cleared so the empty pane suggests something new.
+        from adcode.commands import random_tip
+        self.welcome_tip = random_tip()
 
     # ── boot ────────────────────────────────────────────────
     def _screen_size(self) -> tuple[int, int]:
@@ -438,6 +454,7 @@ class AdCodeApp:
     def config_changed(self) -> None:
         self.save_config()
         self.config_version += 1
+        self.keymap = KeyMap(self.config.keys)
         self.palette = build_palette(self.config.ui.theme, self.config.ui.accent)
         self.canvas.palette = self.palette
         self.transcript.invalidate()
@@ -448,6 +465,10 @@ class AdCodeApp:
             self.skills.scan()
             if self.loop is not None:
                 self.loop.refresh_tools()
+        if self.loop is not None:
+            # The hold settings steer the engine's retry loop: they have to
+            # reach it while it runs.
+            self.loop.apply_hold()
         self.dirty = True
 
     def _tool_config_signature(self) -> tuple[Any, ...]:
@@ -494,7 +515,10 @@ class AdCodeApp:
         self.transcript.invalidate()
         self.follow = True
         self.scroll = 0
-        self.notify('Conversation cleared.', 'info')
+        # No notice: the empty pane with the welcome logo is the feedback.
+        from adcode.commands import random_tip
+        self.welcome_tip = random_tip()
+        self._update_title()
 
     def load_session(self, name: str) -> None:
         if self.loop is None:
@@ -578,10 +602,39 @@ class AdCodeApp:
                 self._render_if_due()
             except Exception as error:
                 # A UI exception must never take down the session silently.
+                # The traceback goes to the log: a one-line message is not
+                # enough to find a rendering bug.
+                self._log_ui_error(error)
                 try:
-                    self.notify(f'UI error: {error}', 'error')
+                    self.notify(f'UI error: {type(error).__name__}: {error}',
+                                'error')
                 except Exception:
                     pass
+
+    def _log_ui_error(self, error: BaseException) -> None:
+        """Write the traceback of a UI error next to the session database.
+
+        The file is capped: a bug that fires every frame would otherwise
+        fill the disk with the same traceback.
+        """
+        import traceback
+        try:
+            from adcode import paths
+            target = paths.app_dir() / 'adcode.log'
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists() and target.stat().st_size > _LOG_MAX_BYTES:
+                # Keep the tail: the newest traceback is the interesting one.
+                with target.open('rb') as stream:
+                    stream.seek(-_LOG_MAX_BYTES // 2, os.SEEK_END)
+                    tail = stream.read()
+                target.write_bytes(tail)
+            with target.open('a', encoding='utf-8') as stream:
+                stream.write(f'--- {time.strftime("%Y-%m-%d %H:%M:%S")} '
+                             f'UI error\n')
+                traceback.print_exception(type(error), error,
+                                          error.__traceback__, file=stream)
+        except Exception:
+            pass
 
     def _dispatch_input(self, first: KeyEvent | None) -> None:
         """Handle the queued input batch before painting the next frame.
@@ -662,6 +715,8 @@ class AdCodeApp:
             self.live_tool_output = []
             self.phase = 'tool'
             self.status_hint = payload.get('display', '')
+            self.status_args = payload.get('args', {}) or {}
+            self.status_tool_name = payload.get('name', '') or ''
         elif kind == 'tool_output':
             if payload.get('call_id') == self.active_tool:
                 self.live_tool_output.append(payload.get('text', ''))
@@ -669,6 +724,8 @@ class AdCodeApp:
         elif kind == 'tool_end':
             self.active_tool = ''
             self.live_tool_output = []
+            self.status_args = {}
+            self.status_tool_name = ''
             self.phase = 'thinking'
         elif kind == 'compaction_start':
             self.phase = 'compacting'
@@ -724,6 +781,7 @@ class AdCodeApp:
             self.phase = 'idle'
             self.follow = True
             self.scroll = 0
+            self._update_title()
         elif kind == 'agents_refresh':
             self.dirty = True
         elif kind == 'model_changed':
@@ -783,8 +841,12 @@ class AdCodeApp:
 
     # ── input ───────────────────────────────────────────────
     def _handle_event(self, event: KeyEvent) -> None:
-        if event.kind == 'key' and event.key == 'ctrl+q':
-            # One key quits, whatever is on the screen.
+        # One key quits, whatever is on the screen -- unless an overlay is
+        # capturing a new binding, where the quit chord is the value typed.
+        capturing = self.overlay is not None and \
+            getattr(self.overlay, 'capture_mode', False)
+        if event.kind == 'key' and not capturing \
+                and event.key == self.keymap.key_of('quit'):
             self.request_exit()
             return
         if self.overlay is not None:
@@ -824,25 +886,47 @@ class AdCodeApp:
         if event.kind != 'key':
             return
         key = event.key
-        if key != 'ctrl+c':
+        if key != self.keymap.key_of('exit_chord'):
             self.exit_armed = False
-        if key in ('pgup',):
+        if key == 'esc':
+            # Cancel is a fixed gesture: close the completion, interrupt the
+            # turn, or drop the selection.
+            if self._completion_visible():
+                self.prompt.completion_closed_for = self.prompt.text
+                self.prompt.anchor = None
+            elif self.phase != 'idle' and self.loop is not None:
+                self.loop.interrupt()
+            else:
+                self.prompt.anchor = None
+            self.dirty = True
+            return
+        if key == 'enter':
+            # Submit is a fixed gesture too.
+            self._handle_enter(event)
+            return
+        action = self.keymap.action_of(key)
+        if action is None:
+            return
+        if action == 'scroll_up':
             self.follow = False
             self.scroll = min(self._max_scroll(), self.scroll + self._page_size())
             self.dirty = True
             return
-        if key in ('pgdn',):
+        if action == 'scroll_down':
             self.scroll = max(0, self.scroll - self._page_size())
             self.follow = self.scroll <= 0
             self.dirty = True
             return
-        if key == 'ctrl+l':
+        if action == 'redraw':
             self.dirty = True
             return
-        if key == 'ctrl+p':
+        if action == 'palette':
             self.open_command_palette()
             return
-        if key == 'ctrl+c':
+        if action == 'sessions':
+            self.open_sessions_browser()
+            return
+        if action == 'exit_chord':
             if self._copy_selection():
                 return
             if self.prompt.selection()[0] != self.prompt.selection()[1]:
@@ -858,96 +942,85 @@ class AdCodeApp:
                 self.request_exit()
             else:
                 self.exit_armed = True
-                self.status_hint = 'press ctrl+c again to exit'
+                chord = self.keymap.key_of('exit_chord') or 'ctrl+c'
+                self.status_hint = f'press {chord} again to exit'
             self.dirty = True
             return
-        if key == 'ctrl+d':
+        if action == 'exit_eof':
             if not self.prompt.text:
                 self.request_exit()
             return
-        if is_paste_key(key):
+        if action == 'paste':
+            # The standard paste chords stay attached as fixed aliases.
             self._paste_from_clipboard()
             return
-        if key == 'alt+v':
+        if action == 'attach_image':
             self.attach_clipboard_image()
             return
-        if key == 'ctrl+x':
+        if action == 'cut':
             cut = self.prompt.cut()
             if cut and not set_clipboard(cut):
                 self.status_hint = 'the clipboard is not available'
             self.dirty = True
             return
-        if key == 'ctrl+a':
+        if action == 'select_all':
             self.prompt.anchor = 0
             self.prompt.cursor = len(self.prompt.text)
             self.dirty = True
             return
-        if key == 'ctrl+z':
+        if action == 'undo':
             self._undo()
             return
-        if key == 'ctrl+y':
+        if action == 'redo':
             self._redo()
             return
-        if key == 'esc':
-            if self._completion_visible():
-                self.prompt.completion_closed_for = self.prompt.text
-                self.prompt.anchor = None
-            elif self.phase != 'idle' and self.loop is not None:
-                self.loop.interrupt()
-            else:
-                self.prompt.anchor = None
-            self.dirty = True
-            return
-        if key in ('ctrl+j', 'alt+enter', 'shift+enter'):
+        if action == 'newline':
             self.prompt.insert('\n')
             self.dirty = True
             return
-        if key == 'enter':
-            self._handle_enter(event)
-            return
-        if key == 'tab':
+        if action == 'complete':
             self._apply_completion()
             return
-        if key == 'up':
+        if action == 'history_up':
             if self._completion_visible():
                 self._move_completion(-1)
             else:
                 self._history_move(-1)
             self.dirty = True
             return
-        if key == 'down':
+        if action == 'history_down':
             if self._completion_visible():
                 self._move_completion(1)
             else:
                 self._history_move(1)
             self.dirty = True
             return
-        if key in ('left', 'shift+left'):
+        if action == 'move_left':
             self._move_horizontal(-1, event.shift)
             return
-        if key in ('right', 'shift+right'):
+        if action == 'move_right':
             self._move_horizontal(1, event.shift)
             return
-        if key in ('home', 'shift+home'):
+        if action == 'line_start':
             self._move_line_edge(start=True, whole=False, extend=event.shift)
             return
-        if key in ('end', 'shift+end'):
+        if action == 'line_end':
             self._move_line_edge(start=False, whole=False, extend=event.shift)
             return
-        if key == 'backspace':
+        if action == 'delete_backward':
             self.prompt.delete_backward()
             self.dirty = True
             return
-        if key == 'delete':
+        if action == 'delete_forward':
             self.prompt.delete_forward()
             self.dirty = True
             return
-        if key == 'ctrl+home':
+        if action == 'jump_start':
             self.prompt.cursor = 0
             self.prompt.anchor = None
             self.dirty = True
             return
-        if key == 'ctrl+end':
+        if action == 'jump_end':
             self.prompt.cursor = len(self.prompt.text)
             self.prompt.anchor = None
             self.dirty = True
@@ -1392,14 +1465,22 @@ class AdCodeApp:
         self._view_lines = visible
         self._view_start = start
         self._view_top = transcript_top
-        for index, line in enumerate(visible):
-            # Tool call rows declare a bleed so their accent bar sits flush with
-            # the left edge; the gutter inside the row keeps the text aligned.
-            x = _row_offset(line)
-            selected = self._row_selection(start + index)
-            self._draw_line(x, transcript_top + index, line,
-                            max(1, columns - x - 1), selected)
-        self._draw_scrollbar(columns, transcript_top, viewport_h, total, start)
+        if not visible and self.phase == 'idle':
+            # An empty pane: the welcome logo and a random command tip.
+            from adcode.tui.welcome import paint_welcome
+            paint_welcome(self.canvas, transcript_top, separator_y, columns,
+                          self.palette, self.welcome_tip)
+        else:
+            for index, line in enumerate(visible):
+                # Tool call rows declare a bleed so their accent bar sits flush
+                # with the left edge; the gutter inside the row keeps the text
+                # aligned.
+                x = _row_offset(line)
+                selected = self._row_selection(start + index)
+                self._draw_line(x, transcript_top + index, line,
+                                max(1, columns - x - 1), selected)
+            self._draw_scrollbar(columns, transcript_top, viewport_h, total,
+                                 start)
         self.canvas.hline(0, separator_y, columns, self.palette.border, alpha=110)
         for index, line in enumerate(visible_prompt):
             self._draw_line(0, prompt_top + index, line, columns)
@@ -1423,7 +1504,11 @@ class AdCodeApp:
             if self._cursor_visible is not True:
                 parts.append('\x1b[?25h')
                 self._cursor_visible = True
-            if cursor != self._last_cursor:
+            # Writing rows moves the terminal cursor to the end of the last
+            # row it touched, so the caret has to be placed again whenever the
+            # frame carried any bytes.  Only a frame that writes nothing can
+            # trust the remembered position.
+            if payload or cursor != self._last_cursor:
                 parts.append(f'\x1b[{cursor[1] + 1};{cursor[0] + 1}H')
                 self._last_cursor = cursor
             tail = ''.join(parts)
@@ -1503,6 +1588,19 @@ class AdCodeApp:
                                   self.palette.muted, self.palette.status_bg)
         self.canvas.hline(0, 1, columns, self.palette.border, alpha=110)
 
+    def _current_action(self) -> str:
+        """What the agent is doing right now, for the status line.
+
+        A merged chain shows no details, so the status line is where the
+        running action is spelled out ("read  README.md").
+        """
+        name = self.status_hint or 'tool'
+        if self.config.tools.chain != 'merged':
+            return name
+        from adcode.tui.transcript import tool_arg_brief
+        brief = tool_arg_brief(self.status_tool_name or name, self.status_args)
+        return f'{name}  {brief}' if brief else name
+
     def _draw_footer(self, columns: int, y: int, max_scroll: int) -> None:
         snap = self.snapshot()
         frame = SPINNER[int(time.time() * 10) % len(SPINNER)]
@@ -1519,7 +1617,7 @@ class AdCodeApp:
         elif phase == 'answering':
             status = f'{frame} writing'
         elif phase == 'tool':
-            status = f'{frame} {self.status_hint or "tool"}'
+            status = f'{frame} {self._current_action()}'
         elif phase == 'compacting':
             status = f'{frame} compacting'
         elif phase == 'aside':
@@ -1531,8 +1629,21 @@ class AdCodeApp:
             'tool': 'accent', 'compacting': 'info', 'aside': 'accent',
             'idle': 'muted',
         }.get(phase, 'muted')
+        # The token status sits at the right edge; the status line and the
+        # extras get the room that is left of it.
+        right = ''
+        right_x = columns
+        if self.config.ui.show_token_status:
+            context_pct = 0
+            if snap.context_window:
+                context_pct = round(100 * snap.context_tokens / snap.context_window)
+            right = (f'ctx {context_pct}%  ↑{_format_tokens(snap.total_in)} '
+                     f'↓{_format_tokens(snap.total_out)}')
+            right_x = max(1, columns - 1 - text_width(right))
+        room = max(0, right_x - 1)
         x = 1
-        x += self.canvas.draw_text(x, y, status, self._color(color, 'muted'))
+        x += self.canvas.draw_text(x, y, status, self._color(color, 'muted'),
+                                   None, 0, 255, room)
         extras: list[str] = []
         queued = snap.queued
         if queued:
@@ -1549,23 +1660,58 @@ class AdCodeApp:
                   and not (isinstance(row.get('status'), dict))]
         if agents and self.config.agents.show_activity:
             extras.append(f'{len(agents)} agent{"s" if len(agents) > 1 else ""}')
+        if self.config.tools.chain == 'merged':
+            extras.append('merged steps')
+        if self.config.thinking.mode == 'summary':
+            extras.append('summary thinking')
+        if self.config.hold.enabled:
+            extras.append(f'hold ×{self.config.hold.max_retries}')
         if self.scroll > 0:
             extras.append(f'↑ {self.scroll} lines')
         selected = self._selection_range()
         if selected is not None:
             length = len(self._selection_text())
             extras.append(f'{length} selected · ctrl+c copies')
-        if extras:
-            x += self.canvas.draw_text(x, y, '  ·  ', self.palette.border)
-            self.canvas.draw_text(x, y, '  ·  '.join(extras), self.palette.muted)
-        if self.config.ui.show_token_status:
-            context_pct = 0
-            if snap.context_window:
-                context_pct = round(100 * snap.context_tokens / snap.context_window)
-            right = (f'ctx {context_pct}%  ↑{_format_tokens(snap.total_in)} '
-                     f'↓{_format_tokens(snap.total_out)}')
-            right_x = max(1, columns - 1 - text_width(right))
+        # The extras are dropped from the right until they fit: half a word
+        # on the line reads like a bug.  The separator in front of the first
+        # one counts towards the room.
+        separator = '  ·  '
+        room = right_x - x - text_width(separator)
+        fitting: list[str] = []
+        for extra in extras:
+            if text_width('  ·  '.join([*fitting, extra])) > room:
+                break
+            fitting.append(extra)
+        if fitting:
+            x += self.canvas.draw_text(x, y, separator, self.palette.border,
+                                       None, 0, 255, right_x - x)
+            self.canvas.draw_text(x, y, '  ·  '.join(fitting), self.palette.muted,
+                                  None, 0, 255, right_x - x)
+        self._draw_status_sweep(columns, y, phase)
+        if right:
             self.canvas.draw_text(right_x, y, right, self.palette.muted)
+
+    def _draw_status_sweep(self, columns: int, y: int, phase: str) -> None:
+        """The light that runs along the status line while the agent works.
+
+        It enters at the left edge and leaves at the right one a second
+        later, so the line reads as alive without pulling the eye away from
+        the text.  The wait for the provider (``connecting``) has no light:
+        nothing is happening yet.
+        """
+        if phase not in ('thinking', 'answering', 'tool', 'compacting', 'aside'):
+            return
+        # The light enters from beyond the left edge and leaves beyond the
+        # right one, so it is never half on screen.
+        head = ((time.time() % SWEEP_PERIOD) / SWEEP_PERIOD
+                * (columns + SWEEP_SPAN) - SWEEP_SPAN)
+        for offset in range(SWEEP_SPAN):
+            x = int(head) - offset
+            if not (0 <= x < columns):
+                continue
+            fade = 1.0 - offset / SWEEP_SPAN
+            self.canvas.fill_rect(x, y, 1, 1, self.palette.accent,
+                                  alpha=int(20 + 110 * fade * fade))
 
     def _draw_scrollbar(self, columns: int, top: int, height: int, total: int,
                         start: int) -> None:
@@ -1636,6 +1782,28 @@ class AdCodeApp:
 
     def open_settings(self) -> None:
         self.open_overlay(SettingsOverlay(self.config, self.config_changed))
+
+    def open_keybindings(self) -> None:
+        """Open the key bindings panel (/keys)."""
+        from adcode.tui.keybindings_panel import KeybindingsPanel
+        self.open_overlay(KeybindingsPanel(self.config.keys,
+                                           self.config_changed))
+
+    def open_sessions_browser(self) -> None:
+        """Browse and load saved sessions (ctrl+h, /sessions)."""
+        rows = self.session_store.list()
+        if not rows:
+            self.notify('No saved sessions.', 'info')
+            return
+
+        def choose(name: Any) -> None:
+            self.load_session(str(name))
+        self.open_select(
+            'Sessions',
+            [DialogItem(row['name'], row['title'] or row['name'],
+                        f'{row["updated"]} · {row["messages"]} messages')
+             for row in rows],
+            choose, width=86)
 
     def open_message(self, title: str, message: str) -> None:
         self.open_overlay(MessageDialog(title, message))

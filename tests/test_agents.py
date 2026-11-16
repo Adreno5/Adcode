@@ -193,6 +193,24 @@ def test_fork_turns_shapes_child_history(tmp_path):
     asyncio.run(main())
 
 
+def test_child_system_swaps_the_identity_for_its_own_model(tmp_path):
+    """A child running another model must not claim the parent's model."""
+    from adcode.system_prompt import identity_block
+
+    async def main():
+        root, manager, client = _setup(tmp_path)
+        root._system_provider = lambda: identity_block('test-model', 'Test')
+        record = await manager.spawn('remote', 'go', agent_type='remote')
+        system = record.engine.system_prompt()
+        assert 'model id: other-model' in system
+        assert 'model id: test-model' not in system
+        assert 'provider: Other' in system
+        assert 'role: sub-agent' in system
+        await _wait_child(manager, 'remote')
+
+    asyncio.run(main())
+
+
 def test_spawn_validates_input(tmp_path):
     async def main():
         root, manager, client = _setup(tmp_path)
@@ -299,5 +317,42 @@ def test_interrupt_agent(tmp_path):
         assert 'previous_status' in result
         await _wait_child(manager, 'slowpoke')
         assert manager._agents['slowpoke'].status == AgentStatus.INTERRUPTED
+
+    asyncio.run(main())
+
+
+def test_a_failed_turn_gives_the_sub_agent_update_back(tmp_path):
+    """A turn that never reaches the history must not eat the update.
+
+    The sdk clears the inbox when it hands the updates to a turn, and the
+    engine never puts them back: an interrupted turn used to throw away what
+    the sub-agents found.  The manager keeps a copy and returns the updates
+    that never made it into the history.
+    """
+    async def main():
+        root, manager, client = _setup(tmp_path)
+        record = await manager.spawn('scout', 'scout the area')
+        await _wait_child(manager, 'scout')
+
+        # The turn takes the updates out of the inbox...
+        updates = manager.consume_mailbox(root)
+        assert len(updates) == 1
+        assert not manager.records()['root'].inbox
+
+        # ...and the turn dies before the update reaches the history.
+        lost = manager.settle_mailbox(root)
+        assert lost == 1
+        # The update is back in the inbox, so the next turn still sees it.
+        assert len(manager.records()['root'].inbox) == 1
+        again = manager.consume_mailbox(root)
+        assert again == updates
+
+        # A turn that did commit keeps the update and requeues nothing.
+        root.conversation.stage({'role': 'user', 'content': updates[0]})
+        root.conversation.commit()
+        pending = manager.consume_mailbox(root)
+        assert pending == []
+        manager.settle_mailbox(root)
+        assert not manager.records()['root'].inbox
 
     asyncio.run(main())

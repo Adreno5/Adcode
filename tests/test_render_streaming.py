@@ -41,6 +41,32 @@ def test_an_idle_frame_writes_nothing(harness):
     assert _frame_count(harness) == frames
 
 
+def test_the_caret_stays_on_the_prompt_when_another_row_is_repainted(harness):
+    """Repainting a row must not drag the caret to the end of that row.
+
+    Writing rows moves the terminal cursor to the end of the last row it
+    touched, so a frame that repaints anything has to place the caret again.
+    """
+    harness.wait_rendered()
+    harness.type_text('hello world')
+    harness.wait_prompt('hello world')
+    before = harness.screen.latest
+    assert before is not None
+    assert before.cursor is not None
+    caret = before.cursor
+
+    # A notice repaints the transcript area; the caret does not move, but the
+    # frame carries bytes and therefore must reposition it.
+    harness.app.notify('a notice', 'info')
+    harness.app.dirty = True
+    harness.wait_until(lambda: not harness.app.dirty, timeout=5.0,
+                       description='a render pass')
+
+    after = harness.screen.latest
+    assert after is not None
+    assert after.cursor == caret, (after.cursor, caret)
+
+
 def test_typing_repaints_far_less_than_a_full_frame(harness):
     harness.wait_rendered()
     harness.wait_idle()

@@ -242,7 +242,12 @@ def test_escape_interrupts_an_in_flight_turn(harness):
     assert any(kind == 'notice' and text == '[interrupted]'
                for kind, text in harness.transcript_texts())
     assert harness.app is not None and harness.app.loop is not None
-    assert harness.app.loop.context.committed == []
+    # The interrupted turn keeps its work: the request and the reasoning the
+    # model had already streamed.  Dropping it made the next turn start over.
+    committed = harness.app.loop.context.committed
+    assert [message['role'] for message in committed] == ['user', 'assistant']
+    assert committed[0]['content'] == 'start a slow turn'
+    assert 'HELD-REASONING' in str(committed[1].get('content') or '')
     assert not harness.screen.latest.vt_mismatch
 
 

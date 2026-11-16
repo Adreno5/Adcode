@@ -12,13 +12,75 @@ from adcode.goals import GoalStore
 from adcode.skills import SkillRegistry
 
 BASE_SUFFIX = (
-    'You are AdCode, a concise and capable terminal coding agent. '
     'Use the available tools to inspect, change, and verify the project. '
     'Keep working until the task is complete. Prefer reading before editing. '
     'Answer in the language the user writes in. '
     'Do not use emoji characters in replies. '
     'All model operations, including compaction and sub-agents, must use streaming APIs.'
 )
+
+RUNTIME_NAME = 'AdCode'
+HARNESS_NAME = 'AICF harness'
+HARNESS_FULL_NAME = ('AICF (Agent Infrastructure Cybernetics Framework) harness')
+
+IDENTITY_OPEN = '<identity>'
+IDENTITY_CLOSE = '</identity>'
+
+
+def identity_block(model_id: str, provider: str = '', agent_name: str = RUNTIME_NAME,
+                   role: str = '') -> str:
+    """The block that tells the model who it is and what it runs on.
+
+    ``model_id`` is the id of the model this session actually talks to, so
+    the agent can answer "which model am I?" without guessing.
+    """
+    lines = [
+        f'You are {agent_name}, a concise and capable terminal coding agent.',
+        f'model id: {model_id or "unknown"}',
+    ]
+    if provider:
+        lines.append(f'provider: {provider}')
+    lines.append(
+        f'runtime: {RUNTIME_NAME}, built on the {HARNESS_FULL_NAME}. '
+        f'The {HARNESS_NAME} provides the agent loop, tools, sessions and '
+        f'sub-agent collaboration.'
+    )
+    if role:
+        lines.append(f'role: {role}')
+    lines.append(
+        f'The model id above is your own identity; report it when asked, '
+        f'and never claim to be a different model.'
+    )
+    return IDENTITY_OPEN + '\n' + '\n'.join(lines) + '\n' + IDENTITY_CLOSE
+
+
+def _selected_identity(config: AppConfig) -> tuple[str, str]:
+    """(model id, provider) of the configured selection, best effort."""
+    try:
+        selected = config.selected()
+    except Exception:
+        return '', ''
+    if selected is None:
+        return '', ''
+    provider, model = selected
+    return (getattr(model, 'id', '') or '', getattr(provider, 'name', '') or '')
+
+
+def replace_identity(prompt: str, model_id: str, provider: str = '',
+                     agent_name: str = RUNTIME_NAME,
+                     role: str = '') -> str:
+    """Swap the identity block of an assembled prompt for a new model.
+
+    A sub-agent may run a different model than its parent; the parent's
+    prompt is reused verbatim, so its identity lines are replaced instead of
+    contradicting the child.
+    """
+    if IDENTITY_OPEN not in prompt or IDENTITY_CLOSE not in prompt:
+        return prompt
+    head, _, rest = prompt.partition(IDENTITY_OPEN)
+    _, _, tail = rest.partition(IDENTITY_CLOSE)
+    block = identity_block(model_id, provider, agent_name=agent_name, role=role)
+    return head + block + tail
 
 
 GLOBAL_INSTRUCTIONS_PATH = CONFIG_DIR / 'AGENTS.md'
@@ -80,8 +142,12 @@ def environment_block(cwd: str | None = None) -> str:
 
 def build_system_prompt(config: AppConfig, goals: GoalStore | None,
                         skills: SkillRegistry | None, cwd: str | None = None,
-                        vision: bool = False) -> str:
-    parts = [instructions_block(cwd), environment_block(cwd), BASE_SUFFIX]
+                        vision: bool = False,
+                        model_id: str = '', provider: str = '') -> str:
+    if not model_id:
+        model_id, provider = _selected_identity(config)
+    parts = [instructions_block(cwd), environment_block(cwd),
+             identity_block(model_id, provider), BASE_SUFFIX]
     if vision:
         parts.append(
             'You can see images. A user message that carries one shows it to you '

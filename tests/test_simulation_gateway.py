@@ -111,6 +111,67 @@ def test_gateway_accumulates_tool_call_arguments(gateway, wire):
                                 'content': 'from the gateway\n'}
 
 
+@pytest.mark.parametrize('wire', WIRES)
+def test_gateway_receives_a_paired_tool_call_and_result(gateway, wire):
+    """A tool round must reach the provider as a pair the model can follow.
+
+    The responses wire takes *items*, not chat messages: the assistant's
+    ``function_call`` and the matching ``function_call_output``.  Sending the
+    chat shape instead leaves the model without a result it can attach to its
+    own call -- it stops learning from the tools and repeats them forever.
+    """
+    gateway.responder = ScriptedResponder([Turn(text='done')])
+    client = LLMClient(provider(gateway.base_url, wire))
+    history = [
+        {'role': 'user', 'content': 'write the file'},
+        {'role': 'assistant', 'content': None,
+         'tool_calls': [{'id': 'call_write_1', 'type': 'function',
+                         'function': {'name': 'write',
+                                      'arguments': '{"path": "notes.txt"}'}}]},
+        {'role': 'tool', 'tool_call_id': 'call_write_1',
+         'content': 'wrote notes.txt'},
+    ]
+    collect(client, wire, messages=history)
+
+    request = gateway.requests[0]
+    body = request.body
+    if wire == 'openai responses':
+        items = body['input']
+        calls = [item for item in items
+                 if item.get('type') == 'function_call']
+        outputs = [item for item in items
+                   if item.get('type') == 'function_call_output']
+        assert calls, items
+        assert outputs, items
+        assert calls[0]['call_id'] == 'call_write_1'
+        assert calls[0]['name'] == 'write'
+        assert outputs[0]['call_id'] == 'call_write_1'
+        assert outputs[0]['output'] == 'wrote notes.txt'
+        # No chat-shaped leftovers: the endpoint knows neither role.
+        assert not [item for item in items
+                    if item.get('role') in ('tool', 'assistant')
+                    and 'tool_calls' in item]
+    elif wire == 'anthropic messages':
+        messages = body['messages']
+        assistant = [m for m in messages
+                     if m.get('role') == 'assistant'
+                     and any(b.get('type') == 'tool_use'
+                             for b in m.get('content', []))]
+        results = [b for m in messages
+                   for b in (m.get('content') or [])
+                   if isinstance(b, dict) and b.get('type') == 'tool_result']
+        assert assistant, messages
+        assert results, messages
+        assert results[0]['tool_use_id'] == 'call_write_1'
+    else:
+        messages = body['messages']
+        assistant = [m for m in messages if m.get('tool_calls')]
+        tool = [m for m in messages if m.get('role') == 'tool']
+        assert assistant, messages
+        assert tool, messages
+        assert tool[0]['tool_call_id'] == 'call_write_1'
+
+
 def test_gateway_sse_wire_format_is_literal_http(gateway):
     body = json.dumps({
         'model': 'harness-model',

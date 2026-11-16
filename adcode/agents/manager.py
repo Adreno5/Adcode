@@ -29,6 +29,7 @@ from harness.agent.engine import ConversationEngine
 from harness.agent.engine_config import AgentSettings, EngineConfig, ModelInfo
 
 from adcode.config import AgentsSettings, AppConfig, ModelConfig, ProviderConfig
+from adcode.system_prompt import RUNTIME_NAME, replace_identity
 from adcode.tools.registry import AnnotatedTool, ManagedToolRegistry
 
 
@@ -125,6 +126,46 @@ class AgentManager(SdkAgentManager):
         # deliberately inert (drain_events returns empty) so exactly one
         # consumer - the facade - turns these into AgentEvents.
         self._agent_events: deque[tuple[str, dict[str, Any]]] = deque(maxlen=2_000)
+        # Sub-agent updates handed to a turn, kept until that turn commits.
+        self._pending_mailbox: dict[int, list[str]] = {}
+
+    # ── mailbox bookkeeping ─────────────────────────────────
+    def consume_mailbox(self, engine: ConversationEngine) -> list[str]:
+        """Take the inbox, but remember it until the turn that used it commits.
+
+        The sdk clears the inbox as it hands the updates over and the engine
+        never puts them back.  A turn that fails or is interrupted after the
+        updates were staged therefore drops the results of the sub-agents for
+        good -- the parent never learns what they found.  The copy kept here
+        lets :meth:`settle_mailbox` return the undelivered updates.
+        """
+        messages = super().consume_mailbox(engine)
+        if messages:
+            self._pending_mailbox.setdefault(id(engine), []).extend(messages)
+        return messages
+
+    def settle_mailbox(self, engine: ConversationEngine) -> int:
+        """Requeue the sub-agent updates a turn never put into the history.
+
+        Returns how many updates were put back.  Called when the turn ends:
+        the engine has committed or rolled back by then, so the history says
+        which updates made it through.
+        """
+        pending = self._pending_mailbox.pop(id(engine), [])
+        if not pending:
+            return 0
+        history = ''
+        try:
+            for message in engine.conversation.committed:
+                content = message.get('content')
+                if isinstance(content, str):
+                    history += content
+        except Exception:
+            history = ''
+        lost = [text for text in pending if text not in history]
+        if lost:
+            self.requeue_mailbox(engine, lost)
+        return len(lost)
 
     # ── wiring ──────────────────────────────────────────────
     def attach(self, engine: ConversationEngine) -> None:
@@ -245,8 +286,9 @@ class AgentManager(SdkAgentManager):
             client=child_client, registry=self._registry, store=self._store,
             cwd=self._cwd, model=model_info,
             config=EngineConfig(agents=self.config),
-            system_provider=lambda: self._child_system(parent_record,
-                                                       type_config.system),
+            system_provider=lambda: self._child_system(
+                parent_record, type_config.system,
+                model_config.id, provider.name),
             allowed_tools=allowed_tools, agent_name=name)
         child.sink = _child_sink(child, self._agent_events.append)
         child.conversation.committed.extend(
@@ -317,10 +359,19 @@ class AgentManager(SdkAgentManager):
             safe = safe[starts[-keep]:]
         return safe
 
-    def _child_system(self, parent_record, type_system: str) -> str:
+    def _child_system(self, parent_record, type_system: str,
+                      model_id: str = '', provider: str = '') -> str:
         parts = []
         if parent_record is not None:
-            parts.append(parent_record.engine.system_prompt())
+            parent_prompt = parent_record.engine.system_prompt()
+            # The child may run a different model; keep the parent's prompt
+            # but swap the identity so the child does not claim to be the
+            # parent's model.
+            if model_id:
+                parent_prompt = replace_identity(
+                    parent_prompt, model_id, provider,
+                    agent_name=RUNTIME_NAME, role='sub-agent')
+            parts.append(parent_prompt)
         parts.append(SUBAGENT_SYSTEM)
         if type_system:
             parts.append(type_system)

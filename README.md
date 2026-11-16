@@ -120,7 +120,16 @@ maximum output, vision support, tool calling, and reasoning efforts.
 | `ctrl+home` / `ctrl+end` | Input start / end |
 | `ctrl+l` | Redraw the screen |
 | `ctrl+p` | Open the command palette (type to filter, enter to run) |
+| `ctrl+h` | Browse and load saved sessions |
 | `ctrl+q` | Quit |
+
+Every application shortcut above is rebindable: `/keys` opens the bindings
+panel listing each action with its current key. `enter` starts a rebind (press
+the new chord; `esc` cancels), `r` resets an action to its default, and a key
+already used by another action can take it over (the other action becomes
+unbound). Bindings are stored in `~/.adcode/config.json` under `keys` and take
+effect immediately. `enter`, `esc`, and the dialog navigation keys stay fixed;
+`/help` always shows the live bindings.
 
 ## Selecting text
 
@@ -151,10 +160,13 @@ Enter completes it, and Enter runs the command.
 |---|---|
 | `/help` | Commands and key bindings |
 | `/config` | Open the settings browser |
+| `/keys` | Open the key bindings panel |
 | `/model [list\|edit]` | Switch models or edit the selected model's capabilities |
 | `/provider add\|edit\|remove\|list` | Manage providers and their models |
 | `/effort [level]` | Set `low`, `medium`, `high`, `xhigh`, `max`, or `ultra` |
-| `/thinking [mode]` | Set thinking display: `hidden`, `label`, `partial`, `full` |
+| `/thinking [mode]` | Set thinking display: `hidden`, `label`, `partial`, `full`, `summary` |
+| `/steps [level]` | Preset the work-step settings: `concise`, `standard`, `detailed` |
+| `/hold [on\|off\|<retries>]` | Keep retrying a request that was cut short |
 | `/max_tokens [n]` | Set the maximum output tokens per request |
 | `/compact` | Compact older turns immediately |
 | `/context`, `/cache`, `/prefix` | Inspect context size, cache usage, and the stable prefix |
@@ -198,6 +210,7 @@ are persisted to `config.json`.
 | `label` | One label line with a fixed or rotating suffix |
 | `partial` | A configurable window of the rendered reasoning |
 | `full` | The complete reasoning stream |
+| `summary` | The reasoning is kept but not spelled out: one line per finished thought, `thought of 412 tokens` |
 
 The `label` mode configures the label text (`Thinking`, `Reasoning`,
 `Polishing`, ...), the suffix animation (`fixed` or `rotating`), the rotation
@@ -217,6 +230,59 @@ The app draws at 60 frames per second by default. `/config` exposes
 that has nothing new to show writes no bytes to the terminal, so a higher
 rate costs nothing while the app is idle.
 
+### Interruptions and `/hold`
+
+A turn can stop for two very different reasons: the user pressed `esc`, or
+something went wrong on the way (a provider error, a dropped connection, a
+response that ended without a finish signal).  AdCode treats them
+differently.
+
+- **`esc` reaches the provider.**  The stream stops at the next chunk instead
+  of running to the end of the response, so an interrupt is immediate.
+- **The work that was done stays in the history.**  The reasoning of a round
+  that never finished is kept as an assistant turn that says so, together
+  with the partial answer.  Without it the next turn starts from a blank
+  slate: the model re-reads the same files and re-plans the same work.
+- **`/hold` retries the request.**  With `/hold on` a request whose stream
+  broke is re-sent until it works.  The only things that stop the loop are
+  an explicit `esc` and a response that actually finished; when the retries
+  run out, AdCode gives up and says so.
+
+| Command | Effect |
+|---|---|
+| `/hold` | Toggle the mode |
+| `/hold on` / `/hold off` | Turn it on or off |
+| `/hold <n>` | Set how many times a broken request is retried (default 20) |
+
+The settings live in `/config` under **Hold** (retry count and the delay
+between attempts).
+
+### Work steps
+
+The thinking and the tool settings live in one **Work steps** group of
+`/config`; they decide how much of the work chain the transcript spells out.
+
+Two of them do the heavy lifting:
+
+- **Chain of calls** (`tools.chain`) -- `separate` gives every call its own
+  row, `merged` folds a chain of consecutive calls into one row with the
+  tool names and their counts: `bash x2, grep, write`.  A merged chain shows
+  no details; the whole chain stays in the history.
+- **Thinking display** (`thinking.mode`) -- `summary` keeps the reasoning but
+  only says how much there was: `thought of 412 tokens`.
+
+`/steps` is a shortcut that writes those settings:
+
+| Level | Writes |
+|---|---|
+| `concise` | `thinking.mode = summary`, `tools.chain = merged` |
+| `standard` | `thinking.mode = partial`, `tools.chain = separate` |
+| `detailed` | `thinking.mode = full`, `tools.chain = separate`, `tools.result_mode = full` |
+
+While the agent works, a light runs along the status line under the input:
+it enters at the left edge, crosses the screen once per second and leaves at
+the right one.  The wait for the provider (`connecting`) has no light.
+
 ### Tool display
 
 | Mode | Behaviour |
@@ -231,6 +297,10 @@ bar is a left-edge block (`▏`, one cell wide, same room as `│`) rather than 
 centred glyph, so the rule really sits flush with the screen edge while the
 gutter keeps the name one space away from it. Result rows stay aligned with the
 wrapped text.
+
+A chain of consecutive calls can be folded into one row (`tools.chain`,
+see **Work steps**): `▏ bash x2, grep, write`.  The row names the tools the
+chain used and how often; the arguments and the output stay in the history.
 
 Result sections support the same negative-row window, style, gradient, and
 ellipsis controls as thinking, plus a full mode with an optional line cap.
@@ -265,7 +335,8 @@ there automatically on first load. A minimal file looks like this:
     ],
     "selected_model": "DeepSeek::deepseek-chat",
     "thinking": {"mode": "partial", "style": "gradient"},
-    "tools": {"mode": "both", "result_mode": "partial"},
+    "tools": {"mode": "both", "chain": "separate", "result_mode": "partial"},
+    "hold": {"enabled": false, "max_retries": 20, "delay": 2},
     "agents": {"enabled": true, "max_concurrent": 10, "max_depth": 4},
     "agent_types": {},
     "agent_teams": {}
@@ -358,6 +429,12 @@ while active. Global instructions are read from `~/.adcode/AGENTS.md` and
 project instructions from `AGENTS.md` (or `prompt`) in the working directory.
 Both are inserted into the system prompt; when they conflict, the project
 instructions take precedence.
+
+The system prompt also carries an `<identity>` block telling the model who it
+is: the name AdCode, the model id of the currently selected model, and the
+fact that it runs on the AICF harness. The model id follows model changes,
+and a sub-agent running a different model gets its own identity block
+instead of the parent's.
 
 ## Images
 
@@ -470,6 +547,29 @@ The UI consumes a thread-safe event queue and renders the live state.
 - Compaction keeps the most recent turns, summarizes the rest with a streaming
   model call, appends a deterministic fallback when the model call fails, and
   archives the removed messages.
+- An interrupted turn keeps the work it finished: the tool rounds that
+  completed stay in the history, the reasoning of the round that was cut off
+  stays with it, and the sub-agent updates a failed turn never delivered go
+  back into the mailbox for the next turn.
+- `/hold` re-sends a request whose stream broke (a provider error, a dropped
+  connection, a response without a finish signal) until it works, the user
+  interrupts, or the retries run out.
+
+### Wire shapes
+
+Every wire needs its own message shape, and a tool round must reach the model
+as a pair it can follow:
+
+| Wire | Assistant turn | Tool result |
+|---|---|---|
+| OpenAI Chat Completions | `{"role": "assistant", "tool_calls": [...]}` | `{"role": "tool", "tool_call_id": ..., "content": ...}` |
+| OpenAI Responses | `{"type": "function_call", "call_id": ..., ...}` | `{"type": "function_call_output", "call_id": ..., "output": ...}` |
+| Anthropic Messages | a `tool_use` content block | a `tool_result` content block |
+
+The Responses wire takes *items*, not chat messages.  Sending the chat shape
+there leaves the model without a result it can attach to its own call: it
+stops learning from the tools and repeats them until the turn is interrupted.
+`adcode/llm/client.py` therefore translates the history per wire.
 
 ## Project Structure
 
@@ -477,7 +577,8 @@ The UI consumes a thread-safe event queue and renders the live state.
 adcode/
 ├── cli.py            # console entry point
 ├── net.py            # proxy-aware HTTP (SOCKS5, urllib fallbacks)
-├── agent_loop.py     # streaming ReAct loop, events, persistence
+├── agent_loop.py     # the engine facade: events, sessions, control plane
+├── engine.py         # the engine itself: interruptions, hold, reasoning
 ├── config.py         # settings schema, migration, atomic save
 ├── crypto.py         # Fernet API-key encryption
 ├── models_dev.py     # models.dev catalogue and cache
