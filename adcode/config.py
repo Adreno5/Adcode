@@ -365,6 +365,24 @@ class HoldSettings:
 
 
 @dataclass
+class FailoverSettings:
+    """Try the other providers when the selected one is down.
+
+    With ``enabled`` the engine talks to a failover chain: the selected
+    provider first, then the remaining configured ones (the same model id
+    when a provider has it, its first model otherwise).  A provider whose
+    stream already produced content is never switched mid-answer.
+    """
+
+    enabled: bool = True
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> 'FailoverSettings':
+        raw = raw if isinstance(raw, dict) else {}
+        return cls(enabled=_bool(raw.get('enabled'), True))
+
+
+@dataclass
 class ContextSettings:
     auto_compact: bool = True
     compact_threshold: int = 85        # percent of the usable window
@@ -602,6 +620,7 @@ class AppConfig:
     thinking: ThinkingDisplay = field(default_factory=ThinkingDisplay)
     tools: ToolDisplay = field(default_factory=ToolDisplay)
     hold: HoldSettings = field(default_factory=HoldSettings)
+    failover: FailoverSettings = field(default_factory=FailoverSettings)
     footer: FooterSettings = field(default_factory=FooterSettings)
     context: ContextSettings = field(default_factory=ContextSettings)
     reasoning: ReasoningSettings = field(default_factory=ReasoningSettings)
@@ -734,6 +753,7 @@ def config_from_dict(raw: dict[str, Any]) -> AppConfig:
     config.thinking = ThinkingDisplay.from_dict(raw.get('thinking'))
     config.tools = ToolDisplay.from_dict(raw.get('tools'))
     config.hold = HoldSettings.from_dict(raw.get('hold'))
+    config.failover = FailoverSettings.from_dict(raw.get('failover'))
     config.footer = FooterSettings.from_dict(raw.get('footer'))
     config.context = ContextSettings.from_dict(raw.get('context'))
     config.reasoning = ReasoningSettings.from_dict(raw.get('reasoning'))

@@ -314,21 +314,24 @@ def test_the_system_prompt_carries_the_model_identity(loop):
     assert 'model id: test-model' not in system
 
 
-def test_the_turn_end_settles_the_sub_agent_mailbox(loop):
-    """The adapter returns undelivered sub-agent updates when a turn ends."""
+def test_a_failed_turn_settles_the_sub_agent_mailbox(loop):
+    """A turn that fails after the updates were staged keeps them for the
+    next turn: the sdk engine settles the mailbox when the turn ends."""
     manager = loop.agents
     assert manager is not None
-    engine = loop._engine
-    # A sub-agent update sits in the inbox and the turn takes it over.
     record = manager.records()['root']
     record.inbox.append('<subagent_update agent="scout" status="completed">'
-                         '\nfound it\n</subagent_update>')
-    updates = manager.consume_mailbox(engine)
-    assert len(updates) == 1
-    assert not record.inbox
+                        '\nfound it\n</subagent_update>')
+    client = ScriptedClient.instances[0]
 
-    # The turn ends without committing the update: it must come back.
-    loop._on_engine_event('turn_end', {'turn': 1, 'status': 'interrupted'})
+    async def broken(messages, tools=None, **kwargs):
+        raise RuntimeError('provider down')
+        yield  # pragma: no cover - keeps this an async generator
+
+    client.stream = broken
+    loop.submit('go')
+    wait_idle(loop)
+
     assert len(record.inbox) == 1
     assert 'found it' in record.inbox[0]
     # And the user is told about it.

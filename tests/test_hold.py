@@ -17,7 +17,7 @@ import pytest
 import adcode.agent_loop as agent_loop
 from adcode.agent_loop import AgentLoop
 from adcode.config import HoldSettings
-from adcode.engine import UNFINISHED_NOTE, AdCodeEngine
+from harness.agent.engine import UNFINISHED_NOTE, ConversationEngine
 from adcode.goals import GoalStore
 from adcode.session import DbSessionStore
 from adcode.skills import SkillRegistry
@@ -251,39 +251,17 @@ def test_the_hold_settings_reach_the_engine(config, tmp_path, monkeypatch):
         config.hold = HoldSettings(enabled=True, max_retries=7, delay=0.5)
         loop.apply_hold()
         engine = loop._engine
-        assert isinstance(engine, AdCodeEngine)
-        assert engine.hold_enabled is True
-        assert engine.hold_max_retries == 7
-        assert engine.hold_delay == 0.5
+        assert isinstance(engine, ConversationEngine)
+        assert engine.config.hold.enabled is True
+        assert engine.config.hold.max_retries == 7
+        assert engine.config.hold.delay == 0.5
     finally:
         loop.shutdown()
 
 
 # ── the reasoning reaches the model on every wire ───────────
-def test_the_reasoning_travels_as_text_on_the_wires_without_the_field():
-    """The Responses and the Anthropic wire have no ``reasoning_content``."""
-    from adcode.llm.client import _reasoning_as_text, _responses_items
-
-    message = {'role': 'assistant', 'content': None,
-               'reasoning_content': 'the plan is to move the caret'}
-    # The chat wire keeps the field it knows.
-    assert _reasoning_as_text(dict(message), 'chat')['reasoning_content'] \
-        == 'the plan is to move the caret'
-    # The others carry it as the text of the turn.
-    carried = _reasoning_as_text(dict(message), 'responses')
-    assert carried['content'] == 'the plan is to move the caret'
-    assert 'reasoning_content' not in carried
-    items = _responses_items(carried)
-    assert items[0]['content'][0]['text'] == 'the plan is to move the caret'
-
-
-def test_an_assistant_turn_with_text_keeps_its_reasoning_field():
-    from adcode.llm.client import _reasoning_as_text
-
-    message = {'role': 'assistant', 'content': 'the answer',
-               'reasoning_content': 'the plan'}
-    for wire in ('chat', 'responses', 'anthropic'):
-        assert _reasoning_as_text(dict(message), wire) == message
+# The chat-to-items translation and the reasoning promotion live in the sdk
+# now; tests/test_wire_message_translation.py over there covers them.
 
 
 # ── the command ─────────────────────────────────────────────

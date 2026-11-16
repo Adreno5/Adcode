@@ -26,16 +26,16 @@ from typing import Any, Callable
 
 from harness.agent import ConversationEngine, EngineConfig, EngineSnapshot
 from harness.agent.engine_config import (
-    AgentSettings, ContextSettings, ModelInfo, ReasoningSettings,
-    ThinkingSettings,
+    AgentSettings, ContextSettings, HoldSettings, ModelInfo,
+    ReasoningSettings, ThinkingSettings,
 )
 from harness.agent.events import EventSink
 from harness.images import FileIdCache
 from harness.transcript import SessionPayload, TranscriptItem
+from infra.orchestrator.failover import FailoverChat, FailoverEndpoint
 
 from adcode.agents.manager import AgentManager, AgentStatus
-from adcode.engine import AdCodeEngine
-from adcode.config import AppConfig, ModelConfig, ProviderConfig
+from adcode.config import AppConfig, FailoverSettings, ModelConfig, ProviderConfig
 from adcode.llm.client import LLMClient
 from adcode import paths
 from adcode.system_prompt import build_system_prompt
@@ -116,21 +116,21 @@ class AgentLoop:
         self._stop = False
         self._work = _WorkQueue()
         self._sink = EventSink(emit=self._on_engine_event)
-        # The bench's wait_idle samples these; both are plain queues.
-        self._events = self._sink._events
 
         self._selected = config.selected()
         if self._selected is None:
             raise RuntimeError('no provider/model configured')
         self.provider, self.model = self._selected
         self._file_cache = FileIdCache(str(paths.image_file_ids()))
-        self.client = self._make_client(self.provider, self.model)
-
         # The app hands us an empty registry; the built-in suite is installed
-        # here, and the agent / skill sources follow the engine's lifecycle.
+        # here, and the collab / skill sources follow the engine's lifecycle.
         install_coding_tools(registry)
-        registry.unregister_source('agent')
+        registry.unregister_source('collab')
         registry.unregister_source('skill')
+        # The engine talks to one IChatClient; with failover it is a chain
+        # that tries the other providers when the selected one is down.
+        self._endpoints: list[LLMClient] = []
+        self._rebuild_clients(config.failover)
 
         self.agent_live: dict[str, dict[str, str]] = {}
         self._engine: ConversationEngine | None = None
@@ -140,32 +140,38 @@ class AgentLoop:
         self._ready = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
 
+    def _rebuild_clients(self, failover: FailoverSettings) -> None:
+        """Build the selected client and, when enabled, the fallback chain.
+
+        A fallback is the same model id on another provider when it has one,
+        its first model otherwise; at most three extra endpoints are built.
+        """
+        primary = self._make_client(self.provider, self.model)
+        self._endpoints = [primary]
+        if failover.enabled:
+            for provider in self.config.providers:
+                if provider is self.provider or not provider.models:
+                    continue
+                if len(self._endpoints) >= 4:
+                    break
+                model = provider.model(self.model.id) or provider.models[0]
+                self._endpoints.append(self._make_client(provider, model))
+        if len(self._endpoints) == 1:
+            self.client = primary
+            return
+        self.client = FailoverChat([
+            FailoverEndpoint(f'{client.provider.name}::{client.model}',
+                             client)
+            for client in self._endpoints
+        ])
+
     # ── construction helpers ────────────────────────────────
     def _on_engine_event(self, kind: str, payload: dict[str, Any]) -> None:
         """Every engine event passes through here before the UI sees it."""
-        if kind == 'turn_end':
-            # The turn is over: the engine has committed or rolled back, so it
-            # is known which sub-agent updates reached the history.
-            self._settle_mailbox()
         try:
             self._wake(kind, payload)
         except Exception:
             pass
-
-    def _settle_mailbox(self) -> None:
-        """Return sub-agent updates a failed turn never delivered."""
-        manager = self.agents
-        engine = self._engine
-        if manager is None or engine is None:
-            return
-        try:
-            lost = manager.settle_mailbox(engine)
-        except Exception:
-            return
-        if lost:
-            self._emit('notice',
-                       text=f'{lost} sub-agent update(s) were kept for the '
-                            f'next turn.', level='warning')
 
     def _make_client(self, provider: ProviderConfig, model: ModelConfig) -> LLMClient:
         return LLMClient(provider, model, base_dir=self.cwd or '.',
@@ -211,13 +217,16 @@ class AgentLoop:
                 default_type=config.agents.default_type,
                 system_suffix=config.agents.system_suffix,
             ),
+            hold=HoldSettings(enabled=config.hold.enabled,
+                              max_retries=config.hold.max_retries,
+                              delay=config.hold.delay),
             max_output_tokens=config.max_output_tokens,
         )
 
     def apply_hold(self) -> None:
         """Push the ``/hold`` settings into the engine."""
         engine = self._engine
-        if engine is None or not isinstance(engine, AdCodeEngine):
+        if engine is None:
             return
         hold = self.config.hold
         engine.configure_hold(hold.enabled, hold.max_retries, hold.delay)
@@ -248,29 +257,27 @@ class AgentLoop:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         self._loop = loop
-        engine = AdCodeEngine(
+        engine = ConversationEngine(
             client=self.client, registry=self._registry,
             store=self._store,
             sink=self._sink, system_provider=self._system_provider,
             cwd=self.cwd or '.', model=self._model_info(self.provider, self.model),
             config=self._engine_config(self.config))
         self._engine = engine
-        # The client stops the stream at the next chunk when the turn is
+        # Every endpoint stops its stream at the next chunk when the turn is
         # interrupted, so an interrupt is not stuck behind a slow response.
-        self.client.interrupt = engine._interrupt
+        for endpoint in self._endpoints:
+            endpoint.interrupt = engine.interrupt_event
         self.apply_hold()
         if self.config.agents.enabled:
             self.agents = AgentManager(
                 self.config, self.config.agents, self._registry,
                 client=self.client,
                 model_info=self._model_info(self.provider, self.model),
+                provider=self.provider, model_config=self.model,
                 goal_store=self.goals,
                 client_factory=self._client_for,
                 cwd=self.cwd or '.', store=self._store)
-            self.agents._provider = self.provider
-            self.agents._model_config = self.model
-            self.agents._loop = loop
-            self.agents._condition = asyncio.Condition()
 
         def boot() -> None:
             # attach and engine.start need a *running* loop, so they run from
@@ -310,13 +317,13 @@ class AgentLoop:
             self.config.context.compaction_reasoning_effort
 
     def _submit_now(self, mode: str, text: str) -> None:
-        # Bypass engine.submit's own queued event: the facade emitted one with
-        # the facade-side queue position already.
+        # The queued event was emitted with the facade-side queue position
+        # already, so the engine's own copy is suppressed.
         engine = self._engine
         if engine is None:
             return
         self._sync_config(engine)
-        engine._work.put_nowait((mode, text))
+        engine.submit(text, mode, announce=False)
 
     def _pump_thread(self) -> None:
         """Hand queued turns to the engine, in order.
@@ -357,7 +364,7 @@ class AgentLoop:
             return False
         engine = self._engine
         if engine is not None and not engine.busy():
-            engine._interrupt.clear()
+            engine.clear_interrupt()
         self._work.put((mode, text))
         self._emit('queued', text=text, mode=mode,
                    position=self._work.qsize())
@@ -373,7 +380,7 @@ class AgentLoop:
     def request_compact(self) -> None:
         engine = self._engine
         if engine is not None and not engine.busy():
-            engine._interrupt.clear()
+            engine.clear_interrupt()
         self._work.put(('compact', ''))
 
     def add_notice(self, text: str, level: str = 'info') -> None:
@@ -392,24 +399,34 @@ class AgentLoop:
 
     def set_model(self, provider: ProviderConfig, model: ModelConfig) -> None:
         self._require_idle('model change')
-        client = self._make_client(provider, model)
         model_info = self._model_info(provider, model)
-        self.client = client
         self.provider = provider
         self.model = model
-        self._call(lambda: self._apply_model(provider, model, model_info, client))
+        # The chain is rebuilt around the new selection: the engine and the
+        # agent manager only ever see the primary client.
+        primary = self._endpoints[0]
+        if (self._endpoints and primary.provider is provider
+                and primary.model == model.id):
+            client = self.client
+        else:
+            self._rebuild_clients(self.config.failover)
+            client = self._endpoints[0]
+        self._call(lambda: self._apply_model(provider, model, model_info,
+                                             client))
 
     def _apply_model(self, provider, model, model_info, client) -> None:
         engine = self._engine
         if engine is not None:
-            engine.set_client(client, model_info)
+            engine.set_client(self.client, model_info)
+            for endpoint in self._endpoints:
+                endpoint.interrupt = engine.interrupt_event
         if self.agents is not None:
             self.agents.set_model(provider, model, model_info, client)
 
     def refresh_tools(self) -> None:
         self._require_idle('tool refresh')
         registry = self._registry
-        registry.unregister_source('agent')
+        registry.unregister_source('collab')
         registry.unregister_source('skill')
         if self.agents is not None:
             self.agents.reinstall_tools()
@@ -470,7 +487,7 @@ class AgentLoop:
     @property
     def usage_records(self) -> list[dict[str, Any]]:
         engine = self._engine
-        return engine._usage_records if engine is not None else []
+        return engine.usage_records() if engine is not None else []
 
     @property
     def session_name(self) -> str:
