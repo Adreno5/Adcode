@@ -53,6 +53,11 @@ def predictor_file() -> Path:
     return app_dir() / 'predictor.json'
 
 
+def wire_cache_file() -> Path:
+    """Wires learned to be the only ones an endpoint can stream."""
+    return app_dir() / 'wires.json'
+
+
 def goals_file() -> Path:
     """The durable goal store."""
     return app_dir() / 'goals.json'

@@ -269,6 +269,26 @@ def test_canvas_drops_wide_glyph_that_cannot_fit():
     assert canvas.cell(2, 0).ch == ' '
 
 
+def test_canvas_alpha_text_with_combining_mark_past_edge_does_not_crash():
+    canvas = Canvas(6, 1, build_palette('dark'))
+    canvas.clear()
+    # The glyphs run past the right edge; the combining mark must not try to
+    # attach to a cell outside the canvas (IndexError: list index out of range).
+    canvas.draw_text(4, 0, 'abcdef\u0301', canvas.palette.text,
+                     canvas.palette.background, alpha=128)
+    assert canvas.cell(4, 0).ch == 'a'
+    assert canvas.cell(5, 0).ch == 'b'
+
+
+def test_canvas_draw_text_past_right_edge_is_clipped():
+    canvas = Canvas(6, 1, build_palette('dark'))
+    canvas.clear()
+    advance = canvas.draw_text(4, 0, 'abcdef', canvas.palette.text,
+                               canvas.palette.background)
+    assert advance == 6
+    assert [canvas.cell(x, 0).ch for x in range(6)] == list('    ab')
+
+
 def test_markdown_html_tags_apply_attributes():
     from adcode.tui.canvas import BOLD, ITALIC, UNDERLINE
     from adcode.tui.markdown import render_markdown

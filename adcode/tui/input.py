@@ -202,6 +202,48 @@ _KITTY_KEYS = {
     32: 'space',
 }
 
+# Kitty's private-use codes for the modifier keys themselves.  With flag 8
+# ("report all keys as escape codes") plus flag 2 (event types) a terminal
+# reports pressing and releasing Alt as its own CSI u sequence, which is the
+# only way a terminal app can tell "Alt is held" from "Alt was tapped".
+_KITTY_MODIFIERS = {
+    57441: 'shift', 57442: 'ctrl', 57443: 'alt',
+    57447: 'shift', 57448: 'ctrl', 57449: 'alt',
+}
+
+# event-type sub-parameter (the part after the colon in ``mods:event``).
+_KITTY_EVENT_PRESS = 1
+_KITTY_EVENT_REPEAT = 2
+_KITTY_EVENT_RELEASE = 3
+
+# With flag 8 the terminal reports the functional keys as private-use code
+# points as well, so their legacy sequences never arrive and the names have to
+# come from this table.
+_KITTY_FUNCTIONAL = {
+    57344: 'esc', 57345: 'enter', 57346: 'tab', 57347: 'backspace',
+    57348: 'insert', 57349: 'delete', 57350: 'left', 57351: 'right',
+    57352: 'up', 57353: 'down', 57354: 'pgup', 57355: 'pgdn',
+    57356: 'home', 57357: 'end',
+}
+_KITTY_FUNCTIONAL.update({57364 + index: f'f{index + 1}'
+                          for index in range(35)})
+
+# Unicode private use areas.  Kitty reports its functional keys inside the BMP
+# one, so a private-use code point that is in no table above is a key this app
+# has no name for -- caps lock, a media key -- and must never become text.
+_PRIVATE_USE_RANGES = ((0xE000, 0xF8FF), (0xF0000, 0xFFFFD),
+                       (0x100000, 0x10FFFD))
+
+
+def _is_private_use(code: int) -> bool:
+    return any(low <= code <= high for low, high in _PRIVATE_USE_RANGES)
+
+# Bits of the 1 + bitmask modifier parameter.
+_KITTY_SHIFT_BIT = 1
+_KITTY_ALT_BIT = 2
+_KITTY_CTRL_BIT = 4
+_KITTY_SUPER_BIT = 8
+
 _LEGACY_WIN_KEYS = {
     'H': '\x1b[A', 'P': '\x1b[B', 'K': '\x1b[D', 'M': '\x1b[C',
     'G': '\x1b[H', 'O': '\x1b[F', 'I': '\x1b[5~', 'Q': '\x1b[6~',
@@ -233,41 +275,133 @@ def _modified_key(name: str, mods: int) -> tuple[str, bool, bool, bool]:
     return prefix + name, ctrl, alt, shift
 
 
-def _kitty_key_event(params: str) -> KeyEvent | None:
-    """Turn a kitty keyboard protocol sequence into a key event.
+def _kitty_text(code: int, shifted: bool, code_field: list[str],
+                fields: list[str]) -> str:
+    """The characters a text key press generates.
 
-    The protocol reports a key as ``CSI <code>[:<shifted>][:<base>] [;<mods>] u``
-    where ``<code>`` is the code point of the key (always the unshifted one)
-    and ``<mods>`` is 1 plus a bitmask of the modifiers that are down.
-
-    This is the only way a terminal can deliver a chord like ``ctrl+,``: the
-    legacy control-byte table has no entry for the comma, so a terminal that
-    only speaks the legacy encoding sends a plain comma instead and the chord
-    is indistinguishable from typing.
+    Flag 16 makes the terminal spell the text out, which is the only exact
+    answer: the keyboard layout, dead keys and input methods all live in the
+    terminal.  Without it the best available guess is the alternate code point
+    reported for a shifted key (flag 4) and, failing that, the shift applied to
+    a letter by hand.
     """
-    if not params:
-        return None
+    if len(fields) > 2 and fields[2]:
+        try:
+            return ''.join(chr(int(part)) for part in fields[2].split(':')
+                           if part)
+        except (ValueError, OverflowError):
+            pass
+    if shifted and len(code_field) > 1 and code_field[1]:
+        try:
+            return chr(int(code_field[1]))
+        except (ValueError, OverflowError):
+            pass
+    char = chr(code)
+    upper = char.upper()
+    if shifted and upper != char and len(upper) == 1:
+        return upper
+    return char
+
+
+def _kitty_key_event(params: str) -> KeyEvent | None:
+    """Turn a kitty keyboard protocol sequence into an event.
+
+    The protocol reports a key as
+
+        CSI <code>[:<shifted>[:<base>]] [;<mods>[:<event>]] [;<text>] u
+
+    where <code> is the code point of the key, <mods> is one plus a bitmask,
+    <event> is 1 press, 2 repeat or 3 release, and <text> is the text the key
+    produced as colon separated code points.
+
+    Two flags decide what a terminal sends:
+
+    * flag 2 adds the event type, so a held key reports repeats and every key
+      also reports its release;
+    * flag 8 reports every key as a CSI u sequence -- text keys, the modifier
+      keys and the functional keys -- instead of the legacy encoding.  The
+      terminal then sends no plain text bytes at all, so the text of a press
+      has to be rebuilt here (or read from <text> when the terminal honours
+      flag 16 as well).
+    """
     fields = params.split(';')
-    code_field = fields[0].split(':')[0]
+    code_field = fields[0].split(':')
     try:
-        code = int(code_field)
+        code = int(code_field[0])
     except ValueError:
         return None
-    base = _KITTY_KEYS.get(code)
-    if base is None:
-        if 33 <= code <= 126:
-            base = chr(code)
-        else:
-            return None
+
     mods = 1
+    event_type = _KITTY_EVENT_PRESS
     if len(fields) > 1:
+        mod_field = fields[1].split(':')
         try:
-            mods = int(fields[1].split(':')[0])
+            mods = int(mod_field[0])
         except ValueError:
             mods = 1
-    name, ctrl, alt, shift = _modified_key(base, mods)
-    return KeyEvent(kind='key', key=name, ctrl=ctrl, alt=alt, shift=shift,
-                    mods=mods)
+        if len(mod_field) > 1:
+            try:
+                event_type = int(mod_field[1])
+            except ValueError:
+                event_type = _KITTY_EVENT_PRESS
+
+    # The modifier keys themselves: the only way to tell a held Alt from a
+    # tapped one.
+    modifier = _KITTY_MODIFIERS.get(code)
+    if modifier is not None:
+        if event_type == _KITTY_EVENT_RELEASE:
+            return KeyEvent(kind='modifier', key=modifier, action='release',
+                            mods=mods)
+        if event_type == _KITTY_EVENT_REPEAT:
+            # A held modifier repeats; the press already started the hold.
+            return None
+        return KeyEvent(kind='modifier', key=modifier, action='press',
+                        mods=mods)
+
+    # A release ends a key that already fired on its press, but a repeat is the
+    # key still being held: Backspace and the arrows auto-repeat this way, so a
+    # repeat has to behave exactly like another press.
+    if event_type == _KITTY_EVENT_RELEASE:
+        return None
+
+    base = _KITTY_FUNCTIONAL.get(code) or _KITTY_KEYS.get(code)
+    if base is not None and base != 'space':
+        name, ctrl, alt, shift = _modified_key(base, mods)
+        return KeyEvent(kind='key', key=name, ctrl=ctrl, alt=alt,
+                        shift=shift, mods=mods)
+
+    value = max(1, mods) - 1
+    shift = bool(value & _KITTY_SHIFT_BIT)
+    alt = bool(value & _KITTY_ALT_BIT)
+    ctrl = bool(value & _KITTY_CTRL_BIT)
+
+    if len(fields) > 2 and fields[2]:
+        # The terminal says this press produced text: an input method commit,
+        # an AltGr character or a plain character.  Insert it.
+        text = _kitty_text(code, shift, code_field, fields)
+        return KeyEvent(kind='text', text=text, mods=mods) if text else None
+
+    if value & _KITTY_SUPER_BIT:
+        # No super bindings exist, and inventing text for a shortcut would
+        # type a character the user never asked for.
+        return None
+
+    if code < 32 or code == 127:
+        # A control code point without chord bits: nothing to insert.
+        return None
+
+    if _is_private_use(code) or 0xD800 <= code <= 0xDFFF:
+        # An unnamed functional key, or half of a surrogate pair: not text.
+        return None
+
+    if ctrl or alt:
+        base_char = 'space' if code == 32 else chr(code)
+        name, ctrl, alt, shift = _modified_key(base_char, mods)
+        return KeyEvent(kind='key', key=name, ctrl=ctrl, alt=alt,
+                        shift=shift, mods=mods)
+
+    return KeyEvent(kind='text', text=_kitty_text(code, shift, code_field,
+                                                  fields), mods=mods)
 
 
 class KeyParser:
@@ -722,6 +856,88 @@ class InputThread(threading.Thread):
             events = self._parser.feed(chunk)
             events.extend(self._parser.flush_due())
             self._deliver(events)
+
+
+# ── sequence building ─────────────────────────────────────
+# The inverse of the parser above: the bytes a terminal sends for a canonical
+# key name.  A real terminal encodes these chords itself, but an input surface
+# that is not a terminal -- an on-screen key bar, a browser -- has to produce
+# them, and going through the same bytes keeps a single parsing path.
+
+_MODIFIER_BITS = {'ctrl': 4, 'alt': 2, 'shift': 1}
+
+# The order _modified_key writes into a key name.
+_MODIFIER_ORDER = ('ctrl', 'alt', 'shift')
+
+_CSI_LETTER_KEYS_INV = {'up': 'A', 'down': 'B', 'right': 'C', 'left': 'D',
+                        'home': 'H', 'end': 'F'}
+
+_TILDE_KEY_CODES = {'insert': 2, 'delete': 3, 'pgup': 5, 'pgdn': 6,
+                    'f1': 11, 'f2': 12, 'f3': 13, 'f4': 14, 'f5': 15,
+                    'f6': 17, 'f7': 18, 'f8': 19, 'f9': 20, 'f10': 21,
+                    'f11': 23, 'f12': 24}
+
+# Keys that have a plain byte of their own and a kitty code point.
+_PLAIN_KEY_BYTES = {'esc': '\x1b', 'enter': '\r', 'tab': '\t',
+                    'backspace': '\x7f', 'space': ' '}
+
+_KITTY_KEY_CODES = {'esc': 27, 'enter': 13, 'tab': 9, 'backspace': 127,
+                    'space': 32}
+
+
+def split_key(name: str) -> tuple[tuple[str, ...], str]:
+    """Split "ctrl+shift+left" into (("ctrl", "shift"), "left")."""
+    if not name:
+        raise KeyError(name)
+    parts = name.split('+')
+    base = parts[-1]
+    modifiers = parts[:-1]
+    if not base or set(modifiers) - set(_MODIFIER_ORDER):
+        raise KeyError(name)
+    return tuple(mod for mod in _MODIFIER_ORDER if mod in modifiers), base
+
+
+def canonical_key(modifiers, base: str) -> str:
+    """Build a key name in the modifier order the parser produces."""
+    order = [mod for mod in _MODIFIER_ORDER if mod in modifiers]
+    return '+'.join([*order, base])
+
+
+def key_sequence(name: str) -> str:
+    """Return the bytes a terminal sends for a canonical key name.
+
+    "a", "ctrl+c", "alt+up", "shift+tab" and "f5" all map to the sequence
+    KeyParser turns back into that same name, so a caller that is not a
+    terminal can drive the app exactly like a keyboard does.  Chords on
+    punctuation and on control characters travel through the kitty keyboard
+    protocol, the only encoding that can carry them.
+
+    Raises KeyError for names no terminal encoding can express.
+    """
+    modifiers, base = split_key(name)
+    bits = sum(_MODIFIER_BITS[mod] for mod in modifiers)
+    if base in _CSI_LETTER_KEYS_INV:
+        letter = _CSI_LETTER_KEYS_INV[base]
+        if bits:
+            return f'\x1b[1;{bits + 1}{letter}'
+        return '\x1b[' + letter
+    if base == 'tab' and bits == _MODIFIER_BITS['shift']:
+        # shift+tab is old enough to have a sequence of its own.
+        return '\x1b[Z'
+    if base in _TILDE_KEY_CODES:
+        code = _TILDE_KEY_CODES[base]
+        if bits:
+            return f'\x1b[{code};{bits + 1}~'
+        return f'\x1b[{code}~'
+    if base in _KITTY_KEY_CODES:
+        if not bits:
+            return _PLAIN_KEY_BYTES[base]
+        return f'\x1b[{_KITTY_KEY_CODES[base]};{bits + 1}u'
+    if len(base) == 1 and ' ' <= base < '\x7f':
+        if not bits:
+            return base
+        return f'\x1b[{ord(base)};{bits + 1}u'
+    raise KeyError(name)
 
 
 # ── clipboard helpers ──────────────────────────────────────

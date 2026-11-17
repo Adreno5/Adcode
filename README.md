@@ -45,6 +45,9 @@ whole screen is written to the terminal in one pass.
   display, appearance, reasoning, context, agents, skills, and MCP settings.
 - **Command palette** -- `ctrl+p` opens every command in a searchable list,
   and `ctrl+q` quits.
+- **Browser access over the LAN** -- `--web` serves the same full-screen UI
+  to phones and tablets on your network, with an on-screen key bar for `Esc`,
+  `Tab`, the arrows and `Ctrl`/`Alt` chords.
 - **Clipboard and proxy support** -- pasting works on every platform and in
   every input field, and HTTP or SOCKS5 proxies are honoured everywhere.
 
@@ -75,6 +78,80 @@ adcode
 # or
 python main.py
 ```
+
+## Web access from other devices
+
+`--web` serves the same TUI to browsers on the local network, so a phone, a
+tablet or a second laptop can drive the session running on your machine:
+
+```bash
+adcode --web                        # http://<lan-ip>:8765/?token=<random>
+adcode --web --port 9000 --token mysecret
+adcode --web --host 127.0.0.1       # keep it on this machine only
+adcode --web --no-token             # no check at all: see Security below
+```
+
+The terminal UI is not re-implemented for the web.  The same
+`AdCodeApp` runs inside the server and only its two terminal edges are
+swapped:
+
+- `adcode/web/screen.py` publishes the composited cell grid -- text, colours
+  and attributes -- instead of writing ANSI to a console, so the browser paints
+  cells instead of parsing escape sequences;
+- `adcode/web/input.py` turns browser keystrokes into the byte sequences a
+  terminal sends, so they go through the app's own `KeyParser`.  A button in
+  the browser and the same chord on a real keyboard take exactly one code path.
+
+Frames are diffed per row before they leave the process: an idle UI sends
+nothing, and streaming text rewrites one row -- the same economy the terminal
+path gets from `Canvas.render_diff`.
+
+### On-screen keys
+
+Not every device has a keyboard with an Esc, Tab, arrows or Control.  The bar
+under the terminal provides them:
+
+- `Esc`, `Tab`, `⇤` (shift+tab), `⏎` (enter), `⌫` (backspace),
+  `↑ ↓ ← →`, `Home`, `End`, `PgUp`, `PgDn`, `Del`, `/`;
+- `^C`, `^P`, `^H`, `^J`, `^A`, `^X`, `^V`, `^Q` as one-tap
+  chords (copy or interrupt, palette, sessions, newline, select all, cut,
+  paste, quit);
+- sticky `Ctrl`, `Alt` and `Shift`: tap one and the next key or typed
+  character carries it -- `Ctrl` then `↑`, or `Alt` then `c` for the `alt+c`
+  a terminal has.  A modifier is one-shot and clears itself after that key;
+- hold `Alt` -- or hold the keyboard's own `Alt` in a desktop browser -- to
+  show every detail, exactly as holding it in a terminal does.
+
+While `--web` runs, the local terminal is not attached to the app: the
+connected browsers are its screen and its keyboard.  `^Q` (or `/quit`) in a
+browser ends the session and stops the server.
+
+Typing uses the device's own keyboard: tap the terminal to raise it, and the
+hidden field forwards text, Enter, Backspace, Tab, the arrows and Ctrl/Alt
+chords.  `Ctrl+V` and the `Paste` button paste this device's clipboard when
+the browser allows it and fall back to the clipboard of the machine running
+AdCode otherwise; long-pressing the terminal's hidden field always works.  Dragging up or down scrolls the transcript (a mouse wheel does the
+same).  Text can be selected and copied natively, and page zoom works.
+
+The page has no third-party dependency -- no CDN, no bundler, three files in
+`adcode/web/static/` -- so a device that can only reach your machine still
+gets a working terminal.
+
+### Several devices, one session
+
+Every browser drives the same conversation and a newcomer is sent a full
+repaint of the current screen.  The grid is the *smallest* window any connected
+browser reports, and each window scales that grid to fill its own screen, so
+nothing is ever off-screen on the phone.  Close the small window and the grid
+grows back for the remaining ones.
+
+### Security
+
+The session runs with your tools and your shell, so anyone who can reach the
+port can drive it.  `--web` therefore generates a random token per run,
+prints it with the URL, and requires it for the WebSocket.  Treat the printed
+URL as a password and do not forward the port beyond your own network.
+`--no-token` disables the check.
 
 ## First Run
 
@@ -111,6 +188,8 @@ so there is nothing to save by hand.
 | `ctrl+c` | Copy the selected transcript text, else the input selection, else clear the input, else interrupt; press twice on an empty prompt to exit |
 | `ctrl+v`, `shift+insert` | Paste text, or attach a copied screenshot when the clipboard has no text |
 | `alt+v` | Attach the clipboard image, image path, or image URL to the message |
+| `alt+c` | Copy the latest assistant reply to the clipboard as Markdown |
+| hold `alt` | Show every detail while it is held: full reasoning, every tool call and result, complete error bodies.  Releasing `alt` restores the configured display |
 | `ctrl+a` | Select all |
 | `shift+left` / `shift+right` | Extend the selection by one character |
 | `shift+home` / `shift+end` | Extend the selection to the line edge |
@@ -134,18 +213,27 @@ unbound). Bindings are stored in `~/.adcode/config.json` under `keys` and take
 effect immediately. `enter`, `esc`, and the dialog navigation keys stay fixed;
 `/help` always shows the live bindings.
 
-### Chords on punctuation
+### Chords on punctuation, and held modifiers
 
 `ctrl+,` and the other chords on punctuation (`ctrl+.`, `ctrl+/`, ...) have no
 control byte in the legacy terminal encoding, so a terminal cannot report
 them the old way. AdCode asks for the
 [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
-(`CSI > 1 u`, the "disambiguate escape codes" flag) when it starts, and
-terminals that speak it (kitty, Ghostty, WezTerm, alacritty, foot, iTerm2,
-Microsoft Terminal, rio, Warp, xterm.js) deliver the chord. Terminals that do
-not support the protocol ignore the request and keep sending plain
-characters, so on those the chord does not fire -- rebind it with `/keys` if
-you need it there.
+when it starts, with four flags: disambiguate escape codes (`1`), report event
+types (`2`), report every key as an escape code (`8`), and report the text a
+key produced (`16`) -- `CSI > 27 u`.
+
+Terminals that speak it (kitty, Ghostty, WezTerm, alacritty, foot, iTerm2,
+Microsoft Terminal, rio, Warp, xterm.js) deliver the punctuation chords *and*
+the modifier keys themselves, which is how a held `alt` is told apart from a
+tapped one.  Flag 8 takes the plain text bytes away, so the app rebuilds the
+characters from the key codes and uses the text the terminal reports when it
+honours flag 16 -- that is what keeps input methods, dead keys and AltGr
+working.
+
+Terminals without the protocol ignore the request and keep sending plain
+characters: everything else still works, but the punctuation chords do not
+fire (rebind them with `/keys`) and holding `alt` does nothing.
 
 ## Selecting text
 
@@ -192,7 +280,10 @@ Enter completes it, and Enter runs the command.
 | `/skills [list\|reload]` | Browse and reload installed skills |
 | `/image <path\|url>` | Attach an image file or URL to the next message |
 | `/diff [path]` | Show the Git working-tree diff in the transcript |
-| `/sessions` | Browse and load saved sessions |
+| `/sessions` | Browse and load saved sessions; `delete` archives the highlighted one, `alt` reveals the archived ones |
+| `/archive` | Archive this session: read-only and hidden until `/respawn` |
+| `/respawn` | Restore this archived session and accept messages again |
+| `/perish` | Delete this session for good (asks first) |
 | `/save [name]` / `/load [name]` | Save / load a session |
 | `/rewind` | Roll the conversation back to an earlier turn |
 | `/edit` | Rewind to a turn and prefill its message for editing |
@@ -497,6 +588,38 @@ session files are migrated on load.
 - `/fork` copies the conversation into a new session and continues there.
 - `/save` / `/load` / `/sessions` manage named sessions.
 
+### Archived sessions
+
+Archiving sets a session aside without touching it: the row, its messages and
+its transcript stay exactly where the engine wrote them, so it can be read
+and restored later.  The archive lives in its own table in the session
+database (`adcode_archived_sessions`), which is why a session the engine
+saves again stays archived, and why an archived session is never the one a
+new run resumes.
+
+- `delete` in the sessions browser (`ctrl+h`) archives the highlighted
+  session; `/archive` archives the one you are in.
+- An archived session is read-only: a message is refused (and stays in the
+  prompt).  The status line says `archived` while that is the case.
+- Only the commands that work on that session are refused: the ones that
+  send a turn or rewrite the stored conversation (`/btw`, `/compact`,
+  `/edit`, `/fork`, `/goal`, `/image`, `/rewind`, `/save`), and the ones
+  that retune the engine behind it (`/effort`, `/hold`, `/max_tokens`,
+  `/model`, `/provider`, `/steps`, `/thinking`).  Every other command keeps
+  working -- `/help`, `/config`, `/keys`, `/sessions`, `/load`, `/diff`,
+  `/quit`, and `/new`, which starts a live session and leaves the archived
+  one exactly as it was.
+- `/respawn` restores it: the session is back in the list and takes messages
+  again.
+- `/perish` deletes it for good after a confirmation, and the next message
+  starts a new session.
+- The browser hides archived sessions; pressing `alt` shows them (dimmed,
+  marked `archived` in the row) and pressing it again hides them.  This
+  needs the terminal to report the modifier keys themselves, which the kitty
+  keyboard protocol does -- see [Chords on punctuation, and held
+  modifiers](#chords-on-punctuation-and-held-modifiers).  In the web UI the
+  `Alt` button on the key bar sends the same event.
+
 Goals live in `sessions/goals.json` and are injected into the system prompt
 while active. Global instructions are read from `~/.adcode/AGENTS.md` and
 project instructions from `AGENTS.md` (or `prompt`) in the working directory.
@@ -644,6 +767,30 @@ there leaves the model without a result it can attach to its own call: it
 stops learning from the tools and repeats them until the turn is interrupted.
 `adcode/llm/client.py` therefore translates the history per wire.
 
+### Endpoints with a half-implemented Responses wire
+
+Plenty of OpenAI-compatible gateways answer `/v1/responses` by translating a
+chat completion into events, and drop the ones they consider optional -- most
+often `response.content_part.added`.  The openai SDK's stream state machine
+needs that event: it indexes the accumulating message content on the first
+`response.output_text.delta`, so the first token fails with
+`IndexError: list index out of range` raised inside the SDK.  A gateway that
+implements the wire properly -- MiniMax, OpenAI itself -- never hits this.
+
+AdCode recognises that shape error, switches the endpoint to chat completions
+for the rest of the session and says so in the transcript.  The lesson is
+written to `~/.adcode/wires.json`, keyed by the endpoint and by the wire that
+failed, so the next start goes straight to the wire that works.  The
+provider's own `wire` setting is left alone, and moving that provider to a
+different wire ignores the old lesson; delete the file (or its entry) to make
+AdCode try the configured wire again.
+
+A request that fails before it streamed anything is replayed on chat
+completions inside the same turn.  One that had already streamed the
+reasoning ends that turn with the error -- replaying it would duplicate the
+thinking that reached the conversation -- and the next turn is clean; with
+`/hold on` the engine retries the round by itself and the turn completes.
+
 ## Project Structure
 
 ```
@@ -674,6 +821,13 @@ adcode/
 │   └── manager.py    # server lifecycle, tool registration, diagnostics
 ├── agents/
 │   └── manager.py    # sub-agent tree, teams, mailboxes, ReAct workers
+├── web/
+│   ├── server.py     # the page, its assets, and the WebSocket upgrade
+│   ├── session.py    # the app, the connected browsers, the frame diff
+│   ├── screen.py     # cell-grid frames instead of a terminal
+│   ├── input.py      # browser keys -> the sequences the app parses
+│   ├── websocket.py  # minimal RFC 6455 server side
+│   └── static/       # index.html, app.js, style.css
 └── tui/
     ├── app.py        # layout, input, scrolling, overlays
     ├── canvas.py     # software renderer and alpha compositing
@@ -698,7 +852,9 @@ python -m pytest
 The test suite covers canvas compositing, wrapping and Markdown, config
 migration, models.dev matching, compaction, sessions and rewind, skills, the
 tools, the agent loop, sub-agents, all three MCP transports, commands, input
-parsing, transcript display policies, settings behavior, and prompt layout.
+parsing, transcript display policies, settings behavior, prompt layout, and
+the browser bridge (key sequences, frame runs, the served page over a real
+WebSocket).
 
 It also contains real controlled-run simulations: the actual application is
 started against a temporary config, a local fake LLM gateway, and scripted

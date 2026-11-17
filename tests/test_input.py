@@ -113,6 +113,70 @@ def test_kitty_protocol_reports_shifted_and_alternate_keys():
 def test_kitty_protocol_ignores_an_unknown_code():
     assert parse('\x1b[999999u') == []
 
+
+def test_kitty_modifier_press_and_release():
+    # flag 8 + flag 2: LEFT_ALT (57443) reports its own press (event 1) and
+    # release (event 3).  The release carries no modifier bit.
+    press = parse('\x1b[57443;3:1u')
+    assert len(press) == 1
+    assert press[0].kind == 'modifier' and press[0].key == 'alt'
+    assert press[0].action == 'press'
+    release = parse('\x1b[57443;1:3u')
+    assert len(release) == 1
+    assert release[0].kind == 'modifier' and release[0].key == 'alt'
+    assert release[0].action == 'release'
+
+
+def test_kitty_release_is_ignored_but_repeat_fires():
+    # A release closes a key that already fired on its press, but a repeat is
+    # the key still being held: dropping it would kill auto-repeat.
+    assert parse('\x1b[99;5:3u') == []                 # ctrl+c released
+    assert parse('\x1b[99;5:2u')[0].key == 'ctrl+c'    # ctrl+c held
+    assert parse('\x1b[99;5:1u')[0].key == 'ctrl+c'    # press delivered
+
+
+def test_kitty_flag_8_text_keys_still_type():
+    # Flag 8 reports every key as a CSI u sequence, so the plain text bytes are
+    # gone and the parser has to rebuild the character itself.
+    assert parse('\x1b[97;1:1u')[0].kind == 'text'
+    assert parse('\x1b[97;1:1u')[0].text == 'a'
+    assert parse('\x1b[32;1:1u')[0].text == ' '
+    assert parse('\x1b[27785;1:1u')[0].text == '沉'    # an input method commit
+    assert parse('\x1b[97;1:2u')[0].text == 'a'        # a held key
+
+
+def test_kitty_flag_8_shifted_text():
+    # The alternate (shifted) code point when the terminal reports it, else a
+    # letter shifted by hand.
+    assert parse('\x1b[97:65;2:1u')[0].text == 'A'
+    assert parse('\x1b[97;2:1u')[0].text == 'A'
+
+
+def test_kitty_flag_16_reports_the_text_itself():
+    # With flag 16 the terminal spells the text out: the only exact answer for
+    # layouts, dead keys and AltGr.
+    assert parse('\x1b[97;1;97u')[0].text == 'a'
+    assert parse('\x1b[49;2;33u')[0].text == '!'
+    assert parse('\x1b[101;7:1;8364u')[0].text == '€'  # AltGr+E
+
+
+def test_kitty_flag_8_functional_keys_keep_their_names():
+    # The functional keys arrive as private-use code points, not legacy codes.
+    assert parse('\x1b[57352;1:1u')[0].key == 'up'
+    assert parse('\x1b[57356;1:1u')[0].key == 'home'
+    assert parse('\x1b[57364;1:1u')[0].key == 'f1'
+    assert parse('\x1b[57344;1:1u')[0].key == 'esc'
+
+
+def test_kitty_unnamed_codes_never_become_text():
+    # Caps lock, a media key or a super chord must not type anything.
+    assert parse('\x1b[57358;1:1u') == []
+    assert parse('\x1b[97;9:1u') == []
+
+
+def test_kitty_right_alt_is_also_alt():
+    assert parse('\x1b[57449;3:1u')[0].key == 'alt'
+
 # ── split / truncated control sequences ────────────────────
 # A terminal may deliver one report in several writes.  The tail must never be
 # typed into the prompt, and a truncated report must not fire a stray Esc

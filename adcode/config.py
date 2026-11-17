@@ -513,6 +513,7 @@ class KeysSettings:
     redraw: str = 'ctrl+l'
     paste: str = 'ctrl+v'
     attach_image: str = 'alt+v'
+    copy_last: str = 'alt+c'
     cut: str = 'ctrl+x'
     select_all: str = 'ctrl+a'
     undo: str = 'ctrl+z'
