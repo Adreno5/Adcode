@@ -40,6 +40,7 @@ from adcode.llm.client import LLMClient
 from adcode import paths
 from adcode.system_prompt import build_system_prompt
 from adcode.tools.builtin import install_coding_tools, shutdown_shell_sessions
+from adcode.tools.todo import install_todo_tool
 
 # The snapshot the TUI renders is the engine's own dataclass; the fields are
 # identical (status, turn, token counters, context window, session identity,
@@ -125,6 +126,7 @@ class AgentLoop:
         # The app hands us an empty registry; the built-in suite is installed
         # here, and the collab / skill sources follow the engine's lifecycle.
         install_coding_tools(registry)
+        install_todo_tool(registry)
         registry.unregister_source('collab')
         registry.unregister_source('skill')
         # The engine talks to one IChatClient; with failover it is a chain

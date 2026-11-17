@@ -32,6 +32,11 @@ whole screen is written to the terminal in one pass.
 - **Sub-agents and agent teams** -- configurable agent types, background ReAct
   workers, a shared workspace, mailboxes, recursive delegation limits, and
   team spawning.
+- **Visible todo plan** -- the model plans multi-step work with the `todo`
+  tool (`create` / `add` / `update` / `complete` / `fail`) and the plan is
+  painted right above the input bar as a live checklist, with progress and the
+  step being worked on; it lives in `.harness_todo.json`, so it survives a
+  restart and every sub-agent shares it.
 - **MCP support** -- stdio, Streamable HTTP, and legacy SSE transports, with
   automatic tool scanning (including pagination cursors).
 - **Skills** -- scans `~/.agents/skills` (plus project and extra paths), gives

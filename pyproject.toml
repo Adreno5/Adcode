@@ -5,7 +5,7 @@ description = "A configurable full-screen terminal coding agent"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "aicf-core>=0.6.0",
+    "aicf-core>=0.6.1",
     "anthropic>=0.116.0",
     "cryptography>=44.0.0",
     "httpx2[socks]>=2.16.0",

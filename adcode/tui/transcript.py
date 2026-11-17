@@ -8,6 +8,7 @@ fade, or the complete block.
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -81,6 +82,35 @@ def tool_arg_brief(name: str, args: dict[str, Any]) -> str:
         key = next(iter(args))
         return str(args[key]).replace('\n', ' ')
     return ''
+
+
+def tool_result_brief(name: str, output: str) -> str:
+    """The one-line version of a result, for tools whose JSON is not worth it.
+
+    ``todo`` answers with the whole plan so the model can act on it; the panel
+    above the prompt already shows that plan, so echoing the JSON into the
+    transcript only pushes the conversation away.  Any other tool returns ''
+    and keeps its normal rendering.
+    """
+    if name != 'todo' or not output.lstrip().startswith('{'):
+        return ''
+    try:
+        view = json.loads(output)
+    except ValueError:
+        return ''
+    if not isinstance(view, dict):
+        return ''
+    items = view.get('items')
+    if not isinstance(items, list):
+        return ''
+    parts = [f'{view.get("done", 0)}/{len(items)}']
+    status = str(view.get('status') or '')
+    if status:
+        parts.append(status)
+    current = str(view.get('current') or '')
+    if current and status != 'completed':
+        parts.append(f'now {current}')
+    return '  ·  '.join(parts)
 
 
 def _thinking_suffix(config: ThinkingDisplay, now: float) -> str:
@@ -454,6 +484,13 @@ class TranscriptRenderer:
                            config: AppConfig) -> list[Line]:
         if not item.output:
             return []
+        brief = tool_result_brief(item.name, item.output)
+        if brief:
+            line: Line = [Span('│ ', 'border', attrs=DIM),
+                          Span(brief, 'muted')]
+            if item.status == 'error':
+                line = _apply_base_role(line, 'error')
+            return [truncate_line(line, max(8, width - 2), '…')]
         renderer = MarkdownRenderer(max(8, width - 2))
         renderer.feed(item.output)
         renderer.finish()

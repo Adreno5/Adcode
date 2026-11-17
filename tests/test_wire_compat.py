@@ -2,9 +2,15 @@
 
 Compatible gateways frequently translate a chat completion into Responses
 events and forget response.content_part.added.  The openai SDK's typed stream
-indexes the accumulated content on the first text delta, so the missing part
-surfaces as an IndexError from inside the SDK -- which used to end the turn for
-good.  These tests drive the real client against a gateway shaped that way.
+used to index the accumulated content on the first text delta, so the missing
+part surfaced as an IndexError from inside the SDK; AdCode answered that by
+learning a chat-completions override for the endpoint.
+
+aicf-core 0.6.1 reads the raw Responses stream instead, so that shape no longer
+raises and the override is not needed for it.  These tests drive the real
+client against such a gateway and pin the new behaviour: the stream simply
+works, and the learned-wire cache still sends a later client straight to the
+wire that was chosen.
 """
 
 from __future__ import annotations
@@ -189,7 +195,7 @@ def _text_of(events) -> str:
     return ''.join(event for event in events if isinstance(event, str))
 
 
-def test_missing_content_part_replays_the_request_as_chat(gateway_factory):
+def test_a_missing_content_part_no_longer_breaks_the_wire(gateway_factory):
     gateway = gateway_factory(_responses_events(content_part=False,
                                                 reasoning=False))
     warnings: list[str] = []
@@ -198,44 +204,42 @@ def test_missing_content_part_replays_the_request_as_chat(gateway_factory):
         events = _collect(client)
     finally:
         client.close()
-    assert _text_of(events) == 'chat answer'
-    assert gateway.paths[0].endswith('/responses')
-    assert gateway.paths[-1].endswith('/chat/completions')
-    assert client.wire == 'openai chat completions'
-    # The user's provider definition is left alone: the learning is AdCode's.
+    assert _text_of(events) == 'hello'
+    assert [path for path in gateway.paths] == ['/v1/responses'], gateway.paths
+    assert client.wire == 'openai responses'
     assert provider.wire == 'openai responses'
-    assert any('chat completions' in text for text in warnings)
+    assert warnings == []
+    assert client_module.learned_wire(client._file_scope(),
+                                     'openai responses') == ''
 
 
-def test_a_broken_stream_after_output_switches_the_next_turn(gateway_factory):
+def test_reasoning_before_the_answer_survives_a_skipped_part(gateway_factory):
+    """The hardest case used to fail mid-stream, after the reasoning shipped."""
     gateway = gateway_factory(_responses_events(content_part=False,
                                                 reasoning=True))
     warnings: list[str] = []
     client, _provider = _client(gateway, 'openai responses', warnings)
     try:
-        with pytest.raises(IndexError):
-            _collect(client)
-        # The reasoning had already been streamed, so replaying this request
-        # would duplicate it in the conversation -- but the endpoint is fixed.
-        assert client.wire == 'openai chat completions'
         events = _collect(client)
     finally:
         client.close()
-    assert _text_of(events) == 'chat answer'
-    assert gateway.paths[-1].endswith('/chat/completions')
+    assert {'reasoning': 'thinking'} in events, events
+    assert _text_of(events) == 'hello'
+    assert client.wire == 'openai responses'
+    assert warnings == []
+    assert all(path.endswith('/responses') for path in gateway.paths)
 
 
 def test_the_learned_wire_is_used_by_the_next_client(gateway_factory):
-    gateway = gateway_factory(_responses_events(content_part=False,
-                                                reasoning=True))
+    """The override an endpoint earned is remembered across clients."""
+    gateway = gateway_factory(_responses_events(content_part=True,
+                                                reasoning=False))
     client, _provider = _client(gateway, 'openai responses', [])
     try:
-        with pytest.raises(IndexError):
-            _collect(client)
+        client_module.remember_wire(client._file_scope(), 'openai responses',
+                                    'openai chat completions')
     finally:
         client.close()
-    # A new process (a new client from the same definition) must not fail a
-    # turn to learn the same thing again.
     gateway.paths.clear()
     again, _ = _client(gateway, 'openai responses', [])
     try:
@@ -244,6 +248,7 @@ def test_the_learned_wire_is_used_by_the_next_client(gateway_factory):
         again.close()
     assert _text_of(events) == 'chat answer'
     assert gateway.paths == ['/v1/chat/completions']
+    assert again.wire == 'openai chat completions'
 
 
 def test_a_complete_responses_stream_keeps_its_wire(gateway_factory):
@@ -275,10 +280,8 @@ def test_only_sequence_errors_from_the_sdk_are_recognised():
         assert is_responses_sequence_error(error) is False
 
 
-# -- the same failure through the real application ------------------------
-def test_app_turn_learns_the_wire_and_the_next_turn_works(
-        harness_factory, monkeypatch):
-    """The whole app: failed turn, its notice, and a clean retry."""
+# -- the same gateway shape through the real application ------------------
+def _skip_content_part(monkeypatch):
     from bench.gateway import FakeLLMGateway
 
     original = FakeLLMGateway._write_event
@@ -292,6 +295,12 @@ def test_app_turn_learns_the_wire_and_the_next_turn_works(
 
     monkeypatch.setattr(FakeLLMGateway, '_write_event', write_event)
 
+
+def test_an_app_turn_on_a_partial_gateway_streams_the_answer(
+        harness_factory, monkeypatch):
+    """The whole app: no failed turn, no wire switch, the answer arrives."""
+    _skip_content_part(monkeypatch)
+
     harness = harness_factory(wire='openai responses')
     harness.type_text('hi there')
     harness.wait_prompt('hi there')
@@ -301,17 +310,11 @@ def test_app_turn_learns_the_wire_and_the_next_turn_works(
     harness.wait_idle(30.0)
 
     items = harness.transcript_texts()
-    assert any(kind == 'notice' and 'chat completions' in text
-               for kind, text in items), items
-    assert any(kind == 'notice' and 'Request failed' in text
-               for kind, text in items), items
-
-    # The next turn streams on the wire that works.
-    harness.type_text('again')
-    harness.wait_prompt('again')
-    harness.press('enter')
-    harness.wait_until(lambda: len(harness.requests) >= 2, timeout=20.0,
-                       description='the second model request')
-    harness.wait_idle(30.0)
-    assert any(kind == 'assistant' and 'again' in text
-               for kind, text in harness.transcript_texts())
+    assert any(kind == 'assistant' for kind, _text in items), items
+    assert not any(kind == 'notice' and 'chat completions' in text
+                   for kind, text in items), items
+    assert not any(kind == 'notice' and 'Request failed' in text
+                   for kind, text in items), items
+    assert all(request.path.endswith('/responses')
+               for request in harness.requests), \
+        [request.path for request in harness.requests]

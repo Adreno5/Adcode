@@ -54,6 +54,7 @@ from adcode.tui.text import (
     Line, Span, add_span, line_text_between, line_width, plain_text,
     split_line_columns,
 )
+from adcode.tui import todo_panel
 from adcode.tui.transcript import LiveRender, TranscriptRenderer
 
 SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
@@ -289,6 +290,10 @@ class AdCodeApp:
         self.registry = ToolRegistry()
         self.mcp = get_mcp_manager(self.registry)
         self.loop: AgentLoop | None = None
+        # The todo panel reads the same store the tool writes; the revision
+        # tells the frame whether anything changed since the last paint.
+        self._todo_store = None
+        self._todo_revision: int | None = None
         self.standalone_items: list[TranscriptItem] = []
         self.transcript = TranscriptRenderer()
         self.prompt = PromptState()
@@ -745,6 +750,7 @@ class AdCodeApp:
                 if self.loop is not None:
                     self.loop.pump_agent_events()
                     self._apply_loop_events()
+                self._sync_todo()
                 self._dispatch_input(event)
                 self._check_resize()
                 self._tick_animation()
@@ -1682,6 +1688,40 @@ class AdCodeApp:
         header = 2 if self.config.ui.show_header else 0
         return max(1, rows - header - 1 - 1 - 3)
 
+    # ── todo panel ──────────────────────────────────────────
+    def _todo(self):
+        """The todo store for this project; False once it cannot be opened."""
+        if self._todo_store is None:
+            try:
+                from adcode.tools.todo import todo_store
+                self._todo_store = todo_store(self.cwd)
+            except Exception:      # noqa: BLE001 - a broken list must not kill the UI
+                self._todo_store = False
+        return self._todo_store or None
+
+    def _sync_todo(self) -> None:
+        """One cheap check per frame: did the todo list change?"""
+        store = self._todo()
+        if store is None:
+            return
+        if store.revision != self._todo_revision:
+            self._todo_revision = store.revision
+            self.dirty = True
+
+    def _todo_lines(self, columns: int) -> list:
+        """The panel rows, or none while the completion list owns that space."""
+        if self._completion_visible():
+            return []
+        store = self._todo()
+        if store is None:
+            return []
+        try:
+            plan = store.active_plan()
+        except Exception:      # noqa: BLE001 - a bad file shows as no list
+            return []
+        return todo_panel.panel_lines(plan, columns,
+                                      max_rows=todo_panel.MAX_ROWS)
+
     def _render_interval(self) -> float:
         """Seconds between two frames, derived from the configured rate."""
         fps = int(getattr(self.config.ui, 'fps', 0) or _DEFAULT_FPS)
@@ -1721,7 +1761,14 @@ class AdCodeApp:
         prompt_h = max(1, len(visible_prompt))
         footer_y = rows - 1
         prompt_top = footer_y - prompt_h
-        separator_y = prompt_top - 1
+        todo_lines = self._todo_lines(columns)
+        # The list sits above the prompt, and never takes more than a third of
+        # the space above it: the conversation keeps the rest.
+        room = max(0, prompt_top - header_h - 2)
+        limit = min(todo_panel.MAX_ROWS, room // 3)
+        todo_lines = todo_lines[:limit] if limit else []
+        todo_top = prompt_top - len(todo_lines)
+        separator_y = todo_top - 1
         transcript_top = header_h
         viewport_h = max(1, separator_y - transcript_top)
         lines = self._transcript_lines()
@@ -1757,6 +1804,8 @@ class AdCodeApp:
             self._draw_scrollbar(columns, transcript_top, viewport_h, total,
                                  start)
         self.canvas.hline(0, separator_y, columns, self.palette.border, alpha=110)
+        for index, line in enumerate(todo_lines):
+            self._draw_line(0, todo_top + index, line, columns)
         for index, line in enumerate(visible_prompt):
             self._draw_line(0, prompt_top + index, line, columns)
         if self._completion_visible():
