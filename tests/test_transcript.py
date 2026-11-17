@@ -237,3 +237,30 @@ def test_agent_items_spacing(config):
     ]
     lines = render(config, items)
     assert any(plain_text(line) == '' for line in lines)
+
+def test_after_completion_keeps_labels_or_hides_the_reasoning(config):
+    item = TranscriptItem(kind='thinking', turn=1, text='deep thought',
+                          duration=1.5)
+    config.thinking.mode = 'full'
+    config.thinking.after_completion = 'keep'
+    assert any('deep thought' in line for line in texts(render(config, [item])))
+    config.thinking.after_completion = 'label'
+    lines = [line for line in texts(render(config, [item])) if line.strip()]
+    assert len(lines) == 1, lines
+    assert lines[0].startswith('Thinking') and '1.5s' in lines[0], lines
+    assert 'deep thought' not in lines[0], lines
+    config.thinking.after_completion = 'hide'
+    assert texts(render(config, [item])) == []
+
+def test_after_completion_label_can_carry_the_token_count(config):
+    item = TranscriptItem(kind='thinking', turn=1, text='word ' * 40,
+                          duration=0.4)
+    config.thinking.mode = 'full'
+    config.thinking.after_completion = 'label'
+    lines = [line for line in texts(render(config, [item])) if line.strip()]
+    assert lines[0].startswith('Thinking'), lines
+    assert 'tokens' not in lines[0], lines
+    config.thinking.label_tokens = True
+    lines = [line for line in texts(render(config, [item])) if line.strip()]
+    assert 'tokens' in lines[0], lines
+    assert 'word' not in lines[0], lines

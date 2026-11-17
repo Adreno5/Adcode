@@ -9,7 +9,10 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from adcode.config import REASONING_EFFORTS
+from adcode.config import (
+    REASONING_EFFORTS, STEPS_CUSTOM, STEP_PRESETS, THINKING_MODES,
+    apply_step_preset,
+)
 from adcode.diff import git_worktree_diff
 from adcode.theme import ACCENT_PRESETS, THEMES
 from adcode.tui.dialogs import DialogItem
@@ -287,34 +290,31 @@ def cmd_effort(app: Any, args: str) -> None:
 
 
 @command('/thinking', 'Set the thinking display mode', usage='/thinking <mode>',
-         subcommands=[(mode, f'Thinking display: {mode}')
-                      for mode in ('hidden', 'label', 'partial', 'full',
-                                   'summary')])
+         subcommands=[(mode, f'Thinking display: {mode}') for mode in THINKING_MODES])
 def cmd_thinking(app: Any, args: str) -> None:
     value = args.strip().lower()
-    modes = ('hidden', 'label', 'partial', 'full', 'summary')
+    modes = THINKING_MODES
     if value not in modes:
         items = [DialogItem(mode, mode, '') for mode in modes]
 
         def choose(mode: Any) -> None:
             app.config.thinking.mode = str(mode)
+            # The mode no longer matches a preset: the settings are the
+            # user's own mix now, which is what unlocks them in /config.
+            app.config.steps.preset = STEPS_CUSTOM
             app.config_changed()
             app.notify(f'Thinking display: {mode}', 'success')
         app.open_select('Thinking display', items, choose)
         return
     app.config.thinking.mode = value
+    app.config.steps.preset = STEPS_CUSTOM
     app.config_changed()
     app.notify(f'Thinking display: {value}', 'success')
 
 
-#: The work-step presets.  Each one writes the thinking and tool settings
-#: that belong to it; the settings themselves stay the source of truth.
-STEP_PRESETS: dict[str, dict[str, Any]] = {
-    'concise': {'thinking.mode': 'summary', 'tools.chain': 'merged'},
-    'standard': {'thinking.mode': 'partial', 'tools.chain': 'separate'},
-    'detailed': {'thinking.mode': 'full', 'tools.chain': 'separate',
-                 'tools.result_mode': 'full'},
-}
+# The named levels come from ``adcode.config``, the same ones the settings
+# browser offers in **Work steps**.  ``custom`` is not a level here: the
+# command only ever jumps to a preset, never to the user's own mix.
 
 
 @command('/steps', 'Set how much of the work chain is shown',
@@ -341,12 +341,8 @@ def cmd_steps(app: Any, args: str) -> None:
 
 def _apply_step_preset(app: Any, level: str) -> None:
     """Write the thinking and tool settings of one work-step level."""
-    for path, value in STEP_PRESETS.get(level, {}).items():
-        target = app.config
-        parts = path.split('.')
-        for part in parts[:-1]:
-            target = getattr(target, part)
-        setattr(target, parts[-1], value)
+    if not apply_step_preset(app.config, level):
+        return
     app.config_changed()
     app.notify(f'Work steps: {level}', 'success')
 

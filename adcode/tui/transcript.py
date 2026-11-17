@@ -336,25 +336,29 @@ class TranscriptRenderer:
         renderer.finish()
         return wrap_lines(renderer.lines(), width)
 
+    def _thinking_label(self, item: TranscriptItem,
+                        config: AppConfig) -> list[Line]:
+        """The one-line form: label, how long it took, how much it said."""
+        label = config.thinking.label or 'Thinking'
+        line: Line = [Span(label, 'subtext', attrs=BOLD)]
+        if item.duration:
+            line.append(Span(f' · {item.duration:.1f}s', 'muted'))
+        if config.thinking.label_tokens:
+            tokens = estimate_text_tokens(item.text or '')
+            line.append(Span(f' · {tokens} token{"s" if tokens != 1 else ""}',
+                             'muted'))
+        return [line]
+
     def _render_thinking(self, item: TranscriptItem, width: int,
                          config: AppConfig) -> list[Line]:
         mode = config.thinking.mode
-        if mode == 'hidden':
+        after = config.thinking.after_completion
+        if mode == 'hidden' or after == 'hide':
             return []
-        if not config.thinking.show_completed:
-            return []
-        if mode == 'summary':
-            # The reasoning is kept, but not spelled out: the row says how
-            # much there was.
-            tokens = estimate_text_tokens(item.text or '')
-            return [[Span('thought of ', 'subtext'),
-                     Span(f'{tokens} token{"s" if tokens != 1 else ""}',
-                          'muted')]]
-        if mode == 'label':
-            label = config.thinking.label or 'Thinking'
-            suffix = '' if not item.duration else f' · {item.duration:.1f}s'
-            return [[Span(label, 'subtext', attrs=BOLD),
-                     Span(suffix, 'muted')]]
+        if after == 'label' or mode == 'label':
+            # The reasoning is over: say that it happened, not what it said
+            # (and how much there was, when the label carries the count).
+            return self._thinking_label(item, config)
         renderer = MarkdownRenderer(width)
         renderer.feed(item.text)
         renderer.finish()
@@ -553,9 +557,9 @@ class TranscriptRenderer:
         phase = live.phase
         if phase == 'thinking':
             mode = config.thinking.mode
-            if mode in ('label', 'summary'):
-                # The summary mode keeps the running thought out of the way as
-                # well: the label is enough while it is in flight.
+            if mode == 'label':
+                # The label is enough while the thought is in flight: the
+                # token count only lands once the round is over.
                 label = config.thinking.label or 'Thinking'
                 output.append([
                     Span(label, 'subtext', attrs=BOLD),

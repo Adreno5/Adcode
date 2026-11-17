@@ -31,7 +31,7 @@ API_WIRES = (
     'anthropic messages',
 )
 REASONING_EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max', 'ultra')
-THINKING_MODES = ('hidden', 'label', 'partial', 'full', 'summary')
+THINKING_MODES = ('hidden', 'label', 'partial', 'full')
 THINKING_ANIMATIONS = ('fixed', 'rotating')
 THINKING_STYLES = ('normal', 'gradient')
 ELLIPSIS_STYLES = ('none', 'label', 'count')
@@ -39,7 +39,25 @@ TOOL_MODES = ('hidden', 'call', 'result', 'both')
 RESULT_MODES = ('partial', 'full')
 #: How a chain of consecutive tool calls is shown.
 TOOL_CHAINS = ('separate', 'merged')
+#: What is left of a thinking block once it has finished.
+THINKING_AFTER_COMPLETION = ('keep', 'label', 'hide')
 THEMES = ('dark', 'light')
+
+#: The work-step preset the user edited the thinking and tool settings under.
+STEPS_CUSTOM = 'custom'
+#: The work-step presets.  Each one writes the thinking and tool settings that
+#: belong to it; the settings themselves stay the source of truth, so a preset
+#: is only a named starting point and ``custom`` is "the user's own mix".
+STEP_PRESETS: dict[str, dict[str, Any]] = {
+    'concise': {'thinking.mode': 'label', 'thinking.label_tokens': True,
+                'tools.chain': 'merged'},
+    'standard': {'thinking.mode': 'partial', 'thinking.label_tokens': False,
+                 'tools.chain': 'separate'},
+    'detailed': {'thinking.mode': 'full', 'thinking.label_tokens': False,
+                 'tools.chain': 'separate', 'tools.result_mode': 'full'},
+}
+#: Every value ``steps.preset`` may hold (the presets plus ``custom``).
+STEPS_PRESETS = (*STEP_PRESETS, STEPS_CUSTOM)
 
 
 def _now() -> str:
@@ -217,7 +235,11 @@ class ThinkingDisplay:
     gradient_top_alpha: int = 40
     ellipsis: str = 'label'
     ellipsis_label: str = '...'
-    show_completed: bool = True
+    # The label line can carry the size of the reasoning it stands for.
+    label_tokens: bool = False
+    # 'keep': leave the finished reasoning as the mode renders it;
+    # 'label': collapse it into one label line; 'hide': drop it entirely.
+    after_completion: str = 'keep'
 
     @classmethod
     def from_dict(cls, raw: Any) -> 'ThinkingDisplay':
@@ -228,8 +250,21 @@ class ThinkingDisplay:
         rotation_ms = raw.get('rotation_ms')
         if not isinstance(rotation_ms, list) or len(rotation_ms) != len(rotation):
             rotation_ms = [400] * len(rotation)
+        after = raw.get('after_completion')
+        if after is None:
+            # Older files stored the same decision as a boolean.
+            after = 'keep' if _bool(raw.get('show_completed'), True) else 'hide'
+        mode = _choice(raw.get('mode'), THINKING_MODES, 'label')
+        label_tokens = raw.get('label_tokens')
+        if raw.get('mode') == 'summary':
+            # The token count used to be a mode of its own; it is an attribute
+            # of the label line now, so the old mode becomes "label + count".
+            mode = 'label'
+            if label_tokens is None:
+                label_tokens = True
+        label_tokens = _bool(label_tokens, False)
         return cls(
-            mode=_choice(raw.get('mode'), THINKING_MODES, 'label'),
+            mode=mode,
             label=_str(raw.get('label'), 'Thinking') or 'Thinking',
             animation=_choice(raw.get('animation'), THINKING_ANIMATIONS, 'rotating'),
             fixed_suffix=_str(raw.get('fixed_suffix'), '...'),
@@ -241,8 +276,29 @@ class ThinkingDisplay:
             gradient_top_alpha=_bounded_int(raw.get('gradient_top_alpha'), 0, 255, 40),
             ellipsis=_choice(raw.get('ellipsis'), ELLIPSIS_STYLES, 'label'),
             ellipsis_label=_str(raw.get('ellipsis_label'), '...'),
-            show_completed=_bool(raw.get('show_completed'), True),
+            label_tokens=label_tokens,
+            after_completion=_choice(after, THINKING_AFTER_COMPLETION, 'keep'),
         )
+
+
+@dataclass
+class StepsSettings:
+    """Which work-step preset wrote the thinking and tool settings.
+
+    Any preset but ``custom`` owns those settings: ``/config`` shows them
+    read-only, and only ``custom`` unlocks them for editing.
+    """
+
+    preset: str = STEPS_CUSTOM
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> 'StepsSettings':
+        raw = raw if isinstance(raw, dict) else {}
+        return cls(preset=_choice(raw.get('preset'), STEPS_PRESETS, STEPS_CUSTOM))
+
+    @property
+    def custom(self) -> bool:
+        return self.preset == STEPS_CUSTOM
 
 
 @dataclass
@@ -620,6 +676,7 @@ class AppConfig:
     mcp_servers: list[dict[str, Any]] = field(default_factory=list)
     thinking: ThinkingDisplay = field(default_factory=ThinkingDisplay)
     tools: ToolDisplay = field(default_factory=ToolDisplay)
+    steps: StepsSettings = field(default_factory=StepsSettings)
     hold: HoldSettings = field(default_factory=HoldSettings)
     failover: FailoverSettings = field(default_factory=FailoverSettings)
     footer: FooterSettings = field(default_factory=FooterSettings)
@@ -753,6 +810,7 @@ def config_from_dict(raw: dict[str, Any]) -> AppConfig:
     ]
     config.thinking = ThinkingDisplay.from_dict(raw.get('thinking'))
     config.tools = ToolDisplay.from_dict(raw.get('tools'))
+    config.steps = StepsSettings.from_dict(raw.get('steps'))
     config.hold = HoldSettings.from_dict(raw.get('hold'))
     config.failover = FailoverSettings.from_dict(raw.get('failover'))
     config.footer = FooterSettings.from_dict(raw.get('footer'))
@@ -876,3 +934,18 @@ def set_by_path(config: Any, path: str, value: Any) -> None:
     for part in parts[:-1]:
         current = getattr(current, part)
     setattr(current, parts[-1], value)
+
+def apply_step_preset(config: Any, level: str) -> bool:
+    """Write the thinking and tool settings of one work-step level.
+
+    The preset is recorded too, so ``/config`` knows whether those settings
+    still belong to a preset or were edited by hand.  False when ``level`` is
+    not one of the presets.
+    """
+    paths = STEP_PRESETS.get(level)
+    if paths is None:
+        return False
+    for path, value in paths.items():
+        set_by_path(config, path, value)
+    config.steps.preset = level
+    return True

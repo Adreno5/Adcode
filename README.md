@@ -268,8 +268,8 @@ Enter completes it, and Enter runs the command.
 | `/model [list\|edit]` | Switch models or edit the selected model's capabilities |
 | `/provider add\|edit\|remove\|list` | Manage providers and their models |
 | `/effort [level]` | Set `low`, `medium`, `high`, `xhigh`, `max`, or `ultra` |
-| `/thinking [mode]` | Set thinking display: `hidden`, `label`, `partial`, `full`, `summary` |
-| `/steps [level]` | Preset the work-step settings: `concise`, `standard`, `detailed` |
+| `/thinking [mode]` | Set thinking display: `hidden`, `label`, `partial`, `full` |
+| `/steps [level]` | Preset the work-step settings: `concise`, `standard`, `detailed` (the same **Preset** in `/config`, where `custom` unlocks them) |
 | `/hold [on\|off\|<retries>]` | Keep retrying a request that was cut short |
 | `/max_tokens [n]` | Set the maximum output tokens per request |
 | `/compact` | Compact older turns immediately |
@@ -318,7 +318,22 @@ to save by hand.
 | `label` | One label line with a fixed or rotating suffix |
 | `partial` | A configurable window of the rendered reasoning |
 | `full` | The complete reasoning stream |
-| `summary` | The reasoning is kept but not spelled out: one line per finished thought, `thought of 412 tokens` |
+
+The label line carries a **Token count** switch (`thinking.label_tokens`): on,
+a finished thought reads `Thinking · 1.5s · 412 tokens` instead of just
+`Thinking · 1.5s`.  The switch sits in the label mode's settings and again
+under the label collapse of **After completion** -- it is one setting, shown
+wherever a label can appear.  The count lands when the round ends, not while
+the thought streams.
+
+**After completion** (`thinking.after_completion`) decides what is left of a
+thought once the model has finished thinking:
+
+| Value | Behaviour |
+|---|---|
+| `keep` | Leave it as the mode above renders it |
+| `label` | Collapse it into the one label line, with the duration (and the token count, when the label carries it) |
+| `hide` | Drop it entirely; it stays in the conversation, just not on screen |
 
 The `label` mode configures the label text (`Thinking`, `Reasoning`,
 `Polishing`, ...), the suffix animation (`fixed` or `rotating`), the rotation
@@ -369,6 +384,11 @@ between attempts).
 
 The thinking and the tool settings live in one **Work steps** group of
 `/config`; they decide how much of the work chain the transcript spells out.
+The first item, **Preset**, is the same choice `/steps` offers, plus
+**Custom**: the thinking, tool and chain settings below it are editable only
+while the preset is Custom.  Under a named preset they still show what they
+are set to, but cannot be opened or edited -- the preset would otherwise stop
+being what its name says.
 
 Two of them do the heavy lifting:
 
@@ -376,16 +396,22 @@ Two of them do the heavy lifting:
   row, `merged` folds a chain of consecutive calls into one row with the
   tool names and their counts: `bash x2, grep, write`.  A merged chain shows
   no details; the whole chain stays in the history.
-- **Thinking display** (`thinking.mode`) -- `summary` keeps the reasoning but
-  only says how much there was: `thought of 412 tokens`.
+- **Thinking display** (`thinking.mode`) -- `label` keeps the reasoning but
+  only says that it happened, and how much there was when `label_tokens` is
+  on: `Thinking · 1.5s · 412 tokens`.
 
 `/steps` is a shortcut that writes those settings:
 
 | Level | Writes |
 |---|---|
-| `concise` | `thinking.mode = summary`, `tools.chain = merged` |
-| `standard` | `thinking.mode = partial`, `tools.chain = separate` |
-| `detailed` | `thinking.mode = full`, `tools.chain = separate`, `tools.result_mode = full` |
+| `concise` | `thinking.mode = label`, `thinking.label_tokens = on`, `tools.chain = merged` |
+| `standard` | `thinking.mode = partial`, `thinking.label_tokens = off`, `tools.chain = separate` |
+| `detailed` | `thinking.mode = full`, `thinking.label_tokens = off`, `tools.chain = separate`, `tools.result_mode = full` |
+
+The command also records the level as the preset, so `/config` reflects what
+`/steps` just did.  It only ever jumps to one of the three levels; `custom` is
+selected in `/config`, and editing the thinking mode with `/thinking` marks
+the settings custom again.
 
 ### The status line
 

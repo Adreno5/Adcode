@@ -194,7 +194,7 @@ class AgentLoop:
         )
 
     def _engine_config(self, config: AppConfig) -> EngineConfig:
-        show_completed = (config.thinking.show_completed
+        show_completed = (config.thinking.after_completion != 'hide'
                           and config.thinking.mode != 'hidden')
         return EngineConfig(
             context=ContextSettings(

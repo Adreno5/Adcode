@@ -231,3 +231,101 @@ def test_escape_leaves_the_cursor_on_the_collapsed_item(config):
     overlay.handle(key('esc'))
     assert overlay.expanded == []
     assert current(overlay) == 'context.auto'
+
+def test_the_work_steps_group_starts_with_the_preset(config):
+    overlay = SettingsOverlay(config, lambda: None)
+    keys = [row.key for row in overlay._flatten()]
+    assert keys[keys.index('group:Work steps') + 1] == 'steps.preset'
+    focus(overlay, 'steps.preset')
+    overlay.handle(key('enter'))
+    options = [row.key for row in overlay._flatten() if row.kind == 'option']
+    assert options == [f'steps.preset::{level}'
+                       for level in ('concise', 'standard', 'detailed', 'custom')]
+
+def test_a_preset_writes_its_settings_and_locks_them(config):
+    overlay = SettingsOverlay(config, lambda: None)
+    walk_to(overlay, 'steps.preset')
+    overlay.handle(key('enter'))
+    walk_to(overlay, 'steps.preset::standard')
+    overlay.handle(key('enter'))
+    assert config.steps.preset == 'standard'
+    assert config.thinking.mode == 'partial'
+    assert config.tools.chain == 'separate'
+    # The settings the preset owns are read-only: they show their value but
+    # do not open, and the panel says why.
+    walk_to(overlay, 'thinking.mode')
+    overlay.handle(key('enter'))
+    assert overlay.editing is False
+    assert 'thinking.mode::full' not in [row.key for row in overlay._flatten()]
+    assert config.thinking.mode == 'partial'
+    assert 'Custom' in overlay.notice
+    walk_to(overlay, 'tools.chain')
+    overlay.handle(key('enter'))
+    assert config.tools.chain == 'separate'
+
+def test_custom_unlocks_the_work_step_settings(config):
+    config.steps.preset = 'concise'
+    config.thinking.mode = 'label'
+    config.thinking.label_tokens = True
+    overlay = SettingsOverlay(config, lambda: None)
+    walk_to(overlay, 'steps.preset')
+    overlay.handle(key('enter'))
+    walk_to(overlay, 'steps.preset::custom')
+    overlay.handle(key('enter'))
+    assert config.steps.preset == 'custom'
+    # Nothing else moved: the hand-edited values stay as they were.
+    assert config.thinking.mode == 'label'
+    assert config.thinking.label_tokens is True
+    walk_to(overlay, 'thinking.mode')
+    overlay.handle(key('enter'))
+    walk_to(overlay, 'thinking.mode::full')
+    overlay.handle(key('enter'))
+    assert config.thinking.mode == 'full'
+
+def test_choosing_a_preset_collapses_what_it_locked(config):
+    overlay = SettingsOverlay(config, lambda: None)
+    walk_to(overlay, 'thinking.mode')
+    overlay.handle(key('enter'))
+    walk_to(overlay, 'steps.preset')
+    overlay.handle(key('enter'))
+    walk_to(overlay, 'steps.preset::concise')
+    overlay.handle(key('enter'))
+    # An expansion of a setting the preset took back must not linger: escape
+    # would otherwise half-revert the preset.
+    assert overlay.expanded == []
+    assert overlay.snapshots == {}
+
+def test_the_token_count_belongs_to_the_label(config):
+    overlay = SettingsOverlay(config, lambda: None)
+    walk_to(overlay, 'thinking.mode')
+    overlay.handle(key('enter'))
+    options = [row.key for row in overlay._flatten() if row.kind == 'option']
+    assert 'thinking.mode::summary' not in options
+    # The label owns the count: it is one of its settings, not a mode.
+    walk_to(overlay, 'thinking.mode::label')
+    overlay.handle(key('enter'))
+    assert config.thinking.mode == 'label'
+    walk_to(overlay, 'thinking.label_tokens')
+    overlay.handle(key('enter'))
+    walk_to(overlay, 'thinking.label_tokens::True')
+    overlay.handle(key('enter'))
+    assert config.thinking.label_tokens is True
+
+def test_every_label_position_offers_the_token_count(config):
+    overlay = SettingsOverlay(config, lambda: None)
+    walk_to(overlay, 'thinking.mode')
+    overlay.handle(key('enter'))
+    walk_to(overlay, 'thinking.mode::full')
+    overlay.handle(key('enter'))
+    # The label collapse after the thought finishes shows a label too, so it
+    # carries the same switch (and the same setting).
+    walk_to(overlay, 'thinking.after_completion')
+    overlay.handle(key('enter'))
+    walk_to(overlay, 'thinking.after_completion::label')
+    overlay.handle(key('enter'))
+    assert config.thinking.after_completion == 'label'
+    walk_to(overlay, 'thinking.label_tokens')
+    overlay.handle(key('enter'))
+    walk_to(overlay, 'thinking.label_tokens::True')
+    overlay.handle(key('enter'))
+    assert config.thinking.label_tokens is True

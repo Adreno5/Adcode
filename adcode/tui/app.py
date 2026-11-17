@@ -1650,7 +1650,7 @@ class AdCodeApp:
         renderer's per-item memo cannot mistake it for the normal config.
         """
         cfg = self.config
-        thinking = replace(cfg.thinking, mode='full', show_completed=True)
+        thinking = replace(cfg.thinking, mode='full', after_completion='keep')
         tools = replace(cfg.tools, mode='both', chain='separate',
                         result_mode='full', show_args=True, show_diff=True,
                         max_result_lines=0)
@@ -1972,8 +1972,9 @@ class AdCodeApp:
             extras.append(f'{len(agents)} agent{"s" if len(agents) > 1 else ""}')
         if self.config.tools.chain == 'merged':
             extras.append('merged steps')
-        if self.config.thinking.mode == 'summary':
-            extras.append('summary thinking')
+        if (self.config.thinking.mode == 'label'
+                and self.config.thinking.label_tokens):
+            extras.append('token count')
         if self.config.hold.enabled:
             extras.append(f'hold ×{self.config.hold.max_retries}')
         if self.scroll > 0:

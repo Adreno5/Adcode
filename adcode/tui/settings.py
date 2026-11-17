@@ -15,7 +15,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from adcode.config import (
-    REASONING_EFFORTS, AppConfig, get_by_path, set_by_path,
+    REASONING_EFFORTS, STEPS_CUSTOM, STEP_PRESETS,
+    AppConfig, apply_step_preset, get_by_path, set_by_path,
 )
 from adcode.theme import ACCENT_PRESETS, Palette
 from adcode.tui.canvas import BOLD, DIM, Canvas, text_width, truncate_text
@@ -31,6 +32,9 @@ class SettingChoice:
     label: str
     description: str = ''
     children: list['SettingNode'] = field(default_factory=list)
+    #: Runs after the option is written: a work-step preset owns settings
+    #: beyond its own path, so selecting it has to write those too.
+    on_select: Callable[[AppConfig], None] | None = None
 
 
 @dataclass
@@ -45,6 +49,8 @@ class SettingNode:
     hint: str = ''
     action: Callable[[], None] | None = None
     value_text: Callable[[AppConfig], str] | None = None
+    #: When it answers True the item is shown but cannot be opened or edited.
+    lock: Callable[[AppConfig], bool] | None = None
 
 
 @dataclass
@@ -79,6 +85,53 @@ def _text(key: str, label: str, path: str, hint: str = '') -> SettingNode:
 def _label(key: str, label: str,
            value: Callable[[AppConfig], str]) -> SettingNode:
     return SettingNode(key=key, label=label, kind='label', value_text=value)
+
+
+def _step_preset_node() -> SettingNode:
+    """The preset item: the same levels ``/steps`` offers, plus ``custom``."""
+    descriptions = {
+        'concise': 'Tools in one row, reasoning as a token count',
+        'standard': 'Every step on its own',
+        'detailed': 'Every step, fully expanded',
+    }
+    choices = [
+        SettingChoice(level, level.capitalize(), descriptions.get(level, ''),
+                      on_select=lambda cfg, level=level: apply_step_preset(cfg, level))
+        for level in STEP_PRESETS
+    ]
+    choices.append(SettingChoice(
+        STEPS_CUSTOM, 'Custom',
+        'Edit the thinking and tool settings yourself'))
+    return SettingNode(key='steps.preset', label='Preset', kind='choice',
+                       path='steps.preset', choices=choices,
+                       hint='Anything but Custom keeps the settings below read-only')
+
+
+def _locked_by_preset(config: AppConfig) -> bool:
+    """The work-step settings belong to the preset until it is ``custom``."""
+    steps = getattr(config, 'steps', None)
+    return not getattr(steps, 'custom', True)
+
+
+def _label_tokens_node() -> SettingNode:
+    """The switch for the label's token count.
+
+    It is one setting (``thinking.label_tokens``) offered at every place a
+    label can be shown: the label mode and the label collapse after the
+    thought finishes.
+    """
+    return _bool('thinking.label_tokens', 'Token count', 'thinking.label_tokens',
+                 'Append the size of the reasoning to the label')
+
+
+def _after_completion_node() -> SettingNode:
+    return _choice('thinking.after_completion', 'After completion',
+                   'thinking.after_completion', [
+        SettingChoice('keep', 'Keep', 'Leave the finished reasoning as it is'),
+        SettingChoice('label', 'Label', 'Collapse it into one label line',
+                      [_label_tokens_node()]),
+        SettingChoice('hide', 'Hide', 'Drop it once the answer starts'),
+    ])
 
 
 def _partial_children(prefix: str, from_path: str, to_path: str,
@@ -144,23 +197,17 @@ def build_settings_tree(config: AppConfig) -> list[SettingNode]:
                           'thinking.rotation_ms'),
                 ]),
             ]),
+            _label_tokens_node(),
         ]),
         SettingChoice('partial', 'Partial window', 'Show a configurable window', [
             *_partial_children('thinking.partial', 'thinking.from_index',
                                'thinking.to_index', 'thinking.style',
                                'thinking.gradient_top_alpha', 'thinking.ellipsis',
                                'thinking.ellipsis_label'),
-            _bool('thinking.show_completed', 'Keep after completion',
-                  'thinking.show_completed'),
+            _after_completion_node(),
         ]),
         SettingChoice('full', 'Full', 'Show everything', [
-            _bool('thinking.show_completed', 'Keep after completion',
-                  'thinking.show_completed'),
-        ]),
-        SettingChoice('summary', 'Token count',
-                      'Keep the reasoning, but only say how much there was', [
-            _bool('thinking.show_completed', 'Keep after completion',
-                  'thinking.show_completed'),
+            _after_completion_node(),
         ]),
     ]
     thinking_item = _choice('thinking.mode', 'Thinking display', 'thinking.mode',
@@ -294,12 +341,18 @@ def build_settings_tree(config: AppConfig) -> list[SettingNode]:
                                      for server in cfg.mcp_servers) or '(none)'),
     ]
 
+    # A named preset owns the thinking, tool and chain settings: /config shows
+    # them but leaves them read-only until the preset is switched to Custom.
+    for item in (thinking_item, tool_item, chain_item):
+        item.lock = _locked_by_preset
+
     return [
         SettingNode(key='group:Appearance', label='Appearance', kind='group',
                     choices=[], value_text=None),
         *appearance,
         SettingNode(key='group:Work steps', label='Work steps', kind='group',
                     choices=[]),
+        _step_preset_node(),
         thinking_item,
         tool_item,
         chain_item,
@@ -349,6 +402,7 @@ class SettingsOverlay(Overlay):
         self.edit_value = ''
         self.edit_error = ''
         self.edit_select_all = False
+        self.notice = ''
         self.snapshots: dict[str, dict[str, Any]] = {}
         self.nodes = build_settings_tree(config)
 
@@ -365,7 +419,7 @@ class SettingsOverlay(Overlay):
                     rows.append(Row('label', depth, f'label:{node.key}', node))
                     continue
                 rows.append(Row('setting', depth, node.key, node))
-                if node.key not in self.expanded:
+                if node.key not in self.expanded or self._locked(node):
                     continue
                 if node.kind in ('choice', 'bool'):
                     options = node.choices if node.kind == 'choice' else [
@@ -414,6 +468,27 @@ class SettingsOverlay(Overlay):
         """Remember ``key`` and move the cursor onto it right away."""
         self.row_key = key
         self._sync_cursor(self._flatten())
+
+    def _locked(self, node: SettingNode | None) -> bool:
+        """Whether the item is read-only under the current config."""
+        if node is None or node.lock is None:
+            return False
+        try:
+            return bool(node.lock(self.config))
+        except Exception:
+            return False
+
+    def _collapse_locked(self) -> None:
+        """Drop the expansions (and their undo snapshots) of locked items.
+
+        Choosing a preset takes the thinking and tool settings back, so a
+        half-reverted expansion must not survive behind it.
+        """
+        for key in list(self.expanded):
+            node = self._find_node(key)
+            if node is not None and self._locked(node):
+                self.expanded.remove(key)
+                self.snapshots.pop(key, None)
 
     def _get(self, node: SettingNode) -> Any:
         if not node.path:
@@ -466,6 +541,7 @@ class SettingsOverlay(Overlay):
     def _move(self, delta: int) -> None:
         rows = self._flatten()
         self._sync_cursor(rows)
+        self.notice = ''
         selectable = self._selectable(rows)
         if not selectable:
             return
@@ -556,8 +632,16 @@ class SettingsOverlay(Overlay):
         node = row.node
         if node is None:
             return
+        if self._locked(node):
+            self.notice = (f'{node.label} is read-only under this preset; '
+                           'choose Custom to edit it')
+            return
+        self.notice = ''
         if row.kind == 'option' and row.option is not None:
             self._set(node, row.option.value)
+            if row.option.on_select is not None:
+                row.option.on_select(self.config)
+            self._collapse_locked()
             self.on_change()
             if row.option.children:
                 if node.key not in self.expanded:
@@ -758,21 +842,25 @@ class SettingsOverlay(Overlay):
                                  truncate_text(value, max(1, w - indent - label_width - 3)),
                                  palette.muted, bg, DIM)
             elif row.kind == 'setting':
-                expanded = row.node.key in self.expanded
-                marker = '▾ ' if expanded else '▸ '
+                locked = self._locked(row.node)
+                expanded = row.node.key in self.expanded and not locked
+                marker = '⊘ ' if locked else ('▾ ' if expanded else '▸ ')
                 canvas.draw_text(x + indent, row_y, marker,
-                                 palette.accent if expanded else palette.muted, bg)
+                                 palette.muted if locked or not expanded
+                                 else palette.accent, bg)
                 label = row.node.label
                 canvas.draw_text(x + indent + 2, row_y,
                                  truncate_text(label, max(8, w // 2)),
-                                 palette.text, bg, BOLD if selected else 0)
+                                 palette.muted if locked else palette.text, bg,
+                                 BOLD if selected else 0)
                 value = self._display_value(row.node)
                 if value:
                     value_width = text_width(value)
                     value_x = x + w - 3 - value_width
                     if value_x > x + indent + 4 + text_width(label):
                         canvas.draw_text(value_x, row_y, value,
-                                         palette.subtext, bg)
+                                         palette.subtext, bg,
+                                         DIM if locked else 0)
             elif row.kind == 'option':
                 current = self._get(row.node)
                 chosen = _same(row.option.value, current)
@@ -798,6 +886,8 @@ class SettingsOverlay(Overlay):
             canvas.draw_text(x + 2, y + h - 3, self.edit_error, palette.error)
         hint = ('type a value · enter apply · esc cancel' if self.editing
                 else '↑↓ move · enter expand/select · esc back')
+        if self.notice and not self.editing:
+            hint = self.notice
         _draw_hint(canvas, x, y + h - 2, w, hint, palette)
 
     def _display_value(self, node: SettingNode) -> str:

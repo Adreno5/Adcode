@@ -130,3 +130,52 @@ def test_agent_type_from_dict():
                                              'max_turns': 3})
     assert agent.tools == ['read']
     assert agent.max_turns == 3
+
+def test_the_work_steps_default_to_custom():
+    cfg = AppConfig()
+    assert cfg.steps.preset == 'custom'
+    assert cfg.steps.custom is True
+    assert cfg.thinking.after_completion == 'keep'
+
+def test_the_thinking_after_completion_migrates_from_the_old_flag():
+    hidden = config_from_dict({'version': 2, 'thinking': {'show_completed': False}})
+    assert hidden.thinking.after_completion == 'hide'
+    kept = config_from_dict({'version': 2, 'thinking': {'show_completed': True}})
+    assert kept.thinking.after_completion == 'keep'
+    chosen = config_from_dict(
+        {'version': 2, 'thinking': {'after_completion': 'label'}})
+    assert chosen.thinking.after_completion == 'label'
+    # A value the schema does not know falls back to keeping the reasoning.
+    bogus = config_from_dict({'version': 2, 'thinking': {'after_completion': '?'}})
+    assert bogus.thinking.after_completion == 'keep'
+
+def test_the_preset_survives_a_roundtrip(tmp_path):
+    path = tmp_path / 'config.json'
+    store = ConfigStore(path)
+    cfg = store.load()
+    cfg.steps.preset = 'concise'
+    store.save()
+    assert json.loads(path.read_text(encoding='utf-8'))['steps']['preset'] == 'concise'
+    assert ConfigStore(path).load().steps.preset == 'concise'
+
+def test_apply_step_preset_writes_the_settings_and_the_preset():
+    cfg = AppConfig()
+    assert config_module.apply_step_preset(cfg, 'detailed') is True
+    assert cfg.thinking.mode == 'full'
+    assert cfg.tools.chain == 'separate'
+    assert cfg.tools.result_mode == 'full'
+    assert cfg.steps.preset == 'detailed'
+    assert config_module.apply_step_preset(cfg, 'custom') is False
+    assert cfg.steps.preset == 'detailed'
+
+def test_the_token_count_mode_becomes_a_label_setting():
+    migrated = config_from_dict(
+        {'version': 2, 'thinking': {'mode': 'summary', 'label': 'Thinking'}})
+    assert migrated.thinking.mode == 'label'
+    assert migrated.thinking.label_tokens is True
+    # An explicit switch wins over what the old mode implied.
+    chosen = config_from_dict(
+        {'version': 2, 'thinking': {'mode': 'summary', 'label_tokens': False}})
+    assert chosen.thinking.mode == 'label'
+    assert chosen.thinking.label_tokens is False
+    assert AppConfig().thinking.label_tokens is False

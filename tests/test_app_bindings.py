@@ -150,7 +150,7 @@ def test_holding_alt_reveals_details_and_release_restores(app, monkeypatch):
     reveal_cfg, version = app._reveal_config()
     assert reveal_cfg is not config_before
     assert reveal_cfg.thinking.mode == 'full'
-    assert reveal_cfg.thinking.show_completed is True
+    assert reveal_cfg.thinking.after_completion == 'keep'
     assert reveal_cfg.tools.mode == 'both'
     assert reveal_cfg.tools.chain == 'separate'
     assert reveal_cfg.tools.result_mode == 'full'

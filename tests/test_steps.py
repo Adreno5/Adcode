@@ -86,27 +86,36 @@ def test_the_merged_chain_hides_the_tool_output(config):
     assert not any('written' in line for line in lines), lines
 
 
-def test_the_summary_thinking_counts_the_tokens(config):
-    config.thinking.mode = 'summary'
+def test_the_label_can_carry_the_token_count(config):
+    config.thinking.mode = 'label'
     item = TranscriptItem(kind='thinking', turn=1,
                           text='word ' * 400, duration=1.5)
-    lines = [line for line in texts(render(config, [item])) if line.strip()]
-    assert len(lines) == 1, lines
-    assert lines[0].startswith('thought of '), lines
-    assert 'tokens' in lines[0], lines
+    plain = [line for line in texts(render(config, [item])) if line.strip()]
+    assert len(plain) == 1, plain
+    assert plain[0].startswith('Thinking'), plain
+    assert 'tokens' not in plain[0], plain
+
+    config.thinking.label_tokens = True
+    counted = [line for line in texts(render(config, [item])) if line.strip()]
+    assert len(counted) == 1, counted
+    assert counted[0].startswith('Thinking'), counted
+    assert '1.5s' in counted[0] and 'tokens' in counted[0], counted
     # The reasoning itself is not spelled out.
-    assert 'word' not in lines[0], lines
+    assert 'word' not in counted[0], counted
 
 
-def test_the_summary_thinking_keeps_the_run_label(config):
-    config.thinking.mode = 'summary'
+def test_the_label_mode_keeps_the_run_label(config):
+    config.thinking.mode = 'label'
+    config.thinking.label_tokens = True
     live = LiveRender(phase='thinking')
     lines = texts(render(config, [], live=live))
     assert lines and lines[0].startswith('Thinking'), lines
+    # The count lands when the round does, not while it streams.
+    assert 'token' not in lines[0], lines
 
 
-def test_the_summary_thinking_shows_nothing_for_the_running_output(config):
-    config.thinking.mode = 'summary'
+def test_the_label_mode_shows_nothing_for_the_running_output(config):
+    config.thinking.mode = 'label'
     config.tools.chain = 'merged'
     live = LiveRender(phase='tool', tool_output=['some output'])
     assert texts(render(config, [], live=live)) == []
@@ -130,19 +139,29 @@ def test_the_command_applies_a_preset(config):
 
     app = FakeApp()
     dispatch(app, '/steps concise')
-    assert config.thinking.mode == 'summary'
+    assert config.thinking.mode == 'label'
+    assert config.thinking.label_tokens is True
     assert config.tools.chain == 'merged'
+    assert config.steps.preset == 'concise'
     dispatch(app, '/steps standard')
     assert config.thinking.mode == 'partial'
+    assert config.thinking.label_tokens is False
     assert config.tools.chain == 'separate'
+    assert config.steps.preset == 'standard'
     dispatch(app, '/steps detailed')
     assert config.thinking.mode == 'full'
     assert config.tools.result_mode == 'full'
+    assert config.steps.preset == 'detailed'
     dispatch(app, '/steps')
     assert app.select is not None
+    # ``custom`` is a settings-browser value only: the command never sets it.
+    app.select = None
+    dispatch(app, '/steps custom')
+    assert app.select is not None
+    assert config.steps.preset == 'detailed'
 
 
-def test_the_thinking_command_knows_the_summary_mode(config):
+def test_the_thinking_command_knows_the_label_mode(config):
     class FakeApp:
         def __init__(self) -> None:
             self.config = config
@@ -154,5 +173,9 @@ def test_the_thinking_command_knows_the_summary_mode(config):
             pass
 
     app = FakeApp()
-    dispatch(app, '/thinking summary')
-    assert config.thinking.mode == 'summary'
+    config.steps.preset = 'detailed'
+    dispatch(app, '/thinking label')
+    assert config.thinking.mode == 'label'
+    # The mode no longer matches the preset, so the settings count as the
+    # user's own mix (which is what unlocks them in /config).
+    assert config.steps.preset == 'custom'
