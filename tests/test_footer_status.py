@@ -11,11 +11,17 @@ import time
 
 import pytest
 
+from infra.policy.predictor import DurationPredictor
+
 from adcode.tui.app import AdCodeApp, _percent_in
 
 
 @pytest.fixture()
-def app(tmp_path):
+def app(tmp_path, monkeypatch):
+    # the wait predictor persists between sessions; a test must not read the
+    # learnings of the real one
+    monkeypatch.setattr('adcode.paths.predictor_file',
+                        lambda: tmp_path / 'predictor.json')
     instance = AdCodeApp(cwd=str(tmp_path), resume=False,
                          config_path=str(tmp_path / 'config.json'))
     try:
@@ -224,3 +230,45 @@ def test_the_rate_is_measured_while_the_model_writes(app):
 def test_without_tokens_there_is_no_rate(app):
     app._apply_event('turn_start', {'turn': 1, 'text': 'hi'})
     assert app._token_rate() == 0.0
+
+
+# ── the wait estimate and the cache hit ────────────────────
+def _finished_request(app, elapsed=2.0):
+    app._apply_event('status', {'status': 'connecting'})
+    app.connect_started = time.time() - elapsed
+    app._apply_event('usage', {'input_tokens': 12_000,
+                               'cached_input_tokens': 9_000,
+                               'output_tokens': 800,
+                               'cache_hit_rate': 0.75})
+
+
+def test_a_finished_request_teaches_the_wait_estimate(app):
+    assert app._connect_eta() == ''            # nothing learned yet
+    _finished_request(app)
+    assert app._last_cache_hit == 0.75
+    assert app._predictor.n == 1
+    # One sample is not an estimate either; the second one is.
+    _finished_request(app)
+    assert app._predictor.n == 2
+    assert app._connect_eta().startswith(' ~')
+
+
+def test_the_cache_hit_shows_in_the_extras(app):
+    app._apply_event('usage', {'input_tokens': 1_000,
+                               'cached_input_tokens': 250,
+                               'output_tokens': 100,
+                               'cache_hit_rate': 0.25})
+    assert app._last_cache_hit == 0.25
+    app.canvas.resize(60, 10)
+    app.canvas.clear()
+    app._draw_footer(60, 9, 0)
+    row = ''.join(app.canvas.cell(x, 9).ch for x in range(60))
+    assert 'cache 25%' in row
+
+
+def test_the_estimate_takes_the_learned_sizes(app):
+    app._predictor = DurationPredictor(w1=0.0, w2=1.0, w3=0.0, b=1.0, n=5)
+    app._last_usage = {'input_tokens': 10_000, 'cached_input_tokens': 0,
+                       'output_tokens': 2_000}
+    eta = app._connect_eta()
+    assert eta == ' ~3.0s'                     # w2 * 2k + b, at the floor

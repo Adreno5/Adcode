@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from adcode import net
+from infra import net
 from adcode.config import ModelConfig, ProviderConfig
 from adcode.llm.client import LLMClient
 

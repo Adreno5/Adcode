@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
+import yaml
+
 from adcode.config import SkillsSettings
 from adcode.tools.registry import AnnotatedTool
 
@@ -45,66 +47,38 @@ class Skill:
         return entries
 
 
-def _strip_quotes(value: str) -> str:
-    value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
-        return value[1:-1]
-    return value
-
-
 def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
-    """Parse a minimal YAML frontmatter block without external dependencies."""
-    if text.startswith('﻿'):
-        text = text.lstrip('﻿')
-    stripped = text.lstrip('\r\n ')
+    """Split a SKILL.md into its YAML frontmatter and its body.
+
+    PyYAML is already here (the engine sdk depends on it), so the header is
+    parsed with the real grammar: quoted values, ``|`` / ``>`` blocks and
+    comments all behave.  Nested structures are not part of the contract
+    and are skipped; every kept value becomes a string.
+    """
+    stripped = text.lstrip('\ufeff\r\n ')
     if not stripped.startswith('---'):
         return {}, text
     lines = stripped.splitlines()
     if lines[0].strip() != '---':
         return {}, text
-    metadata: dict[str, str] = {}
-    index = 1
-    key = ''
-    block_indent = 0
-    block_style = ''
-    block_lines: list[str] = []
-    while index < len(lines):
-        line = lines[index]
-        if line.strip() == '---':
-            index += 1
+    end = None
+    for index in range(1, len(lines)):
+        if lines[index].strip() == '---':
+            end = index
             break
-        indent = len(line) - len(line.lstrip(' '))
-        if key and block_style:
-            if line.strip() and indent >= block_indent:
-                block_lines.append(line[block_indent:])
-                index += 1
+    if end is None:
+        return {}, text
+    body = '\n'.join(lines[end + 1:]).lstrip('\r\n')
+    try:
+        loaded = yaml.safe_load('\n'.join(lines[1:end]))
+    except yaml.YAMLError:
+        return {}, body
+    metadata: dict[str, str] = {}
+    if isinstance(loaded, dict):
+        for key, value in loaded.items():
+            if value is None or isinstance(value, (dict, list)):
                 continue
-            separator = '\n' if block_style == '|' else ' '
-            metadata[key] = separator.join(block_lines).strip()
-            key = ''
-            block_style = ''
-            block_lines = []
-            continue
-        if ':' in line and not line.lstrip().startswith('#'):
-            raw_key, raw_value = line.split(':', 1)
-            key = raw_key.strip()
-            value = raw_value.strip()
-            if value in ('|', '>'):
-                block_style = value
-                block_indent = indent + 2
-                block_lines = []
-                index += 1
-                continue
-            metadata[key] = _strip_quotes(value)
-            key = ''
-        elif key and line.startswith(' '):
-            # Plain multi-line continuation.
-            metadata[key] = (metadata[key] + ' ' + line.strip()).strip()
-        index += 1
-    if key and block_style:
-        separator = '\n' if block_style == '|' else ' '
-        metadata[key] = separator.join(block_lines).strip()
-    body = '\n'.join(lines[index:]).lstrip('\r\n')
+            metadata[str(key)] = str(value).strip()
     return metadata, body
 
 

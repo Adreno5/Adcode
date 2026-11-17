@@ -24,7 +24,10 @@ from adcode.images import (
     ImageStore, count_image_markers, file_uri_to_path, image_marker, is_image_url,
     read_clipboard_image, resolve_image,
 )
+from infra.policy.predictor import DurationPredictor
+
 from adcode.mcp.manager import get_mcp_manager
+from adcode import paths
 from adcode.paths import goals_file, sessions_db
 from adcode.session import DbSessionStore, TranscriptItem
 from adcode.skills import SkillRegistry
@@ -345,6 +348,11 @@ class AdCodeApp:
         # show how long the provider has been silent.
         self.connect_started = 0.0
         self.connect_retrying = False
+        # Learns how long a request takes from the finished ones; the footer
+        # turns that into an estimate while the provider is silent.
+        self._predictor = DurationPredictor.load(str(paths.predictor_file()))
+        self._last_cache_hit: float | None = None
+        self._last_usage: dict[str, Any] = {}
         self._resume = resume
         self._started_at = time.time()
         self._tool_signature = self._tool_config_signature()
@@ -786,6 +794,7 @@ class AdCodeApp:
             self.phase = 'thinking'
         elif kind == 'usage':
             self._sample_tokens()
+            self._learn_request_duration(payload)
             self.dirty = True
         elif kind == 'notice':
             level = payload.get('level', 'info')
@@ -1695,7 +1704,7 @@ class AdCodeApp:
             verb = 'reconnecting' if self.connect_retrying else 'connecting'
             elapsed = self._connect_elapsed()
             suffix = f' {elapsed:.1f}s' if elapsed >= 1.0 else ''
-            status = f'{frame} {verb}{suffix}'
+            status = f'{frame} {verb}{suffix}{self._connect_eta()}'
         elif phase == 'thinking':
             status = f'{frame} thinking'
         elif phase == 'answering':
@@ -1740,6 +1749,8 @@ class AdCodeApp:
         rate = self._token_rate()
         if rate > 0 and phase in ('thinking', 'answering'):
             extras.append(f'{rate:.0f} tok/s')
+        if self._last_cache_hit is not None:
+            extras.append(f'cache {round(100 * self._last_cache_hit)}%')
         queued = snap.queued
         if queued:
             extras.append(f'{queued} queued')
@@ -1921,6 +1932,46 @@ class AdCodeApp:
         if not self._stream_started:
             self._stream_started = time.time()
         self._stream_tokens += estimate_text_tokens(text)
+
+    def _learn_request_duration(self, payload: dict[str, Any]) -> None:
+        """Teach the duration predictor from a finished request.
+
+        The elapsed time is the wait the footer has been showing; the token
+        counts are the sizes the next request will roughly have.
+        """
+        hit = payload.get('cache_hit_rate')
+        self._last_cache_hit = float(hit) if hit is not None else None
+        self._last_usage = dict(payload)
+        elapsed = self._connect_elapsed()
+        self.connect_started = 0.0
+        if elapsed < 0.5:
+            return
+        predictor = self._predictor
+        predictor.add(
+            int(payload.get('input_tokens') or 0),
+            int(payload.get('cached_input_tokens') or 0),
+            int(payload.get('output_tokens') or 0),
+            elapsed)
+        try:
+            predictor.save(str(paths.predictor_file()))
+        except OSError:
+            pass
+
+    def _connect_eta(self) -> str:
+        """The estimated wait for the current request, from the learned ones."""
+        predictor = self._predictor
+        if predictor.n < 2:
+            return ''
+        usage = self._last_usage
+        if not usage:
+            return ''
+        eta = predictor.predict(
+            int(usage.get('input_tokens') or 0),
+            int(usage.get('cached_input_tokens') or 0),
+            int(usage.get('output_tokens') or 0))
+        if eta <= 0:
+            return ''
+        return f' ~{eta:.0f}s' if eta >= 10 else f' ~{eta:.1f}s'
 
     def _sample_tokens(self) -> None:
         """Remember how many tokens the model has produced, and when.

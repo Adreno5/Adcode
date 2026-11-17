@@ -233,9 +233,11 @@ def test_images_are_uploaded_and_referenced_by_file_id(gateway, wire, tmp_path):
     pixels = bytes([255, 0, 0, 255])
     payload = images.encode_png(1, 1, pixels)
     (tmp_path / 'shot.png').write_bytes(payload)
-    client = LLMClient(provider(gateway.base_url, wire))
+    file_cache = images.FileIdCache(tmp_path / 'files.json')
+    client = LLMClient(provider(gateway.base_url, wire),
+                       file_cache=file_cache)
     client.base_dir = str(tmp_path)
-    client.file_cache = images.FileIdCache(tmp_path / 'files.json')
+    client.file_cache = file_cache
     collect(client, wire, [{'role': 'user',
                             'content': 'look [image: shot.png] here'}])
 
@@ -268,9 +270,11 @@ def test_a_provider_without_a_files_api_still_gets_the_image(gateway, wire,
     gateway.responder = ScriptedResponder([Turn(text='seen')])
     gateway.files_supported = False
     (tmp_path / 'shot.png').write_bytes(images.encode_png(1, 1, bytes([1, 2, 3, 255])))
-    client = LLMClient(provider(gateway.base_url, wire))
+    file_cache = images.FileIdCache(tmp_path / 'files.json')
+    client = LLMClient(provider(gateway.base_url, wire),
+                       file_cache=file_cache)
     client.base_dir = str(tmp_path)
-    client.file_cache = images.FileIdCache(tmp_path / 'files.json')
+    client.file_cache = file_cache
     warnings: list[str] = []
     client.warn = warnings.append
     collect(client, wire, [{'role': 'user', 'content': 'see [image: shot.png]'}])
@@ -289,9 +293,11 @@ def test_a_rejected_file_id_retries_the_request_inline(gateway, wire, tmp_path):
     gateway.responder = ScriptedResponder([Turn(text='seen')])
     (tmp_path / 'shot.png').write_bytes(
         images.encode_png(1, 1, bytes([9, 9, 9, 255])))
-    client = LLMClient(provider(gateway.base_url, wire))
+    file_cache = images.FileIdCache(tmp_path / 'files.json')
+    client = LLMClient(provider(gateway.base_url, wire),
+                       file_cache=file_cache)
     client.base_dir = str(tmp_path)
-    client.file_cache = images.FileIdCache(tmp_path / 'files.json')
+    client.file_cache = file_cache
     warnings: list[str] = []
     client.warn = warnings.append
     gateway.fail_next = 1

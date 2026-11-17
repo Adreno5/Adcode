@@ -49,6 +49,10 @@ def image_file_ids() -> Path:
     return images_dir() / 'files.json'
 
 
+def predictor_file() -> Path:
+    return app_dir() / 'predictor.json'
+
+
 def goals_file() -> Path:
     """The durable goal store."""
     return app_dir() / 'goals.json'
