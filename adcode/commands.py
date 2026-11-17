@@ -40,8 +40,37 @@ def command(name: str, description: str, usage: str = '',
     return decorate
 
 
-# Commands the welcome screen never suggests.
-_TIP_DENYLIST = frozenset({'/quit'})
+# Commands the welcome screen never suggests: they either quit or only make
+# sense inside an archived session.
+_TIP_DENYLIST = frozenset({'/quit', '/exit', '/respawn', '/perish'})
+
+# What an archived session refuses: every command that works on the loaded
+# conversation or on the engine that runs it.  Everything else -- /new,
+# /config, /sessions, /help, /quit, ... -- keeps working, so archiving a
+# session never locks the user out of the application.
+_ARCHIVED_DENIED = frozenset({
+    '/btw',         # runs an aside turn
+    '/compact',     # rewrites the stored history
+    '/edit',        # rewinds and resubmits a message
+    '/effort',      # request shape of this session
+    '/fork',        # copies this conversation into a new session
+    '/goal',        # goals belong to the session and start turns
+    '/hold',        # retries the request of a turn
+    '/image',       # queues an attachment for the next message
+    '/max_tokens',  # request shape of this session
+    '/model',       # re-points this session's engine at another model
+    '/provider',    # the same, through the provider wizard
+    '/rewind',      # rolls the history back
+    '/save',        # writes this conversation under another name
+    '/steps',       # request shape of this session
+    '/thinking',    # request shape of this session
+})
+
+# The footer hint and the refusal: an archived session is read-only, and the
+# user is told how to get out of it.
+ARCHIVED_HINT = 'archived · /respawn restores it, /new starts another'
+ARCHIVED_REFUSAL = ('This session is archived · /respawn restores it, '
+                    '/new starts another, /perish deletes it')
 
 
 def random_tip() -> Command:
@@ -59,6 +88,9 @@ def dispatch(app: Any, text: str) -> None:
     item = find(head)
     if item is None:
         app.notify(f'Unknown command: {head} · type /help', 'warning')
+        return
+    if head in _ARCHIVED_DENIED and getattr(app, 'session_archived', False):
+        app.notify(ARCHIVED_REFUSAL, 'warning')
         return
     try:
         item.handler(app, tail.strip())
@@ -804,6 +836,30 @@ def cmd_skills(app: Any, args: str) -> None:
 @command('/sessions', 'Browse and load saved sessions')
 def cmd_sessions(app: Any, args: str) -> None:
     app.open_sessions_browser()
+
+
+@command('/archive', 'Archive this session: read-only until /respawn')
+def cmd_archive(app: Any, args: str) -> None:
+    app.archive_session()
+
+
+@command('/respawn', 'Restore this archived session')
+def cmd_respawn(app: Any, args: str) -> None:
+    app.respawn_session()
+
+
+@command('/perish', 'Delete this session for good')
+def cmd_perish(app: Any, args: str) -> None:
+    name = app.loop.session_name if app.loop is not None else ''
+    if not name:
+        app.notify('No session to delete.', 'warning')
+        return
+
+    def confirm(result: bool) -> None:
+        if result:
+            app.perish_session()
+
+    app.open_confirm('Delete session', f'Delete **{name}** for good?', confirm)
 
 
 @command('/save', 'Save the current session', usage='/save [name]')

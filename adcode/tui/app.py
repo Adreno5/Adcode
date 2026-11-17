@@ -14,10 +14,12 @@ import queue
 import re
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
 from adcode.agent_loop import AgentLoop, AgentSnapshot
+from adcode.commands import ARCHIVED_HINT, ARCHIVED_REFUSAL
 from adcode.config import AppConfig, ConfigStore, ProviderConfig, ModelConfig
 from adcode.goals import GoalStore
 from adcode.images import (
@@ -29,7 +31,9 @@ from infra.policy.predictor import DurationPredictor
 from adcode.mcp.manager import get_mcp_manager
 from adcode import paths
 from adcode.paths import goals_file, sessions_db
-from adcode.session import DbSessionStore, TranscriptItem
+from adcode.session import (
+    ArchivedSessionStore, TranscriptItem,
+)
 from adcode.skills import SkillRegistry
 from adcode.theme import Palette, build_palette
 from adcode.tools.builtin import shutdown_shell_sessions
@@ -275,7 +279,9 @@ class AdCodeApp:
             input_thread if input_thread is not None
             else InputThread(self.input_queue))
         self.posted: 'queue.Queue[Callable[[], None]]' = queue.Queue()
-        self.session_store = DbSessionStore(db_path=str(sessions_db()))
+        # The store keeps the archived set beside the sessions themselves, so
+        # archiving is a property of the session and not of its messages.
+        self.session_store = ArchivedSessionStore(db_path=str(sessions_db()))
         self.images = ImageStore(os.path.join(self.cwd, 'sessions', 'images'),
                                  self.cwd)
         self.goals = GoalStore(str(goals_file()))
@@ -295,6 +301,10 @@ class AdCodeApp:
         self.config_version = 0
         self.btw_mode = False
         self.exit_armed = False
+        # The loaded session is archived: it is read-only until /respawn.
+        self.session_archived = False
+        # The sessions browser hides archived rows until Alt reveals them.
+        self._sessions_show_archived = False
         self.last_render = 0.0
         self._prompt_cache: tuple[tuple[Any, ...], tuple[list[Line], int, int]] | None = None
         self._snapshot_cache: AgentSnapshot | None = None
@@ -311,6 +321,13 @@ class AdCodeApp:
         self.last_interrupt = 0.0
         self.last_width = 0
         self.last_title = ''
+        # Holding Alt for this long temporarily reveals every detail (full
+        # reasoning, every tool call and result, and error bodies).  Releasing
+        # Alt restores the configured display policy.  A modifier press event
+        # starts the timer; None means Alt is not currently held.
+        self._alt_pressed_at: float | None = None
+        self._alt_details_shown = False
+        self._alt_reveal_seconds = 1.0
         self._last_total = 0
         self._last_viewport = 0
         self._last_max_scroll = 0
@@ -432,6 +449,7 @@ class AdCodeApp:
             f'({len(payload.messages)} messages).', level='info')
         self.follow = True
         self.dirty = True
+        self._sync_archive_state()
 
     # ── shutdown ────────────────────────────────────────────
     def _shutdown(self) -> None:
@@ -557,6 +575,11 @@ class AdCodeApp:
 
     def clear_conversation(self) -> None:
         if self.loop is not None:
+            if self.session_archived:
+                # /new in an archived session starts a session of its own: the
+                # engine would otherwise keep the archived name and save the
+                # fresh conversation back into the read-only row.
+                self.loop.forget_session()
             self.loop.clear()
         self.standalone_items.clear()
         self.transcript.invalidate()
@@ -565,7 +588,85 @@ class AdCodeApp:
         # No notice: the empty pane with the welcome logo is the feedback.
         from adcode.commands import random_tip
         self.welcome_tip = random_tip()
+        self.session_archived = False
         self._update_title()
+
+    # ── archived sessions ───────────────────────────────────
+    def _session_name(self) -> str:
+        """The name the engine saves this conversation under ('' before one)."""
+        return self.loop.session_name if self.loop is not None else ''
+
+    def _sync_archive_state(self) -> bool:
+        """Re-read whether the loaded session is archived."""
+        name = self._session_name()
+        archived = bool(name) and self.session_store.is_archived(name)
+        if archived != self.session_archived:
+            self.session_archived = archived
+            self.dirty = True
+        return archived
+
+    def archive_session(self, name: str | None = None) -> bool:
+        """Archive a session: it leaves the list and takes no new messages."""
+        target = (name if name is not None else self._session_name()).strip()
+        if not target:
+            self.notify('Nothing to archive yet · send a message first.',
+                        'warning')
+            return False
+        if self.session_store.is_archived(target):
+            self.notify(f'Session "{target}" is already archived.', 'info')
+            self._sync_archive_state()
+            return False
+        current = target == self._session_name()
+        if current and self.phase != 'idle':
+            # A running turn would be saved again behind the archive, and the
+            # user would keep watching it write into a read-only session.
+            self.notify('Wait for the turn to finish before archiving it.',
+                        'warning')
+            return False
+        if not self.session_store.archive(target):
+            self.notify(f'Session not found: {target}', 'error')
+            return False
+        if current:
+            self._sync_archive_state()
+            self.status_hint = ARCHIVED_HINT
+        self.notify(f'Archived "{target}" · /respawn restores it, '
+                    '/perish deletes it', 'info')
+        self.dirty = True
+        return True
+
+    def respawn_session(self) -> bool:
+        """Bring the loaded session back out of the archive."""
+        name = self._session_name()
+        if not name or not self.session_store.is_archived(name):
+            self.notify('This session is not archived.', 'info')
+            return False
+        self.session_store.unarchive(name)
+        self._sync_archive_state()
+        self.status_hint = ''
+        self.notify(f'"{name}" is back · messages are accepted again.',
+                    'success')
+        self.dirty = True
+        return True
+
+    def perish_session(self) -> bool:
+        """Delete the loaded session for good."""
+        name = self._session_name()
+        if not name:
+            self.notify('No session to delete.', 'warning')
+            return False
+        if self.phase != 'idle':
+            self.notify('Wait for the turn to finish before deleting it.',
+                        'warning')
+            return False
+        self.session_store.delete(name)
+        if self.loop is not None:
+            # The engine would otherwise name the next message after the
+            # row that was just deleted.
+            self.loop.forget_session()
+        self.clear_conversation()
+        self.notify(f'Deleted "{name}".', 'success')
+        self.dirty = True
+        return True
 
     def load_session(self, name: str) -> None:
         if self.loop is None:
@@ -576,6 +677,7 @@ class AdCodeApp:
             self.follow = True
             self.scroll = 0
             self.dirty = True
+            self._sync_archive_state()
         else:
             self.notify(f'Session not found: {name}', 'error')
 
@@ -878,6 +980,12 @@ class AdCodeApp:
         return max(0.0, time.time() - self.connect_started)
 
     def _needs_animation(self) -> bool:
+        # A held Alt needs a tick so the hold timer can fire while the app is
+        # otherwise idle -- but only until it has fired: after that the timer
+        # has nothing left to do, and a release that never arrives must not
+        # keep the UI repainting at the full frame rate.
+        if self._alt_pressed_at is not None and not self._alt_details_shown:
+            return True
         if self.phase in ('connecting', 'thinking', 'answering', 'tool',
                           'compacting', 'aside'):
             return True
@@ -893,6 +1001,7 @@ class AdCodeApp:
         # The green state leaves on its own; the tick runs every loop, not
         # only when a frame is drawn.
         self._footer_tick(time.time())
+        self._tick_alt_reveal()
         if self._needs_animation():
             self.dirty = True
 
@@ -912,6 +1021,36 @@ class AdCodeApp:
             self.dirty = True
 
     # ── input ───────────────────────────────────────────────
+    def _handle_modifier(self, event: KeyEvent) -> None:
+        """Track a held Alt for the temporary "reveal all details" mode."""
+        if event.key != 'alt':
+            return
+        if event.action == 'press':
+            if self.overlay is not None:
+                # A modal owns Alt while it is open: the sessions browser uses
+                # it to reveal the archived rows instead of starting a hold.
+                self.overlay.handle(event)
+                self.dirty = True
+                return
+            if self._alt_pressed_at is None:
+                self._alt_pressed_at = time.monotonic()
+        elif event.action == 'release':
+            self._alt_pressed_at = None
+            if self._alt_details_shown:
+                self._alt_details_shown = False
+                self.transcript.invalidate()
+                self.dirty = True
+
+    def _tick_alt_reveal(self) -> None:
+        """Promote a long Alt hold into a temporary detail reveal."""
+        pressed = self._alt_pressed_at
+        if pressed is None or self._alt_details_shown:
+            return
+        if time.monotonic() - pressed >= self._alt_reveal_seconds:
+            self._alt_details_shown = True
+            self.transcript.invalidate()
+            self.dirty = True
+
     def _handle_event(self, event: KeyEvent) -> None:
         # One key quits, whatever is on the screen -- unless an overlay is
         # capturing a new binding, where the quit chord is the value typed.
@@ -920,6 +1059,9 @@ class AdCodeApp:
         if event.kind == 'key' and not capturing \
                 and event.key == self.keymap.key_of('quit'):
             self.request_exit()
+            return
+        if event.kind == 'modifier':
+            self._handle_modifier(event)
             return
         if self.overlay is not None:
             # A modal owns every event while it is open.  Keys, pastes and the
@@ -1034,6 +1176,9 @@ class AdCodeApp:
         if action == 'attach_image':
             self.attach_clipboard_image()
             return
+        if action == 'copy_last':
+            self._copy_last_reply()
+            return
         if action == 'cut':
             cut = self.prompt.cut()
             if cut and not set_clipboard(cut):
@@ -1129,6 +1274,13 @@ class AdCodeApp:
         text = self.prompt.text.strip()
         if not text:
             return
+        if self.session_archived and not text.startswith('/'):
+            # Read-only until /respawn: keep the message in the prompt so it is
+            # still there afterwards.  Commands fall through -- the dispatcher
+            # refuses the ones that work on this session and runs the rest.
+            self.status_hint = ARCHIVED_HINT
+            self.dirty = True
+            return
         self.prompt.history.append(self.prompt.text)
         self.prompt.history_index = len(self.prompt.history)
         self.prompt.history_draft = ''
@@ -1142,6 +1294,9 @@ class AdCodeApp:
         from adcode.commands import dispatch
         if text.startswith('/'):
             dispatch(self, text)
+            return
+        if self.session_archived:
+            self.notify(ARCHIVED_REFUSAL, 'warning')
             return
         if self.loop is None:
             self.notify('No provider is configured. Use /provider add.', 'warning')
@@ -1445,6 +1600,31 @@ class AdCodeApp:
         self.dirty = True
         return True
 
+    def _last_reply_text(self) -> str:
+        """The most recent assistant answer as Markdown source.
+
+        A reply still streaming lives only in ``live_answer_text``; once the
+        turn finishes it is committed to ``items`` as an ``assistant`` item.
+        Prefer the committed one so a finished turn is stable, but fall back
+        to the live buffer when the answer is still being written.
+        """
+        for item in reversed(self.items):
+            if item.kind == 'assistant' and getattr(item, 'text', ''):
+                return item.text
+        return self.live_answer_text
+
+    def _copy_last_reply(self) -> None:
+        """Copy the latest assistant reply (Markdown) to the clipboard."""
+        text = self._last_reply_text()
+        if not text.strip():
+            self.status_hint = 'no assistant reply to copy'
+        elif not set_clipboard(text):
+            self.status_hint = 'the clipboard is not available'
+        else:
+            lines = text.count('\n') + 1
+            self.status_hint = f'copied last reply ({lines} lines) as Markdown'
+        self.dirty = True
+
     def _prompt_rows(self, columns: int) -> tuple[list[Line], int, int]:
         """Wrap the input, reusing the previous result when nothing changed.
 
@@ -1461,6 +1641,21 @@ class AdCodeApp:
         self._prompt_cache = (key, layout)
         return layout
 
+    def _reveal_config(self) -> tuple[AppConfig, int]:
+        """A throwaway config that shows every detail, plus its cache key.
+
+        Holding Alt swaps this in for one frame.  It never touches the live
+        ``self.config``, so nothing is persisted and releasing Alt restores the
+        user's policy on the next frame.  The cache version is offset so the
+        renderer's per-item memo cannot mistake it for the normal config.
+        """
+        cfg = self.config
+        thinking = replace(cfg.thinking, mode='full', show_completed=True)
+        tools = replace(cfg.tools, mode='both', chain='separate',
+                        result_mode='full', show_args=True, show_diff=True,
+                        max_result_lines=0)
+        return replace(cfg, thinking=thinking, tools=tools), -1_000_000
+
     def _transcript_lines(self) -> list[Line]:
         width = max(16, self.screen.size().columns - 2)
         live = LiveRender(
@@ -1475,9 +1670,12 @@ class AdCodeApp:
             tool_running=self.phase == 'tool',
             tool_output=self.live_tool_output,
         )
-        return self.transcript.render(self.items, live, width, self.config,
-                                      self.config_version, time.time(),
-                                      self.palette)
+        if self._alt_details_shown:
+            config, version = self._reveal_config()
+        else:
+            config, version = self.config, self.config_version
+        return self.transcript.render(self.items, live, width, config,
+                                      version, time.time(), self.palette)
 
     # ── rendering ───────────────────────────────────────────
     def _viewport_height(self, rows: int) -> int:
@@ -1720,6 +1918,10 @@ class AdCodeApp:
             status = f'{frame} compacting'
         elif phase == 'aside':
             status = f'{frame} aside'
+        elif self.session_archived:
+            # Read-only until /respawn: the line says so instead of offering
+            # a prompt that will refuse the message.
+            status = 'archived'
         else:
             status = 'ready'
         color = {
@@ -1727,6 +1929,8 @@ class AdCodeApp:
             'tool': 'accent', 'compacting': 'info', 'aside': 'accent',
             'idle': 'muted',
         }.get(phase, 'muted')
+        if self.session_archived and phase == 'idle':
+            color = 'warning'
         if done:
             # On the green the font is white.
             color = done_foreground
@@ -1866,6 +2070,11 @@ class AdCodeApp:
         if wipe <= 0 or now - self.footer_state_at >= wipe:
             self.footer_state = 'normal'
             self.footer_state_at = 0.0
+            # The last fading frame still carries a sliver of the green cover.
+            # Leaving the state does not schedule a frame by itself, so without
+            # this the sliver stays on the status line -- over the separator
+            # between the status word and the extras -- until the user types.
+            self.dirty = True
 
     def _footer_done_cover(self, columns: int, now: float) -> int:
         """How many columns of the status line the green covers."""
@@ -2163,20 +2372,50 @@ class AdCodeApp:
                                            self.config_changed))
 
     def open_sessions_browser(self) -> None:
-        """Browse and load saved sessions (ctrl+h, /sessions)."""
-        rows = self.session_store.list()
-        if not rows:
-            self.notify('No saved sessions.', 'info')
-            return
+        """Browse, load and archive saved sessions (ctrl+h, /sessions).
+
+        Enter loads, Delete archives the highlighted session and Alt shows the
+        archived ones (dimmed) so they can be found again.
+        """
+        # Every visit starts with the list the user expects: live sessions.
+        self._sessions_show_archived = False
+
+        def items() -> list[DialogItem]:
+            rows = self.session_store.list(
+                include_archived=self._sessions_show_archived)
+            return [self._session_item(row) for row in rows]
 
         def choose(name: Any) -> None:
             self.load_session(str(name))
-        self.open_select(
-            'Sessions',
-            [DialogItem(row['name'], row['title'] or row['name'],
-                        f'{row["updated"]} · {row["messages"]} messages')
-             for row in rows],
-            choose, width=86)
+
+        def archive(name: Any) -> list[DialogItem] | None:
+            self.archive_session(str(name))
+            return items()
+
+        def reveal() -> list[DialogItem] | None:
+            self._sessions_show_archived = not self._sessions_show_archived
+            return items()
+
+        listing = items()
+        if not listing and not self.session_store.list(include_archived=True):
+            self.notify('No saved sessions.', 'info')
+            return
+        # An empty list still opens: everything may be archived, and Alt is
+        # how those sessions are found again.
+        self.open_overlay(SelectDialog(
+            'Sessions', listing, choose, width=86,
+            on_delete=archive, on_alt=reveal,
+            footer='↑↓ move · enter load · del archive · alt archived '
+                   '· esc close'))
+
+    @staticmethod
+    def _session_item(row: dict[str, Any]) -> DialogItem:
+        archived = bool(row.get('archived'))
+        description = f'{row["updated"]} · {row["messages"]} messages'
+        if archived:
+            description += ' · archived'
+        return DialogItem(str(row['name']), row['title'] or row['name'],
+                          description, dim=archived)
 
     def open_message(self, title: str, message: str) -> None:
         self.open_overlay(MessageDialog(title, message))

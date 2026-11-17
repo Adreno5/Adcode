@@ -549,6 +549,21 @@ class AgentLoop:
 
         self._sync_call(reset)
 
+    def forget_session(self) -> None:
+        """Drop the session identity after its row was deleted.
+
+        The engine names a session on its first save and keeps that name; a
+        deleted session must not be resurrected by the next message under the
+        old name.
+        """
+        self._require_idle('session delete')
+
+        def reset() -> None:
+            self._engine.session_name = ''
+            self._engine.session_title = ''
+
+        self._sync_call(reset)
+
     def rewind(self, turn: int) -> str:
         self._require_idle('rewind')
         return self._sync_call(lambda: self._engine.rewind(turn))

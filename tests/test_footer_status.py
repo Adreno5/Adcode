@@ -80,6 +80,37 @@ def test_the_green_stays_until_the_user_types(app):
     assert app.footer_state == 'normal'
 
 
+def test_the_fade_leaves_no_green_behind(app):
+    """The last fading frame still carries a sliver of the cover.
+
+    Leaving the state does not schedule a frame by itself, so without an
+    explicit request that sliver stays on the status line -- over the
+    separator between the status word and the extras -- until the user types.
+    """
+    app.config.footer.done_wipe = 0.4
+    app._apply_event('turn_end', {'turn': 1, 'status': 'done'})
+    app._footer_input()
+    assert app.footer_state == 'fading'
+
+    # A frame taken in the middle of the fade keeps a piece of the green.
+    app.footer_state_at = time.time() - 0.39
+    app.canvas.resize(60, 10)
+    app.canvas.clear()
+    app._draw_footer(60, 9, 0)
+    assert green_columns(app, 60, 9)
+
+    # The fade is over: the frame after it has to be drawn again.
+    app.dirty = False
+    app.footer_state_at = time.time() - 1.0
+    app._tick_animation()
+    assert app.footer_state == 'normal'
+    assert app.dirty is True
+
+    app.canvas.clear()
+    app._draw_footer(60, 9, 0)
+    assert green_columns(app, 60, 9) == []
+
+
 def test_the_font_is_white_on_the_green(app):
     app._apply_event('turn_end', {'turn': 1, 'status': 'done'})
     assert tuple(app._footer_color('muted')) == (255, 255, 255)

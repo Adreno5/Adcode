@@ -100,3 +100,85 @@ def test_shift_aliases_keep_selection_behind_a_rebind(app):
     app.prompt.cursor = len(app.prompt.text)
     app._handle_event(KeyEvent(kind='key', key='shift+left', shift=True))
     assert app.prompt.anchor is not None
+
+
+def test_alt_c_copies_latest_assistant_reply(app, monkeypatch):
+    from adcode.tui import app as app_module
+    from adcode.session import TranscriptItem
+
+    copied = {}
+    monkeypatch.setattr(app_module, 'set_clipboard',
+                        lambda text: copied.setdefault('text', text) or True)
+    app.standalone_items[:] = [
+        TranscriptItem(kind='assistant', turn=1, text='# first\nold'),
+        TranscriptItem(kind='tool', turn=2, text='a tool call'),
+        TranscriptItem(kind='assistant', turn=2, text='# latest\n**markdown**'),
+    ]
+    app._handle_event(key('alt+c'))
+    assert copied['text'] == '# latest\n**markdown**'
+    assert 'copied last reply' in app.status_hint
+
+
+def test_alt_c_uses_live_answer_when_no_committed_reply(app, monkeypatch):
+    from adcode.tui import app as app_module
+
+    copied = {}
+    monkeypatch.setattr(app_module, 'set_clipboard',
+                        lambda text: copied.setdefault('text', text) or True)
+    app.standalone_items[:] = []
+    app.live_answer_text = 'streaming **answer**'
+    app._handle_event(key('alt+c'))
+    assert copied['text'] == 'streaming **answer**'
+
+
+def modifier(name, action):
+    return KeyEvent(kind='modifier', key=name, action=action)
+
+
+def test_holding_alt_reveals_details_and_release_restores(app, monkeypatch):
+    config_before = app.config
+    # A normal, non-revealing render uses the live config object.
+    app._handle_event(modifier('alt', 'press'))
+    assert app._alt_pressed_at is not None
+    assert app._alt_details_shown is False
+
+    # Move the press into the past so the hold threshold is crossed.
+    app._alt_pressed_at -= app._alt_reveal_seconds + 0.1
+    app._tick_alt_reveal()
+    assert app._alt_details_shown is True
+
+    reveal_cfg, version = app._reveal_config()
+    assert reveal_cfg is not config_before
+    assert reveal_cfg.thinking.mode == 'full'
+    assert reveal_cfg.thinking.show_completed is True
+    assert reveal_cfg.tools.mode == 'both'
+    assert reveal_cfg.tools.chain == 'separate'
+    assert reveal_cfg.tools.result_mode == 'full'
+    # The live config is untouched, so nothing is persisted.
+    assert config_before.thinking.mode == app.config.thinking.mode
+
+    app._handle_event(modifier('alt', 'release'))
+    assert app._alt_pressed_at is None
+    assert app._alt_details_shown is False
+
+
+def test_reveal_config_renders_the_transcript(app):
+    from adcode.session import TranscriptItem
+
+    app.standalone_items[:] = [
+        TranscriptItem(kind='assistant', turn=1, text='hello there'),
+    ]
+    app._alt_details_shown = True
+    # Rendering with the swapped-in config must work: it is a throwaway
+    # dataclass replacement, not a mutated live config.
+    lines = app._transcript_lines()
+    assert any('hello there' in ''.join(span.text for span in line)
+               for line in lines)
+    app._alt_details_shown = False
+    assert app._transcript_lines()
+
+
+def test_quick_alt_tap_does_not_reveal(app):
+    app._handle_event(modifier('alt', 'press'))
+    app._tick_alt_reveal()
+    assert app._alt_details_shown is False

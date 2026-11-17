@@ -113,7 +113,12 @@ class TerminalScreen:
             '\x1b[?2004h'       # bracketed paste
             '\x1b[?1000h'       # basic mouse reporting
             '\x1b[?1006h'       # SGR extended mouse coordinates
-            '\x1b[>1u'          # kitty keyboard protocol: disambiguate codes
+            # kitty keyboard protocol flags: 1 disambiguate codes, 2 report
+            # event types (press/repeat/release), 8 report every key as an
+            # escape code -- the only way to see the modifier keys themselves,
+            # i.e. whether Alt is being held -- and 16 report the text a key
+            # produced, which flag 8 otherwise takes away.
+            '\x1b[>27u'
             '\x1b[2J\x1b[H'
         )
 

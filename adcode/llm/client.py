@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import threading
 from typing import Any, AsyncGenerator, Callable, Generator
 
 from infra.net import build_async_http_client, build_http_client
@@ -34,6 +36,7 @@ from harness.images import (
     iter_segments, resolve_image,
 )
 
+from adcode import paths
 from adcode.config import ModelConfig, ProviderConfig
 
 
@@ -50,6 +53,92 @@ def asyncio_run(coroutine: Any) -> Any:
 
 import anthropic
 import openai
+
+
+# -- half-implemented Responses endpoints ---------------------
+# The Responses wire is new enough that compatible gateways often implement it
+# by translating a chat completion into events, and plenty of them skip the
+# response.content_part.added event.  The openai SDK's typed stream needs that
+# event: on the first response.output_text.delta it indexes the accumulated
+# message content, so a missing part turns the first token into an IndexError
+# raised from the SDK's own state machine.  The chat wire has no such
+# requirement, so an endpoint that trips over this is switched to it instead of
+# failing the turn forever.
+
+# The overrides live next to the other state in ~/.adcode, keyed by the endpoint
+# and the wire that failed, so a restart does not have to fail a turn to find
+# out that the same gateway is still broken -- and so a provider the user moves
+# to another wire is not held to an old lesson.
+_WIRE_CACHE_LOCK = threading.RLock()
+_wire_cache: dict[str, dict[str, str]] | None = None
+
+
+def _load_wire_cache() -> dict[str, dict[str, str]]:
+    global _wire_cache
+    with _WIRE_CACHE_LOCK:
+        if _wire_cache is None:
+            overrides: dict[str, dict[str, str]] = {}
+            try:
+                raw = json.loads(paths.wire_cache_file().read_text('utf-8'))
+            except (OSError, ValueError):
+                raw = {}
+            if isinstance(raw, dict):
+                for scope, mapping in raw.items():
+                    if not isinstance(mapping, dict):
+                        continue
+                    known = {str(broken): str(working)
+                             for broken, working in mapping.items()
+                             if isinstance(working, str) and working}
+                    if known:
+                        overrides[str(scope)] = known
+            _wire_cache = overrides
+        return {scope: dict(mapping) for scope, mapping in _wire_cache.items()}
+
+
+def learned_wire(scope: str, wire: str) -> str:
+    """The wire this endpoint needs instead of the one that was configured."""
+    return _load_wire_cache().get(scope, {}).get(wire, '')
+
+
+def remember_wire(scope: str, broken: str, working: str) -> None:
+    """Record that an endpoint cannot stream one wire and works on another."""
+    global _wire_cache
+    with _WIRE_CACHE_LOCK:
+        overrides = _load_wire_cache()
+        if overrides.get(scope, {}).get(broken) == working:
+            return
+        overrides.setdefault(scope, {})[broken] = working
+        _wire_cache = overrides
+        target = paths.wire_cache_file()
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_suffix('.tmp')
+            temporary.write_text(json.dumps(overrides, indent=2), 'utf-8')
+            os.replace(temporary, target)
+        except OSError:
+            pass      # learned for this process; the file is a shortcut only
+
+
+_SEQUENCE_ERRORS = (IndexError, AssertionError, RuntimeError)
+
+
+def is_responses_sequence_error(error: BaseException) -> bool:
+    """True when the SDK's Responses state machine rejected the event stream.
+
+    A shape error raised inside that module means the provider sent an event
+    sequence the protocol does not allow -- never a network or provider
+    failure -- so the caller can retry the same request on a wire that does not
+    care about the sequence.
+    """
+    if not isinstance(error, _SEQUENCE_ERRORS):
+        return False
+    traceback = error.__traceback__
+    while traceback is not None:
+        filename = traceback.tb_frame.f_code.co_filename.replace('\\', '/')
+        if '/openai/lib/streaming/responses/' in filename:
+            return True
+        traceback = traceback.tb_next
+    return False
 
 
 def _image_parts(text: Any, *, base_dir: str = '', wire: str = 'chat',
@@ -155,6 +244,15 @@ class LLMClient:
         # uploader owns the upload-once / inline-fallback trade-off.  ``sdk``
         # is a test seam: inject a fake raw client before the uploader exists.
         self._sdk = sdk if sdk is not None else self._client._client
+        # A wire this endpoint was learned to need wins over the configured one:
+        # the gateway cannot stream the configured protocol, so asking again
+        # only burns a turn.
+        learned = learned_wire(self._file_scope(), self.wire)
+        if learned:
+            self.wire = learned
+            if str(getattr(self._client, 'protocol', '')) == 'responses' \
+                    and 'responses' not in learned:
+                self._client.protocol = 'chat'
         self._files = FilesUploader(
             self._sdk, file_cache, self._file_scope(),
             api='anthropic' if self.wire == 'anthropic messages' else 'openai',
@@ -291,7 +389,9 @@ class LLMClient:
 
         A provider that refuses a Files API reference (400/403/404/422)
         triggers exactly one inline rebuild, before anything reached the
-        caller.
+        caller.  An endpoint whose Responses stream breaks the protocol's
+        event sequence is switched to chat completions the same way: the
+        request is replayed there when nothing had been streamed yet.
 
         The stream also stops at the next chunk when the turn was
         interrupted, so an interrupt is not stuck behind a slow or endless
@@ -299,8 +399,10 @@ class LLMClient:
         """
         prepared = self._prepared(messages)
         kwargs = self._with_provider_extras(kwargs)
+        produced = False
         try:
             async for event in self._client.stream(prepared, tools, **kwargs):
+                produced = True
                 yield event
                 if self._interrupted():
                     # The user stopped the turn: stop the stream too.
@@ -315,6 +417,22 @@ class LLMClient:
                 yield event
                 if self._interrupted():
                     return
+            return
+        except Exception as error:      # noqa: BLE001 - see _degrade_wire
+            if not self._degrade_wire(error):
+                raise
+            if produced:
+                # Text already reached the caller, so replaying the request
+                # here would duplicate it; the next one uses the working wire.
+                raise
+        # The endpoint cannot stream the Responses protocol and nothing above
+        # reached the caller, so send the same request again as chat
+        # completions.
+        prepared = self._prepared(messages)
+        async for event in self._client.stream(prepared, tools, **kwargs):
+            yield event
+            if self._interrupted():
+                return
 
     def _interrupted(self) -> bool:
         """True when the user asked to stop."""
@@ -338,6 +456,27 @@ class LLMClient:
         if self.wire == 'openai responses':
             return 'responses'
         return 'chat'
+
+    def _degrade_wire(self, error: BaseException) -> bool:
+        """Switch this endpoint to chat completions after a broken stream.
+
+        The switch is remembered per endpoint, so the next client -- in this
+        process or the next one -- starts on the wire that actually works
+        instead of failing a turn to learn the same thing again.
+        """
+        if self._wire_kind() != 'responses':
+            return False
+        if not is_responses_sequence_error(error):
+            return False
+        failed = self.wire
+        if str(getattr(self._client, 'protocol', '')) == 'responses':
+            self._client.protocol = 'chat'
+        self.wire = 'openai chat completions'
+        remember_wire(self._file_scope(), failed, self.wire)
+        self._note(f'{self.name}: this endpoint ends the Responses stream '
+                   'without the event sequence the protocol requires, so '
+                   'AdCode switched it to chat completions')
+        return True
 
     def _prepared(self, messages: list[Any]) -> list[Any]:
         """Expand image markers and normalize the message shapes.

@@ -14,6 +14,7 @@ dependencies = [
     { name = "keyring" },
     { name = "openai" },
     { name = "pyperclip" },
+    { name = "pyyaml" },
 ]
 
 [package.dev-dependencies]
@@ -23,13 +24,14 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aicf-core", specifier = ">=0.5.1" },
+    { name = "aicf-core", specifier = ">=0.6.0" },
     { name = "anthropic", specifier = ">=0.116.0" },
     { name = "cryptography", specifier = ">=44.0.0" },
     { name = "httpx2", extras = ["socks"], specifier = ">=2.16.0" },
     { name = "keyring", specifier = ">=25.7.0" },
     { name = "openai", specifier = ">=2.45.0" },
     { name = "pyperclip", specifier = ">=1.11.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -37,7 +39,7 @@ dev = [{ name = "pytest", specifier = ">=8.0" }]
 
 [[package]]
 name = "aicf-core"
-version = "0.5.1"
+version = "0.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "openai" },
@@ -45,9 +47,9 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/da/62/2d504fee0a975da09865dfbc3095f7c6d0bb2008759844840028c201fb16/aicf_core-0.5.1.tar.gz", hash = "sha256:968281800ce403dbb78f8776ac9fee93de31a8145590f4edc0e3a6402ad7a8f9", size = 746068, upload-time = "2026-11-15T23:23:51.384Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/48/b5/fbecd70ebf86c61a7ea0f7664530fcd7a7dbdad1788020a2e36549d5e924/aicf_core-0.6.0.tar.gz", hash = "sha256:7888ccd1b241901a99cf04e4795c2b58c7994808882fe2c283d20592b7480490", size = 777069, upload-time = "2026-11-17T02:23:30.184Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/55/ac/ae87f3c8bc2a092a2475a4e3f4efdcb650e36c3bccc66cd15991411c91ae/aicf_core-0.5.1-py3-none-any.whl", hash = "sha256:23ec5a34196c08e11dd49c2ae45450cc3f9833cab8b8dd0eae27ef3260bf5e25", size = 520579, upload-time = "2026-11-15T23:23:49.448Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/1c/ac403643a190c93dbe2de4e1605dfbeff94ea148f7bbbb7bf77f9f2e95d6/aicf_core-0.6.0-py3-none-any.whl", hash = "sha256:29d21eac064d43479139d0e4b75bfac9f36736a21c95409f5093c182d59db055", size = 529621, upload-time = "2026-11-17T02:23:28.285Z" },
 ]
 
 [[package]]

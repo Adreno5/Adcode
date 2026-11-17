@@ -74,6 +74,9 @@ BINDINGS: tuple[Binding, ...] = (
     Binding('attach_image', 'Attach clipboard image',
             'attach the clipboard image to the message', 'alt+v',
             group='Clipboard'),
+    Binding('copy_last', 'Copy last reply',
+            'copy the latest assistant reply as Markdown', 'alt+c',
+            group='Clipboard'),
     Binding('cut', 'Cut', 'cut the selected input text', 'ctrl+x',
             group='Clipboard'),
     # ── editing ─────────────────────────────────────────────
