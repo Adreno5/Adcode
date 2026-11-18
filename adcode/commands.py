@@ -543,8 +543,10 @@ def cmd_goal(app: Any, args: str) -> None:
 
 # ── sub-agents ─────────────────────────────────────────────
 
-@command('/agents', 'Inspect and configure sub-agents', subcommands=[
-    ('list', 'Show the agent tree'), ('max', 'Set the concurrent limit'),
+@command('/agents', 'Inspect and configure sub-agents', usage='/agents [sub]',
+         subcommands=[
+    ('list', 'Show the agent tree'), ('show', 'Read one agent\'s output'),
+    ('max', 'Set the concurrent limit'),
     ('depth', 'Set the delegation depth'), ('wait', 'Wait for agent activity'),
     ('interrupt', 'Interrupt an agent'), ('types', 'List agent types'),
     ('teams', 'List agent teams'),
@@ -566,17 +568,27 @@ def cmd_agents(app: Any, args: str) -> None:
         app.notify('No provider configured.', 'warning')
         return
     manager = app.loop.agents
-    if sub == 'list':
+    if sub in ('list', 'show'):
+        if sub == 'show' and len(parts) > 1:
+            app.open_agent_output(parts[1])
+            return
+        if sub == 'show':
+            app.open_agents_browser()
+            return
         rows = manager.list_agents()
         if not rows:
             app.notify('No agents running.', 'info')
             return
         lines = []
         for row in rows:
-            status = row.get('agent_status')
-            if isinstance(status, dict):
-                status = next(iter(status))
-            lines.append(f'{row["agent_name"]}  ({row.get("agent_type", "")})  {status}')
+            # the sdk reports name/parent/status, plus the outcome once done
+            outcome = row.get('completed') or row.get('errored') or ''
+            outcome = ' '.join(str(outcome).split())
+            if len(outcome) > 100:
+                outcome = outcome[:100] + '…'
+            line = (f'{row.get("name", "?")}  ({row.get("parent") or "-"})  '
+                    f'{row.get("status", "")}')
+            lines.append(f'{line}  {outcome}'.rstrip())
         app.open_message('Agents', '\n'.join(lines))
         return
     if sub in ('max', 'depth', 'wait'):
@@ -599,8 +611,14 @@ def cmd_agents(app: Any, args: str) -> None:
             app.config.agents.wait_timeout_ms = max(0, min(3_600_000, value))
 
             def wait() -> None:
-                result = manager.wait_for_activity(app.config.agents.wait_timeout_ms)
-                app.post(lambda: app.notify(str(result), 'info'))
+                result = app.loop.wait_for_agent_activity(
+                    app.config.agents.wait_timeout_ms)
+                if result.get('timed_out'):
+                    text = 'No agent activity before the timeout.'
+                else:
+                    names = ', '.join(result.get('updated_agents') or [])
+                    text = f'Agent activity: {names}' if names else 'Agent activity.'
+                app.post(lambda: app.notify(text, 'info'))
 
             app.notify('Waiting for agent activity…', 'info')
             threading.Thread(target=wait, name='adcode-agent-wait', daemon=True).start()
@@ -617,9 +635,9 @@ def cmd_agents(app: Any, args: str) -> None:
                 app.notify(str(error), 'error')
             return
         rows = [row for row in manager.list_agents()
-                if row['agent_name'] != 'root']
-        items = [DialogItem(row['agent_name'], row['agent_name'],
-                            str(row.get('agent_status'))) for row in rows]
+                if row.get('name') != 'root']
+        items = [DialogItem(row['name'], row['name'], str(row.get('status', '')))
+                 for row in rows]
         if not items:
             app.notify('No agents to interrupt.', 'info')
             return

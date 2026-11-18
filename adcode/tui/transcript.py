@@ -92,7 +92,11 @@ def tool_result_brief(name: str, output: str) -> str:
     transcript only pushes the conversation away.  Any other tool returns ''
     and keeps its normal rendering.
     """
-    if name != 'todo' or not output.lstrip().startswith('{'):
+    if not output.lstrip().startswith(('{', '[')):
+        return ''
+    if name == 'spawn_agent':
+        return _spawn_brief(output)
+    if name != 'todo':
         return ''
     try:
         view = json.loads(output)
@@ -111,6 +115,21 @@ def tool_result_brief(name: str, output: str) -> str:
     if current and status != 'completed':
         parts.append(f'now {current}')
     return '  ·  '.join(parts)
+
+
+def _spawn_brief(output: str) -> str:
+    """``spawn_agent`` answers with a receipt; the panel shows the agent itself."""
+    try:
+        receipt = json.loads(output)
+    except ValueError:
+        return ''
+    if not isinstance(receipt, dict) or not receipt.get('agent'):
+        return ''
+    parts = [str(receipt['agent']), str(receipt.get('status') or '')]
+    depth = receipt.get('depth')
+    if isinstance(depth, int) and depth:
+        parts.append(f'depth {depth}')
+    return '  ·  '.join(part for part in parts if part)
 
 
 def _thinking_suffix(config: ThinkingDisplay, now: float) -> str:

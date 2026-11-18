@@ -564,6 +564,7 @@ class KeysSettings:
     palette: str = 'ctrl+p'
     config: str = 'ctrl+,'
     sessions: str = 'ctrl+h'
+    agents: str = 'ctrl+g'
     exit_chord: str = 'ctrl+c'
     exit_eof: str = 'ctrl+d'
     redraw: str = 'ctrl+l'

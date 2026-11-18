@@ -54,7 +54,7 @@ from adcode.tui.text import (
     Line, Span, add_span, line_text_between, line_width, plain_text,
     split_line_columns,
 )
-from adcode.tui import todo_panel
+from adcode.tui import agents_panel, todo_panel
 from adcode.tui.transcript import LiveRender, TranscriptRenderer
 
 SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
@@ -294,6 +294,11 @@ class AdCodeApp:
         # tells the frame whether anything changed since the last paint.
         self._todo_store = None
         self._todo_revision: int | None = None
+        # what each sub-agent is doing right now, from its 'agent_event's
+        self.agent_steps: dict[str, str] = {}
+        # the second currently painted in the strip's elapsed column; the
+        # panel ticks once per second even while the root agent is idle
+        self._agent_clock: int | None = None
         self.standalone_items: list[TranscriptItem] = []
         self.transcript = TranscriptRenderer()
         self.prompt = PromptState()
@@ -751,6 +756,7 @@ class AdCodeApp:
                     self.loop.pump_agent_events()
                     self._apply_loop_events()
                 self._sync_todo()
+                self._sync_agent_clock()
                 self._dispatch_input(event)
                 self._check_resize()
                 self._tick_animation()
@@ -953,6 +959,19 @@ class AdCodeApp:
             self._update_title()
         elif kind == 'agents_refresh':
             self.dirty = True
+        elif kind == 'agent_event':
+            name = str(payload.get('agent') or '')
+            status = str(payload.get('status') or '')
+            content = str(payload.get('content') or '')
+            if name:
+                if status == 'tool':
+                    self.agent_steps[name] = content
+                elif status in ('completed', 'interrupted', 'errored',
+                                'shutdown'):
+                    self.agent_steps.pop(name, None)
+                elif status in ('tool_result', 'tool_output') and content:
+                    self.agent_steps[name] = content.strip().splitlines()[-1][:80]
+                self.dirty = True
         elif kind == 'model_changed':
             self.dirty = True
         self.dirty = True
@@ -1150,6 +1169,9 @@ class AdCodeApp:
             return
         if action == 'sessions':
             self.open_sessions_browser()
+            return
+        if action == 'agents':
+            self.open_agents_browser()
             return
         if action == 'exit_chord':
             if self._copy_selection():
@@ -1708,6 +1730,49 @@ class AdCodeApp:
             self._todo_revision = store.revision
             self.dirty = True
 
+    def _sync_agent_clock(self) -> None:
+        """Repaint the strip once a second so its elapsed column keeps up.
+
+        A running child is not otherwise a reason to paint: when the root is
+        idle no events arrive, and the panel would freeze at ``0s`` until
+        something else marked the frame dirty.
+        """
+        loop = self.loop
+        if loop is None:
+            return
+        try:
+            rows = loop.agent_view()
+        except Exception:      # noqa: BLE001 - never break the loop
+            return
+        elapsed = [float(row.get('elapsed') or 0.0) for row in rows
+                   if row.get('status') in agents_panel.ACTIVE
+                   and row.get('name') != 'root']
+        if not elapsed:
+            self._agent_clock = None
+            return
+        tick = int(max(elapsed))
+        if tick != self._agent_clock:
+            self._agent_clock = tick
+            self.dirty = True
+
+    def _agents_lines(self, columns: int) -> list:
+        """The sub-agent strip; empty when nothing is running."""
+        loop = self.loop
+        if loop is None:
+            return []
+        try:
+            rows = loop.agent_view()
+        except Exception:      # noqa: BLE001 - a panel must never break a frame
+            return []
+        if not any(row.get('status') in agents_panel.ACTIVE
+                   and row.get('name') != 'root' for row in rows):
+            return []
+        for row in rows:
+            step = self.agent_steps.get(str(row.get('name') or ''))
+            if step:
+                row['step'] = step
+        return agents_panel.panel_lines(rows, columns)
+
     def _todo_lines(self, columns: int) -> list:
         """The panel rows, or none while the completion list owns that space."""
         if self._completion_visible():
@@ -1761,14 +1826,20 @@ class AdCodeApp:
         prompt_h = max(1, len(visible_prompt))
         footer_y = rows - 1
         prompt_top = footer_y - prompt_h
+        agents_lines = self._agents_lines(columns)
         todo_lines = self._todo_lines(columns)
-        # The list sits above the prompt, and never takes more than a third of
-        # the space above it: the conversation keeps the rest.
+        # Two strips live between the transcript and the prompt.  Each is capped
+        # on its own and together they stay inside the space above the prompt,
+        # so the conversation always keeps the majority of the screen.
         room = max(0, prompt_top - header_h - 2)
-        limit = min(todo_panel.MAX_ROWS, room // 3)
-        todo_lines = todo_lines[:limit] if limit else []
+        agents_limit = min(agents_panel.MAX_ROWS, room // 4)
+        agents_lines = agents_lines[:agents_limit] if agents_limit else []
+        left = max(0, room - len(agents_lines))
+        todo_limit = min(todo_panel.MAX_ROWS, left // 3)
+        todo_lines = todo_lines[:todo_limit] if todo_limit else []
         todo_top = prompt_top - len(todo_lines)
-        separator_y = todo_top - 1
+        agents_top = todo_top - len(agents_lines)
+        separator_y = agents_top - 1
         transcript_top = header_h
         viewport_h = max(1, separator_y - transcript_top)
         lines = self._transcript_lines()
@@ -1804,6 +1875,8 @@ class AdCodeApp:
             self._draw_scrollbar(columns, transcript_top, viewport_h, total,
                                  start)
         self.canvas.hline(0, separator_y, columns, self.palette.border, alpha=110)
+        for index, line in enumerate(agents_lines):
+            self._draw_line(0, agents_top + index, line, columns)
         for index, line in enumerate(todo_lines):
             self._draw_line(0, todo_top + index, line, columns)
         for index, line in enumerate(visible_prompt):
@@ -2014,9 +2087,11 @@ class AdCodeApp:
             extras.append('aside question mode')
         if self.exit_armed:
             extras.append('ctrl+c again to exit')
-        agents = [row for row in (snap.agents or []) if row.get('status') not in
+        agents = [row for row in (snap.agents or [])
+                  if row.get('status') not in
                   ('completed', 'errored', 'interrupted', 'shutdown', None)
-                  and not (isinstance(row.get('status'), dict))]
+                  and not (isinstance(row.get('status'), dict))
+                  and row.get('name') != 'root']
         if agents and self.config.agents.show_activity:
             extras.append(f'{len(agents)} agent{"s" if len(agents) > 1 else ""}')
         if self.config.tools.chain == 'merged':
@@ -2466,6 +2541,41 @@ class AdCodeApp:
             description += ' · archived'
         return DialogItem(str(row['name']), row['title'] or row['name'],
                           description, dim=archived)
+
+    # ── sub-agents: browse and read their output ────────────
+    def open_agents_browser(self) -> None:
+        """Pick one of the session's sub-agents."""
+        loop = self.loop
+        if loop is None or loop.agents is None:
+            self.notify('Sub-agents are disabled in this session.', 'info')
+            return
+        # the root's own work is the transcript; the browser is for children
+        rows = [row for row in loop.agent_view() if row.get('name') != 'root']
+        if not rows:
+            self.notify('No sub-agents in this session yet.', 'info')
+            return
+        items = []
+        for row in rows:
+            elapsed = agents_panel.format_elapsed(row.get('elapsed'))
+            status = agents_panel.WORDS.get(str(row.get('status') or ''),
+                                            str(row.get('status') or ''))
+            detail = ' '.join(part for part in (status, elapsed) if part)
+            items.append(DialogItem(row['name'], str(row['name']), detail,
+                                    dim=not row.get('status') in agents_panel.ACTIVE))
+        self.open_select('Agents', items, self.open_agent_output, width=64)
+
+    def open_agent_output(self, name: Any) -> None:
+        """The full streamed output of one sub-agent, scrollable."""
+        text = ''
+        if self.loop is not None:
+            text = self.loop.agent_output(str(name))
+        title = f'Agent · {name}'
+        body = text or '(no output yet)'
+        # Opened from the browser (ctrl+g), the dialog that fired this callback
+        # still owns the key event that selected the row: deferring by one
+        # iteration keeps the ENTER that picked the agent from also closing the
+        # view it just opened.
+        self.post(lambda: self.open_message(title, body))
 
     def open_message(self, title: str, message: str) -> None:
         self.open_overlay(MessageDialog(title, message))

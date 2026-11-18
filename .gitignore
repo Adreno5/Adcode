@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .pi/
+.dsh-tool-vision/
 .zcode/
 sessions/
 config.json

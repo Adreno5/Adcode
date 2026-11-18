@@ -596,6 +596,10 @@ class AgentLoop:
                         'compaction_delta': 'compacting'}[event.kind]
                 live = self.agent_live.setdefault(
                     name, {'mode': mode, 'text': ''})
+                if live['mode'] != mode and live['text']:
+                    # thinking and the answer are different voices; without a
+                    # break the panel's tail shows them glued together
+                    live['text'] += '\n'
                 live['mode'] = mode
                 live['text'] = (live['text'] + event.content)[-4_000:]
                 dirty = True
@@ -631,8 +635,74 @@ class AgentLoop:
         if dirty:
             self._emit('agents_refresh')
 
+    # ── the panel's view of the children ────────────────────
+    def agent_view(self) -> list[dict[str, Any]]:
+        """Rows for the sub-agent panel: manager state plus the live text.
+
+        ``agent_live`` is filled by :meth:`pump_agent_events`, which the UI
+        thread calls, so the merge here needs no locking.
+        """
+        manager = self.agents
+        if manager is None:
+            return []
+        rows = manager.agent_rows()
+        for row in rows:
+            live = self.agent_live.get(row['name']) or {}
+            row['mode'] = live.get('mode', '')
+            row['tail'] = _tail_line(live.get('text') or '')
+        return rows
+
+    def wait_for_agent_activity(self, timeout_ms: int = 0) -> dict[str, Any]:
+        """Block until a sub-agent reports activity, or the timeout passes.
+
+        ``wait_for_activity`` is a coroutine that belongs to the manager's
+        loop: calling it from a worker thread only hands back a coroutine
+        nobody awaits, so it is submitted to the loop instead.
+        """
+        manager = self.agents
+        loop = self._loop
+        if manager is None or loop is None or loop.is_closed():
+            return {'timed_out': True, 'updated_agents': []}
+        future = asyncio.run_coroutine_threadsafe(
+            manager.wait_for_activity(timeout_ms), loop)
+        try:
+            return future.result(timeout=max(5.0, timeout_ms / 1000 + 5))
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            return {'timed_out': True, 'updated_agents': []}
+
+    def agent_output(self, name: str) -> str:
+        """Everything an agent has produced, for the output viewer.
+
+        Prefers the streamed text the pump keeps; falls back to the finished
+        record so a completed agent can still be inspected.
+        """
+        live = self.agent_live.get(name) or {}
+        text = str(live.get('text') or '').strip()
+        if text:
+            return text
+        manager = self.agents
+        if manager is None:
+            return ''
+        try:
+            record = manager.records().get(name)
+        except RuntimeError:
+            return ''
+        if record is None:
+            return ''
+        return str(record.error or record.final_message or '').strip()
+
     def _emit(self, kind: str, **payload: Any) -> None:
         self._sink.emit(kind, payload)
+
+
+def _tail_line(text: str, limit: int = 96) -> str:
+    """The last non-empty line of a stream, trimmed for a panel row."""
+    for line in reversed(str(text or '').splitlines()):
+        line = line.strip()
+        if line:
+            return line[:limit] + ('…' if len(line) > limit else '')
+    return ''
 
 
 def _tool_brief(args: dict[str, Any]) -> str:

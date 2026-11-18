@@ -60,6 +60,8 @@ BINDINGS: tuple[Binding, ...] = (
             'ctrl+,'),
     Binding('sessions', 'Sessions', 'browse and load saved sessions',
             'ctrl+h'),
+    Binding('agents', 'Agents', 'pick a sub-agent and read its output',
+            'ctrl+g'),
     Binding('exit_chord', 'Copy, clear or exit',
             'copy selection, clear the input, or press twice to exit',
             'ctrl+c'),

@@ -11,10 +11,12 @@ stream the TUI pumps.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from harness.agent.collab import (
+    ACTIVE_STATES,
     AgentManager as SdkAgentManager,
     AgentRecord,
     AgentTypeSpec,
@@ -105,6 +107,12 @@ class AgentManager(SdkAgentManager):
         )
         self.app_config = config
         self.settings = settings
+        # The sdk stamps ``created_at`` with the wall clock but ``updated_at``
+        # with the monotonic clock, so neither can be subtracted from the
+        # other.  The UI's elapsed column runs on the monotonic samples this
+        # manager takes while an agent is visible instead.
+        self._agent_started: dict[str, float] = {}
+        self._agent_stopped: dict[str, float] = {}
         self.goal_store = goal_store
         self._client_factory = client_factory
         self._shared_client = client
@@ -249,3 +257,37 @@ class AgentManager(SdkAgentManager):
     def records(self) -> dict[str, AgentRecord]:
         """The live agent records, keyed by name."""
         return self._agents
+
+    def agent_rows(self) -> list[dict[str, Any]]:
+        """A per-frame copy of the agent state for a UI to render.
+
+        The records belong to the manager's loop, while the UI samples them
+        from its own thread (a spawn or a completion can land mid-copy), so
+        the copy is taken defensively: a frame that races just shows nothing
+        new rather than raising.
+        """
+        try:
+            records = list(self._agents.values())
+        except RuntimeError:      # mutated during the copy
+            return []
+        now = time.monotonic()
+        rows: list[dict[str, Any]] = []
+        for record in records:
+            running = record.status in ACTIVE_STATES
+            started = self._agent_started.setdefault(record.name, now)
+            if running:
+                if self._agent_stopped.pop(record.name, None) is not None:
+                    # a finished name was reused by a new agent
+                    started = self._agent_started[record.name] = now
+                finished = now
+            else:
+                finished = self._agent_stopped.setdefault(record.name, now)
+            rows.append({
+                'name': record.name,
+                'parent': record.parent,
+                'depth': record.depth,
+                'status': record.status,
+                'started': started,
+                'elapsed': max(0.0, finished - started),
+            })
+        return rows
