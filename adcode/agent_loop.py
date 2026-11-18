@@ -133,7 +133,7 @@ class AgentLoop:
         registry.unregister_source('skill')
 
         self.agent_live: dict[str, dict[str, str]] = {}
-        self._engine: ConversationEngine | None = None
+        self._engine: AdCodeEngine | None = None
         self.agents: AgentManager | None = None
         self._thread: threading.Thread | None = None
         self._pump: threading.Thread | None = None
@@ -169,7 +169,11 @@ class AgentLoop:
 
     def _make_client(self, provider: ProviderConfig, model: ModelConfig) -> LLMClient:
         return LLMClient(provider, model, base_dir=self.cwd or '.',
-                         file_cache=self._file_cache, warn=self._warn)
+                         file_cache=self._file_cache, warn=self._warn,
+                         opencode_session=self._active_opencode_session)
+
+    def _active_opencode_session(self) -> str:
+        return self._engine.opencode_session_id if self._engine is not None else ''
 
     def _warn(self, text: str) -> None:
         engine = self._engine

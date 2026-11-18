@@ -20,8 +20,11 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from uuid import uuid4
 
 from harness.agent.engine import ConversationEngine
+
+from adcode.session import OpenCodeSessionPayload, SessionPayload, new_session_name
 
 #: What the model sees in front of the reasoning of a round that never
 #: finished.  It has to be in the history, not only in the transcript: the
@@ -36,6 +39,7 @@ class AdCodeEngine(ConversationEngine):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self.opencode_session_id = uuid4().hex
         # ``/hold``: retry a request whose stream broke.
         self.hold_enabled = False
         self.hold_max_retries = 20
@@ -47,6 +51,31 @@ class AdCodeEngine(ConversationEngine):
         # that came first is gone from the request it returns -- and with it
         # from the history.
         self._round_thinking: list[str] = []
+
+    def payload(self) -> OpenCodeSessionPayload:
+        return OpenCodeSessionPayload(**vars(super().payload()),
+                                      opencode_session_id=self.opencode_session_id)
+
+    def apply_payload(self, payload: SessionPayload) -> None:
+        self._require_idle('session load')
+        saved_id = (payload.opencode_session_id
+                    if isinstance(payload, OpenCodeSessionPayload) else '')
+        self.opencode_session_id = saved_id or uuid4().hex
+        super().apply_payload(payload)
+
+    def clear(self) -> None:
+        super().clear()
+        self.opencode_session_id = uuid4().hex
+
+    def fork(self, name: str = '') -> str:
+        self._require_idle('fork')
+        payload = self.payload()
+        payload.name = name or self._store.unique_name(
+            f'{self.session_name or new_session_name()}_fork')
+        payload.title = f'Fork of {self.session_title or self.session_name}'.strip()
+        payload.opencode_session_id = uuid4().hex
+        self._store.save(payload, as_name=payload.name)
+        return payload.name
 
     # ── hold ────────────────────────────────────────────────
     def configure_hold(self, enabled: bool, max_retries: int,

@@ -20,6 +20,8 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any, AsyncGenerator, Callable, Generator
+from urllib.parse import urlsplit
+from uuid import uuid4
 
 from infra.orchestrator.base import effort_stream_params, retrying_stream
 
@@ -169,6 +171,15 @@ def _file_id_rejected(error: Exception) -> bool:
     return status in (400, 403, 404, 422)
 
 
+_OPENCODE_SESSION_HEADER = 'x-opencode-session'
+
+
+def _is_opencode_endpoint(url: str) -> bool:
+    endpoint = urlsplit(url)
+    return (endpoint.scheme == 'https' and endpoint.hostname == 'opencode.ai'
+            and endpoint.path.removeprefix('/').partition('/')[0] in ('inference', 'zen'))
+
+
 class LLMClient:
     """One provider connection, one wire, IChatClient-compatible.
 
@@ -178,11 +189,13 @@ class LLMClient:
         base_dir: relative ``[image: ...]`` markers resolve against it.
         file_cache: optional Files API id cache (responses / anthropic wires).
         warn: optional sink for one-time notices about upload fallbacks.
+        opencode_session: supplies the active conversation's OpenCode ID.
     """
 
     def __init__(self, provider: ProviderConfig, model: ModelConfig | None = None,
                  *, base_dir: str = '', file_cache: FileIdCache | None = None,
-                 warn: Callable[[str], None] | None = None) -> None:
+                 warn: Callable[[str], None] | None = None,
+                 opencode_session: Callable[[], str] | None = None) -> None:
         self.provider = provider
         self.name = provider.name
         self.wire = provider.wire
@@ -209,6 +222,10 @@ class LLMClient:
         # on both the sync and the async side.
         self._http = build_http_client(timeout=600.0)
         self._async_http = build_async_http_client(timeout=600.0)
+        if (_is_opencode_endpoint(provider.base_url)
+                and not any(key.lower() == _OPENCODE_SESSION_HEADER
+                            for key in headers or {})):
+            self._install_opencode_header(opencode_session)
         if 'openai' in self.wire:
             protocol = 'responses' if 'responses' in self.wire else 'chat'
             self._client: Any = OpenAICompatClient(
@@ -234,6 +251,26 @@ class LLMClient:
             )
         # The raw SDK object, for the Files API and model discovery.
         self._sdk = self._client._client
+
+    def _install_opencode_header(self, session: Callable[[], str] | None) -> None:
+        fallback_id = uuid4().hex
+        added = 'adcode.opencode_session_added'
+
+        def add_header(request: Any) -> None:
+            # Redirects inherit headers and extensions from the first request.
+            if _is_opencode_endpoint(str(request.url)):
+                if _OPENCODE_SESSION_HEADER not in request.headers:
+                    request.headers[_OPENCODE_SESSION_HEADER] = (
+                        (session() if session is not None else '') or fallback_id)
+                    request.extensions[added] = True
+            elif request.extensions.pop(added, False):
+                request.headers.pop(_OPENCODE_SESSION_HEADER, None)
+
+        async def add_async_header(request: Any) -> None:
+            add_header(request)
+
+        self._http.event_hooks['request'].append(add_header)
+        self._async_http.event_hooks['request'].append(add_async_header)
 
     def close(self) -> None:
         """Release the underlying HTTP connection pools."""
@@ -600,5 +637,6 @@ def fetch_model_ids(provider: ProviderConfig, wire: str | None = None) -> list[s
     probe = ProviderConfig(
         name=provider.name, base_url=provider.base_url, api_key=provider.api_key,
         wire=wire or provider.wire, models=provider.models,
+        extra_headers=provider.extra_headers,
     )
     return LLMClient(probe).list_models()

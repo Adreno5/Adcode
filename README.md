@@ -96,6 +96,12 @@ or enter model ids manually. Metadata is matched against models.dev when
 available. A final step lets you review the selected model's context window,
 maximum output, vision support, tool calling, and reasoning efforts.
 
+Official OpenCode Console and Go API URLs on `opencode.ai` automatically get
+an `x-opencode-session` header, including legacy `/zen` URLs. AdCode keeps
+the ID when you switch models or resume a saved conversation, and uses a
+new ID when you clear or fork it. An explicit header in the provider's
+`extra_headers` takes precedence.
+
 ## Keyboard
 
 | Key | Action |

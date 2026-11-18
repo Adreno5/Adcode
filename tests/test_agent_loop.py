@@ -21,7 +21,7 @@ class ScriptedClient:
     instances: list['ScriptedClient'] = []
 
     def __init__(self, provider, model=None, *, base_dir='', file_cache=None,
-                 warn=None):
+                 warn=None, opencode_session=None):
         self.provider = provider
         self.model = model.id if model is not None else 'test-model'
         self.base_dir = base_dir
