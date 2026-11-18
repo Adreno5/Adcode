@@ -4,6 +4,8 @@
 
 **A configurable, full-screen terminal coding agent.**
 
+**Built with [AICF](https://github.com/ccjjfdyqlhy/aicf-core).**
+
 AdCode streams from OpenAI-compatible and Anthropic APIs, runs a ReAct loop
 with real tools, delegates to sub-agents, and paints the whole session into a
 hand-written software renderer — no terminal widget toolkit, no browser
