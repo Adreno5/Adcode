@@ -28,21 +28,28 @@ def test_user_and_assistant(config):
 
 
 def test_thinking_modes(config):
+    # A committed block renders the after-completion stage, so both stages
+    # move together here -- that is what /thinking <mode> does as well.
     item = TranscriptItem(kind='thinking', turn=1, text='deep thought',
                           duration=1.5)
     config.thinking.mode = 'hidden'
+    config.thinking.after_completion = 'hidden'
     assert texts(render(config, [item])) == []
     config.thinking.mode = 'label'
+    config.thinking.after_completion = 'label'
     lines = texts(render(config, [item]))
     assert lines[0].startswith('Thinking')
     config.thinking.mode = 'full'
+    config.thinking.after_completion = 'full'
     assert any('deep thought' in line for line in texts(render(config, [item])))
     config.thinking.mode = 'partial'
+    config.thinking.after_completion = 'partial'
     assert any('deep thought' in line for line in texts(render(config, [item])))
 
 
 def test_partial_window_ellipsis_and_gradient(config):
     config.thinking.mode = 'partial'
+    config.thinking.after_completion = 'partial'
     config.thinking.from_index = -2
     config.thinking.to_index = -1
     config.thinking.style = 'gradient'
@@ -238,19 +245,30 @@ def test_agent_items_spacing(config):
     lines = render(config, items)
     assert any(plain_text(line) == '' for line in lines)
 
-def test_after_completion_keeps_labels_or_hides_the_reasoning(config):
+def test_after_completion_is_a_stage_of_its_own(config):
+    """The finished block follows its own mode, not the ongoing one."""
     item = TranscriptItem(kind='thinking', turn=1, text='deep thought',
                           duration=1.5)
     config.thinking.mode = 'full'
-    config.thinking.after_completion = 'keep'
+    config.thinking.after_completion = 'full'
     assert any('deep thought' in line for line in texts(render(config, [item])))
+    # The live mode still says full; only the finished stage changed.
     config.thinking.after_completion = 'label'
     lines = [line for line in texts(render(config, [item])) if line.strip()]
     assert len(lines) == 1, lines
     assert lines[0].startswith('Thinking') and '1.5s' in lines[0], lines
     assert 'deep thought' not in lines[0], lines
-    config.thinking.after_completion = 'hide'
+    # Partial keeps the same window the ongoing block uses.
+    config.thinking.after_completion = 'partial'
+    config.thinking.from_index = -1
+    config.thinking.to_index = -1
+    assert 'deep thought' in ' '.join(texts(render(config, [item])))
+    config.thinking.after_completion = 'hidden'
     assert texts(render(config, [item])) == []
+    # 'keep' is the old "follow the ongoing mode", still read from old files
+    # and used by the alt-held reveal.
+    config.thinking.after_completion = 'keep'
+    assert any('deep thought' in line for line in texts(render(config, [item])))
 
 def test_after_completion_label_can_carry_the_token_count(config):
     item = TranscriptItem(kind='thinking', turn=1, text='word ' * 40,

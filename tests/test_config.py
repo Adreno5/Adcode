@@ -135,19 +135,36 @@ def test_the_work_steps_default_to_custom():
     cfg = AppConfig()
     assert cfg.steps.preset == 'custom'
     assert cfg.steps.custom is True
-    assert cfg.thinking.after_completion == 'keep'
+    assert cfg.steps.collapse_after_completion is False
+    assert cfg.thinking.after_completion == 'label'
 
 def test_the_thinking_after_completion_migrates_from_the_old_flag():
     hidden = config_from_dict({'version': 2, 'thinking': {'show_completed': False}})
-    assert hidden.thinking.after_completion == 'hide'
+    assert hidden.thinking.after_completion == 'hidden'
     kept = config_from_dict({'version': 2, 'thinking': {'show_completed': True}})
-    assert kept.thinking.after_completion == 'keep'
+    # "Keep it as the ongoing mode renders it" is resolved to that mode: the
+    # two stages are configured separately now.
+    assert kept.thinking.after_completion == 'label'
+    split = config_from_dict(
+        {'version': 2, 'thinking': {'mode': 'partial', 'show_completed': True}})
+    assert split.thinking.after_completion == 'partial'
     chosen = config_from_dict(
-        {'version': 2, 'thinking': {'after_completion': 'label'}})
-    assert chosen.thinking.after_completion == 'label'
-    # A value the schema does not know falls back to keeping the reasoning.
+        {'version': 2, 'thinking': {'after_completion': 'full'}})
+    assert chosen.thinking.after_completion == 'full'
+    # The old name of "nothing left" still reads as hidden.
+    legacy = config_from_dict(
+        {'version': 2, 'thinking': {'after_completion': 'hide'}})
+    assert legacy.thinking.after_completion == 'hidden'
+    # A value the schema does not know follows the ongoing mode.
     bogus = config_from_dict({'version': 2, 'thinking': {'after_completion': '?'}})
-    assert bogus.thinking.after_completion == 'keep'
+    assert bogus.thinking.after_completion == 'label'
+
+def test_the_collapse_toggle_survives_a_roundtrip(tmp_path):
+    path = tmp_path / 'config.json'
+    store = ConfigStore(path)
+    store.load().steps.collapse_after_completion = True
+    assert store.save()
+    assert ConfigStore(path).load().steps.collapse_after_completion is True
 
 def test_the_preset_survives_a_roundtrip(tmp_path):
     path = tmp_path / 'config.json'

@@ -60,9 +60,10 @@ def test_expand_and_choose(config):
     keys = [row.key for row in overlay._flatten()]
     assert 'thinking.partial.from' in keys
     assert 'thinking.partial.to' in keys
-    # Escape reverts the whole item.
+    # Escape closes the item and keeps what was chosen: every change is
+    # applied and saved as it is made, so there is nothing to take back.
     overlay.handle(key('esc'))
-    assert config.thinking.mode == 'label'
+    assert config.thinking.mode == 'partial'
     assert overlay.expanded == []
 
 
@@ -232,15 +233,39 @@ def test_escape_leaves_the_cursor_on_the_collapsed_item(config):
     assert overlay.expanded == []
     assert current(overlay) == 'context.auto'
 
-def test_the_work_steps_group_starts_with_the_preset(config):
+def test_the_work_steps_group_starts_with_the_collapse_toggle(config):
     overlay = SettingsOverlay(config, lambda: None)
     keys = [row.key for row in overlay._flatten()]
-    assert keys[keys.index('group:Work steps') + 1] == 'steps.preset'
+    start = keys.index('group:Work steps')
+    assert keys[start + 1] == 'steps.collapse'
+    assert keys[start + 2] == 'steps.preset'
+    assert keys[start + 3] == 'thinking.mode'
+    assert keys[start + 4] == 'thinking.after_completion'
     focus(overlay, 'steps.preset')
     overlay.handle(key('enter'))
     options = [row.key for row in overlay._flatten() if row.kind == 'option']
     assert options == [f'steps.preset::{level}'
                        for level in ('concise', 'standard', 'detailed', 'custom')]
+
+
+def test_the_collapse_toggle_is_no_presets_business(config):
+    overlay = SettingsOverlay(config, lambda: None)
+    walk_to(overlay, 'steps.preset')
+    overlay.handle(key('enter'))
+    walk_to(overlay, 'steps.preset::detailed')
+    overlay.handle(key('enter'))
+    assert config.steps.preset == 'detailed'
+    # A preset keeps the thinking and tool settings read-only, but the
+    # toggle above it stays the user's own switch.
+    walk_to(overlay, 'thinking.mode')
+    overlay.handle(key('enter'))
+    assert 'thinking.mode::full' not in [row.key for row in overlay._flatten()]
+    walk_to(overlay, 'steps.collapse')
+    overlay.handle(key('enter'))
+    index, _ = find_row(overlay, 'steps.collapse::True')
+    overlay.row, overlay.row_key = index, 'steps.collapse::True'
+    overlay.handle(key('enter'))
+    assert config.steps.collapse_after_completion is True
 
 def test_a_preset_writes_its_settings_and_locks_them(config):
     overlay = SettingsOverlay(config, lambda: None)
@@ -290,10 +315,37 @@ def test_choosing_a_preset_collapses_what_it_locked(config):
     overlay.handle(key('enter'))
     walk_to(overlay, 'steps.preset::concise')
     overlay.handle(key('enter'))
-    # An expansion of a setting the preset took back must not linger: escape
-    # would otherwise half-revert the preset.
+    # An expansion of a setting the preset just locked must not linger: its
+    # rows are gone, and the lock would refuse every edit inside it anyway.
     assert overlay.expanded == []
-    assert overlay.snapshots == {}
+    assert config.thinking.mode == 'label'        # written by the preset
+
+
+def test_the_thinking_display_is_two_stages(config):
+    overlay = SettingsOverlay(config, lambda: None)
+    walk_to(overlay, 'thinking.mode')
+    overlay.handle(key('enter'))
+    # The finished-thought choice is its own item now, not a child of the
+    # live block's options.
+    rows = [row for row in overlay._flatten()
+            if row.key == 'thinking.after_completion']
+    assert [(row.kind, row.depth) for row in rows] == [('setting', 0)], rows
+    walk_to(overlay, 'thinking.mode::partial')
+    overlay.handle(key('enter'))
+    assert config.thinking.mode == 'partial'
+    # The second stage offers the same four modes.
+    walk_to(overlay, 'thinking.after_completion')
+    overlay.handle(key('enter'))
+    options = [row.key for row in overlay._flatten()
+               if row.key.startswith('thinking.after_completion::')]
+    assert options == ['thinking.after_completion::hidden',
+                       'thinking.after_completion::label',
+                       'thinking.after_completion::partial',
+                       'thinking.after_completion::full'], options
+    walk_to(overlay, 'thinking.after_completion::label')
+    overlay.handle(key('enter'))
+    assert config.thinking.after_completion == 'label'
+    assert config.thinking.mode == 'partial'      # the live block is untouched
 
 def test_the_token_count_belongs_to_the_label(config):
     overlay = SettingsOverlay(config, lambda: None)

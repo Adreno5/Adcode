@@ -28,6 +28,30 @@ def app(tmp_path):
         paths_module.set_app_dir(None)
 
 
+class StubLoop:
+    """Stands in for the agent loop: records what the app would send."""
+
+    def __init__(self):
+        self.sent = []
+
+    def submit(self, text, mode):
+        self.sent.append((text, mode))
+
+def test_a_message_that_starts_with_a_path_is_sent_to_the_model(app):
+    app.loop = StubLoop()
+    app.prompt.set_text('/home/me/notes.md explain this')
+    app._handle_enter(key('enter'))
+    assert app.loop.sent == [('/home/me/notes.md explain this', 'chat')]
+    assert app.prompt.text == ''
+    assert not [item for item in app.standalone_items
+                if item.kind == 'notice' and 'Unknown command' in item.text]
+
+def test_a_registered_name_still_runs_the_command(app):
+    app.loop = StubLoop()
+    app.submit('/help')
+    assert app.loop.sent == []
+    assert type(app.overlay).__name__ == 'MessageDialog'
+
 def test_ctrl_h_opens_the_sessions_browser(app):
     app.session_store.save(SessionPayload(name='alpha', messages=[
         {'role': 'user', 'content': 'hello'},

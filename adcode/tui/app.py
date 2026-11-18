@@ -1302,7 +1302,8 @@ class AdCodeApp:
         text = self.prompt.text.strip()
         if not text:
             return
-        if self.session_archived and not text.startswith('/'):
+        from adcode.commands import command_for
+        if self.session_archived and command_for(text) is None:
             # Read-only until /respawn: keep the message in the prompt so it is
             # still there afterwards.  Commands fall through -- the dispatcher
             # refuses the ones that work on this session and runs the rest.
@@ -1319,8 +1320,10 @@ class AdCodeApp:
         self.submit(text)
 
     def submit(self, text: str) -> None:
-        from adcode.commands import dispatch
-        if text.startswith('/'):
+        from adcode.commands import command_for, dispatch
+        # Only a registered name is a command: a message that starts with a
+        # path goes to the model like any other.
+        if command_for(text) is not None:
             dispatch(self, text)
             return
         if self.session_archived:
@@ -1682,7 +1685,10 @@ class AdCodeApp:
         tools = replace(cfg.tools, mode='both', chain='separate',
                         result_mode='full', show_args=True, show_diff=True,
                         max_result_lines=0)
-        return replace(cfg, thinking=thinking, tools=tools), -1_000_000
+        # A collapsed turn is a summary, and Alt asks for the details.
+        steps = replace(cfg.steps, collapse_after_completion=False)
+        return replace(cfg, thinking=thinking, tools=tools,
+                       steps=steps), -1_000_000
 
     def _transcript_lines(self) -> list[Line]:
         width = max(16, self.screen.size().columns - 2)
@@ -2094,10 +2100,13 @@ class AdCodeApp:
                   and row.get('name') != 'root']
         if agents and self.config.agents.show_activity:
             extras.append(f'{len(agents)} agent{"s" if len(agents) > 1 else ""}')
-        if self.config.tools.chain == 'merged':
+        if self.config.steps.collapse_after_completion:
+            extras.append('steps collapse when done')
+        elif self.config.tools.chain == 'merged':
             extras.append('merged steps')
-        if (self.config.thinking.mode == 'label'
-                and self.config.thinking.label_tokens):
+        thinking = self.config.thinking
+        if thinking.label_tokens and 'label' in (thinking.mode,
+                                                 thinking.after_completion):
             extras.append('token count')
         if self.config.hold.enabled:
             extras.append(f'hold ×{self.config.hold.max_retries}')

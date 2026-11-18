@@ -22,7 +22,7 @@ class ScriptedClient:
     instances: list['ScriptedClient'] = []
 
     def __init__(self, provider=None, model=None, *, base_dir='', file_cache=None,
-                 warn=None):
+                 warn=None, session_id=None):
         self.provider = provider
         self.rounds: list[list[str]] = [['child result']]
         self.calls = 0

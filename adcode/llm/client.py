@@ -12,6 +12,9 @@ adds what stays application-shaped here:
   inline image, with the inline fallback when the provider refuses;
 - ``provider.reasoning_extra_body`` merges into the request's extra body
   whenever a reasoning dial is in play;
+- Console's ``x-opencode-session`` header is stamped on the two transports
+  themselves, so every wire carries the conversation id and the provider's
+  ``opencode_session`` setting decides whether it is sent at all;
 - an interrupt stops the stream at the next chunk.
 """
 
@@ -38,6 +41,9 @@ from harness.images import (
 
 from adcode import paths
 from adcode.config import ModelConfig, ProviderConfig
+from adcode.llm.session import (
+    SESSION_HEADER, sends_session_header,
+)
 
 
 def asyncio_run(coroutine: Any) -> Any:
@@ -177,6 +183,38 @@ def _image_parts(text: Any, *, base_dir: str = '', wire: str = 'chat',
     return parts if replaced else None
 
 
+def _stamp_session_header(session_id: Callable[[], str], request: Any) -> None:
+    """Set the Console session header on a request that is about to be sent."""
+    try:
+        value = session_id()
+    except Exception:      # noqa: BLE001 - a header must never fail a turn
+        return
+    if value:
+        request.headers[SESSION_HEADER] = str(value)
+
+
+def install_session_header(client: Any, session_id: Callable[[], str], *,
+                          asynchronous: bool = False) -> None:
+    """Send ``x-opencode-session`` on every request this httpx client makes.
+
+    The header is read per request rather than baked in at construction: the
+    engine names a session only after its first save, and a resume, a fork or
+    a delete moves the conversation to another id while this client lives on.
+    ``asynchronous`` picks the hook shape: httpx awaits the hooks of an async
+    client, so it needs a coroutine function.
+    """
+    if asynchronous:
+        async def hook(request: Any) -> None:
+            _stamp_session_header(session_id, request)
+    else:
+        def hook(request: Any) -> None:
+            _stamp_session_header(session_id, request)
+    try:
+        client.event_hooks['request'].append(hook)
+    except (AttributeError, KeyError, TypeError):
+        pass      # an http client without request hooks still works
+
+
 class LLMClient:
     """One provider connection, one wire, IChatClient-compatible.
 
@@ -186,12 +224,16 @@ class LLMClient:
         base_dir: relative ``[image: ...]`` markers resolve against it.
         file_cache: optional Files API id cache (responses / anthropic wires).
         warn: optional sink for one-time notices about upload fallbacks.
+        session_id: optional callable returning the conversation's
+            ``x-opencode-session`` id; the header is sent when the provider's
+            ``opencode_session`` setting asks for it.
     """
 
     def __init__(self, provider: ProviderConfig, model: ModelConfig | None = None,
                  *, base_dir: str = '', file_cache: FileIdCache | None = None,
                  warn: Callable[[str], None] | None = None,
-                 sdk: Any | None = None) -> None:
+                 sdk: Any | None = None,
+                 session_id: Callable[[], str] | None = None) -> None:
         self.provider = provider
         self.name = provider.name
         self.wire = provider.wire
@@ -217,6 +259,14 @@ class LLMClient:
         # on both the sync and the async side.
         self._http = build_http_client(timeout=600.0)
         self._async_http = build_async_http_client(timeout=600.0)
+        # Console routes a conversation and reuses its prompt cache by the id
+        # in this header.  It rides on the two transports built above, so all
+        # three wires and every request the SDKs make carry it.
+        self.session_id = session_id
+        if session_id is not None and sends_session_header(provider):
+            install_session_header(self._http, session_id)
+            install_session_header(self._async_http, session_id,
+                                   asynchronous=True)
         if 'openai' in self.wire:
             protocol = 'responses' if 'responses' in self.wire else 'chat'
             self._client: Any = OpenAICompatClient(

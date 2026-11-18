@@ -362,6 +362,10 @@ is taller than the panel.
 Type `/` to open the command palette. Up/Down selects a candidate, Tab or
 Enter completes it, and Enter runs the command.
 
+Only a command name makes the input a command. A message that starts with a
+slash but no known name - a path like `/home/me/notes.md`, or any other text -
+is sent to the model like every other message.
+
 | Command | Description |
 |---|---|
 | `/help` | Commands and key bindings |
@@ -370,7 +374,7 @@ Enter completes it, and Enter runs the command.
 | `/model [list\|edit]` | Switch models or edit the selected model's capabilities |
 | `/provider add\|edit\|remove\|list` | Manage providers and their models |
 | `/effort [level]` | Set `low`, `medium`, `high`, `xhigh`, `max`, or `ultra` |
-| `/thinking [mode]` | Set thinking display: `hidden`, `label`, `partial`, `full` |
+| `/thinking [ongoing\|after] [mode]` | Set the thinking display: a bare `hidden`, `label`, `partial` or `full` moves both stages, `ongoing`/`after` one of them |
 | `/steps [level]` | Preset the work-step settings: `concise`, `standard`, `detailed` (the same **Preset** in `/config`, where `custom` unlocks them) |
 | `/hold [on\|off\|<retries>]` | Keep retrying a request that was cut short |
 | `/max_tokens [n]` | Set the maximum output tokens per request |
@@ -402,10 +406,10 @@ Enter completes it, and Enter runs the command.
 - **Move** with Up/Down.
 - **Enter** expands a setting vertically, selects an option, or starts inline
   editing for numbers and text.
-- **Esc** cancels the item: it restores the values captured when the item was
-  expanded, then collapses it. At the top level it closes the panel.
+- **Esc** or **Left** closes the item that is open; at the top level Esc
+  closes the panel. Nothing is taken back: every change is applied and saved
+  the moment it is made, which is also why there is no Ctrl+S to press.
 - **Enter on an expanded setting's title** confirms it and collapses it.
-- **Ctrl+S** closes the panel.
 
 Selecting an option that has children expands its sub-settings automatically.
 Changes apply to the running app immediately (theme and accent included) and
@@ -414,6 +418,14 @@ to save by hand.
 
 ### Thinking display
 
+The display has two stages, configured separately in **Work steps**:
+
+- **Ongoing** (`thinking.mode`): the block while the model is reasoning
+- **After completion** (`thinking.after_completion`): what is left of it once
+  the thought has finished
+
+Both stages offer the same four modes:
+
 | Mode | Behaviour |
 |---|---|
 | `hidden` | Accept reasoning deltas silently |
@@ -421,21 +433,21 @@ to save by hand.
 | `partial` | A configurable window of the rendered reasoning |
 | `full` | The complete reasoning stream |
 
+The window of `partial` (its start, end, style and omitted-content marker) is
+one setting shared by both stages, so the two cannot drift apart.
+`/thinking <mode>` moves both stages at once, `/thinking ongoing <mode>` and
+`/thinking after <mode>` move one of them.
+
+Old config files are migrated: `show_completed` and the old `hide` value land
+on `hidden`, and the old `keep` ("render it as the ongoing mode does") is
+resolved to the mode it used to follow.
+
 The label line carries a **Token count** switch (`thinking.label_tokens`): on,
 a finished thought reads `Thinking · 1.5s · 412 tokens` instead of just
 `Thinking · 1.5s`.  The switch sits in the label mode's settings and again
 under the label collapse of **After completion** — it is one setting, shown
 wherever a label can appear.  The count lands when the round ends, not while
 the thought streams.
-
-**After completion** (`thinking.after_completion`) decides what is left of a
-thought once the model has finished thinking:
-
-| Value | Behaviour |
-|---|---|
-| `keep` | Leave it as the mode above renders it |
-| `label` | Collapse it into the one label line, with the duration (and the token count, when the label carries it) |
-| `hide` | Drop it entirely; it stays in the conversation, just not on screen |
 
 The `label` mode configures the label text (`Thinking`, `Reasoning`,
 `Polishing`, ...), the suffix animation (`fixed` or `rotating`), the rotation
@@ -486,7 +498,23 @@ between attempts).
 
 The thinking and the tool settings live in one **Work steps** group of
 `/config`; they decide how much of the work chain the transcript spells out.
-The first item, **Preset**, is the same choice `/steps` offers, plus
+
+The first item is **Collapse after completion**
+(`steps.collapse_after_completion`, off by default). Once the turn's answer is
+in, its steps fold into one row:
+
+```text
+▏ Thought for 812 tokens, bash x2, edit, grep x3
+```
+
+The reasoning becomes a token count and every tool is named with how often it
+ran. The details stay in the transcript model, so holding `alt` shows them
+again, and a turn that is still working -- or was interrupted, or never
+answered -- keeps its steps on screen. A row only lists what the display
+policy would show anyway: hidden reasoning stays hidden, hidden tools stay
+hidden. It is built once per turn, not per frame, and no preset owns it.
+
+Below the toggle, **Preset** is the same choice `/steps` offers, plus
 **Custom**: the thinking, tool and chain settings below it are editable only
 while the preset is Custom.  Under a named preset they still show what they
 are set to, but cannot be opened or edited -- the preset would otherwise stop
@@ -498,17 +526,17 @@ Two of them do the heavy lifting:
   row, `merged` folds a chain of consecutive calls into one row with the
   tool names and their counts: `bash x2, grep, write`.  A merged chain shows
   no details; the whole chain stays in the history.
-- **Thinking display** (`thinking.mode`) -- `label` keeps the reasoning but
-  only says that it happened, and how much there was when `label_tokens` is
-  on: `Thinking · 1.5s · 412 tokens`.
+- **Ongoing** (`thinking.mode`) and **After completion**
+  (`thinking.after_completion`) -- the reasoning while it streams and what is
+  left of it afterwards; see [Thinking display](#thinking-display).
 
 `/steps` is a shortcut that writes those settings:
 
 | Level | Writes |
 |---|---|
-| `concise` | `thinking.mode = label`, `thinking.label_tokens = on`, `tools.chain = merged` |
-| `standard` | `thinking.mode = partial`, `thinking.label_tokens = off`, `tools.chain = separate` |
-| `detailed` | `thinking.mode = full`, `thinking.label_tokens = off`, `tools.chain = separate`, `tools.result_mode = full` |
+| `concise` | `thinking.mode = label`, `thinking.label_tokens = on`, `thinking.after_completion = label`, `tools.chain = merged` |
+| `standard` | `thinking.mode = partial`, `thinking.label_tokens = off`, `thinking.after_completion = partial`, `tools.chain = separate` |
+| `detailed` | `thinking.mode = full`, `thinking.label_tokens = off`, `thinking.after_completion = full`, `tools.chain = separate`, `tools.result_mode = full` |
 
 The command also records the level as the preset, so `/config` reflects what
 `/steps` just did.  It only ever jumps to one of the three levels; `custom` is
@@ -652,6 +680,38 @@ worker; explore, build, review) and can be replaced with custom definitions:
     "agent_teams": {
         "ship": ["docs", "reviewer"]
     }
+}
+```
+
+### OpenCode Console
+
+[Console](https://opencode.ai/docs/console/harnesses/) serves its models at
+`https://opencode.ai/inference` (pay-as-you-go) and
+`https://opencode.ai/inference/go` (Go). It reads a stable conversation id from
+the `x-opencode-session` header so it can route a conversation consistently
+and reuse its prompt cache; the Go plan requires it.
+
+AdCode keeps one id per session in `~/.adcode/opencode_sessions.json`, so a
+resumed conversation sends the id its cache was written under, a sub-agent
+reports the same one, and the conversation after a delete or an archive starts
+under a new one. Nothing else changes: the header rides on the HTTP request,
+not on the wire body, and every API path (OpenAI Chat Completions, OpenAI
+Responses, Anthropic Messages) carries it.
+
+Each provider says where the header goes:
+
+| `opencode_session` | Behaviour |
+|---|---|
+| `auto` (default) | `opencode.ai` endpoints only, so no other gateway ever sees a header it does not know |
+| `on` | every request to this provider, e.g. a proxy in front of Console |
+| `off` | never |
+
+```json
+{
+    "name": "Console",
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "wire": "openai chat completions",
+    "opencode_session": "auto"
 }
 ```
 

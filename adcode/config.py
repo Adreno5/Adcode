@@ -39,8 +39,11 @@ TOOL_MODES = ('hidden', 'call', 'result', 'both')
 RESULT_MODES = ('partial', 'full')
 #: How a chain of consecutive tool calls is shown.
 TOOL_CHAINS = ('separate', 'merged')
-#: What is left of a thinking block once it has finished.
-THINKING_AFTER_COMPLETION = ('keep', 'label', 'hide')
+#: What is left of a thinking block once it has finished.  The same four
+#: modes the ongoing block offers; ``keep`` is the old "let the ongoing mode
+#: decide" value, still accepted from a config file and used by the alt-held
+#: reveal, but never written.
+THINKING_AFTER_COMPLETION = ('keep', 'hidden', 'label', 'partial', 'full')
 THEMES = ('dark', 'light')
 
 #: The work-step preset the user edited the thinking and tool settings under.
@@ -50,11 +53,13 @@ STEPS_CUSTOM = 'custom'
 #: is only a named starting point and ``custom`` is "the user's own mix".
 STEP_PRESETS: dict[str, dict[str, Any]] = {
     'concise': {'thinking.mode': 'label', 'thinking.label_tokens': True,
-                'tools.chain': 'merged'},
+                'thinking.after_completion': 'label', 'tools.chain': 'merged'},
     'standard': {'thinking.mode': 'partial', 'thinking.label_tokens': False,
+                 'thinking.after_completion': 'partial',
                  'tools.chain': 'separate'},
     'detailed': {'thinking.mode': 'full', 'thinking.label_tokens': False,
-                 'tools.chain': 'separate', 'tools.result_mode': 'full'},
+                 'thinking.after_completion': 'full', 'tools.chain': 'separate',
+                 'tools.result_mode': 'full'},
 }
 #: Every value ``steps.preset`` may hold (the presets plus ``custom``).
 STEPS_PRESETS = (*STEP_PRESETS, STEPS_CUSTOM)
@@ -182,6 +187,9 @@ class ProviderConfig:
     models: list[ModelConfig] = field(default_factory=list)
     extra_headers: dict[str, str] = field(default_factory=dict)
     reasoning_extra_body: dict[str, Any] = field(default_factory=dict)
+    #: Whether requests carry Console's ``x-opencode-session`` header:
+    #: ``auto`` sends it to opencode.ai endpoints only, ``on``/``off`` force it.
+    opencode_session: str = 'auto'
 
     def model(self, model_id: str) -> ModelConfig | None:
         return next((model for model in self.models if model.id == model_id), None)
@@ -215,6 +223,8 @@ class ProviderConfig:
                 for key, value in _mapping(raw.get('extra_headers')).items()
             },
             reasoning_extra_body=_mapping(raw.get('reasoning_extra_body')),
+            opencode_session=_choice(
+                raw.get('opencode_session'), ('auto', 'on', 'off'), 'auto'),
         )
 
 
@@ -237,9 +247,10 @@ class ThinkingDisplay:
     ellipsis_label: str = '...'
     # The label line can carry the size of the reasoning it stands for.
     label_tokens: bool = False
-    # 'keep': leave the finished reasoning as the mode renders it;
-    # 'label': collapse it into one label line; 'hide': drop it entirely.
-    after_completion: str = 'keep'
+    # What the finished reasoning looks like: the same four modes as the
+    # ongoing block.  ``keep`` ("render it as the ongoing mode does") is still
+    # read from old files and used by the alt-held reveal.
+    after_completion: str = 'label'
 
     @classmethod
     def from_dict(cls, raw: Any) -> 'ThinkingDisplay':
@@ -263,6 +274,15 @@ class ThinkingDisplay:
             if label_tokens is None:
                 label_tokens = True
         label_tokens = _bool(label_tokens, False)
+        if after == 'hide':
+            # The old name for "nothing left of it".
+            after = 'hidden'
+        after = _choice(after, THINKING_AFTER_COMPLETION, 'keep')
+        if after == 'keep':
+            # "Whatever the ongoing mode renders" used to be one setting; the
+            # two stages are configured separately now, so resolve it to the
+            # mode it used to follow.
+            after = mode
         return cls(
             mode=mode,
             label=_str(raw.get('label'), 'Thinking') or 'Thinking',
@@ -277,7 +297,7 @@ class ThinkingDisplay:
             ellipsis=_choice(raw.get('ellipsis'), ELLIPSIS_STYLES, 'label'),
             ellipsis_label=_str(raw.get('ellipsis_label'), '...'),
             label_tokens=label_tokens,
-            after_completion=_choice(after, THINKING_AFTER_COMPLETION, 'keep'),
+            after_completion=after,
         )
 
 
@@ -290,11 +310,18 @@ class StepsSettings:
     """
 
     preset: str = STEPS_CUSTOM
+    #: Fold a finished turn's steps -- the reasoning and every tool call -- into
+    #: one summary row (``Thought for 812 tokens, bash x2, edit``).
+    collapse_after_completion: bool = False
 
     @classmethod
     def from_dict(cls, raw: Any) -> 'StepsSettings':
         raw = raw if isinstance(raw, dict) else {}
-        return cls(preset=_choice(raw.get('preset'), STEPS_PRESETS, STEPS_CUSTOM))
+        return cls(
+            preset=_choice(raw.get('preset'), STEPS_PRESETS, STEPS_CUSTOM),
+            collapse_after_completion=_bool(
+                raw.get('collapse_after_completion'), False),
+        )
 
     @property
     def custom(self) -> bool:

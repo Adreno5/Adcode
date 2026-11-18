@@ -85,6 +85,17 @@ def random_tip() -> Command:
 def find(name: str) -> Command | None:
     return next((item for item in COMMANDS if item.name == name), None)
 
+def command_for(text: str) -> Command | None:
+    """The command the text names, or None when the text is a plain message.
+
+    Only the first word decides, and only a registered name counts: a message
+    that starts with a path (`/home/me/notes.md`) is a message.
+    """
+    words = text.strip().split(maxsplit=1)
+    if not words or not words[0].startswith('/'):
+        return None
+    return find(words[0])
+
 
 def dispatch(app: Any, text: str) -> None:
     head, _, tail = text.partition(' ')
@@ -289,28 +300,46 @@ def cmd_effort(app: Any, args: str) -> None:
     app.notify(f'Reasoning effort: {value}', 'success')
 
 
-@command('/thinking', 'Set the thinking display mode', usage='/thinking <mode>',
-         subcommands=[(mode, f'Thinking display: {mode}') for mode in THINKING_MODES])
+@command('/thinking', 'Set the thinking display mode',
+         usage='/thinking [ongoing|after] <mode>',
+         subcommands=[(mode, f'Thinking display: {mode}') for mode in THINKING_MODES]
+                     + [('after', 'What is left of the reasoning once it is over')])
 def cmd_thinking(app: Any, args: str) -> None:
-    value = args.strip().lower()
-    modes = THINKING_MODES
-    if value not in modes:
-        items = [DialogItem(mode, mode, '') for mode in modes]
+    """The thinking display has two stages: the block and what is left of it.
 
-        def choose(mode: Any) -> None:
-            app.config.thinking.mode = str(mode)
+    A bare mode sets both, which is what the single setting used to do;
+    ``ongoing`` and ``after`` move one stage at a time.  Only the ongoing mode
+    belongs to a work-step preset, so only that one makes the settings the
+    user's own mix.
+    """
+    words = args.strip().lower().split()
+    second_stage = bool(words) and words[0] in ('after', 'after_completion')
+    first_stage_only = bool(words) and words[0] in ('ongoing', 'mode')
+    if second_stage or first_stage_only:
+        words = words[1:]
+    value = words[0] if words else ''
+    stage = 'After completion' if second_stage else 'Thinking display'
+
+    def apply_mode(mode: str) -> None:
+        if second_stage:
+            app.config.thinking.after_completion = mode
+        else:
+            app.config.thinking.mode = mode
+            if not first_stage_only:
+                # A bare mode is the whole display, as it always was: the
+                # finished thought keeps the shape the live one has.
+                app.config.thinking.after_completion = mode
             # The mode no longer matches a preset: the settings are the
             # user's own mix now, which is what unlocks them in /config.
             app.config.steps.preset = STEPS_CUSTOM
-            app.config_changed()
-            app.notify(f'Thinking display: {mode}', 'success')
-        app.open_select('Thinking display', items, choose)
-        return
-    app.config.thinking.mode = value
-    app.config.steps.preset = STEPS_CUSTOM
-    app.config_changed()
-    app.notify(f'Thinking display: {value}', 'success')
+        app.config_changed()
+        app.notify(f'{stage}: {mode}', 'success')
 
+    if value not in THINKING_MODES:
+        items = [DialogItem(mode, mode, '') for mode in THINKING_MODES]
+        app.open_select(stage, items, lambda mode: apply_mode(str(mode)))
+        return
+    apply_mode(value)
 
 # The named levels come from ``adcode.config``, the same ones the settings
 # browser offers in **Work steps**.  ``custom`` is not a level here: the

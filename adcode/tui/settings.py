@@ -3,13 +3,15 @@
 The tree mirrors every user-facing setting: appearance, thinking display, tool
 display, reasoning, context compaction, sub-agents, skills and MCP.  Interaction
 follows the requested model: Up/Down move, Enter expands an item and selects
-options, Esc cancels (restoring the values captured when the item was opened),
-and Enter on the expanded title confirms the item.
+options, and Enter on the expanded title confirms the item.
+
+Every change is applied and saved the moment it is made, so leaving an item --
+Esc or Left -- only closes it.  Nothing is reverted, which is why there is no
+ctrl+s here either.
 """
 
 from __future__ import annotations
 
-import copy
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -104,7 +106,8 @@ def _step_preset_node() -> SettingNode:
         'Edit the thinking and tool settings yourself'))
     return SettingNode(key='steps.preset', label='Preset', kind='choice',
                        path='steps.preset', choices=choices,
-                       hint='Anything but Custom keeps the settings below read-only')
+                       hint='Anything but Custom keeps the thinking and tool '
+                            'settings read-only')
 
 
 def _locked_by_preset(config: AppConfig) -> bool:
@@ -125,12 +128,20 @@ def _label_tokens_node() -> SettingNode:
 
 
 def _after_completion_node() -> SettingNode:
+    """The second stage of the thinking display: a finished thought.
+
+    It offers the same modes as the ongoing block and shares its window
+    (``thinking.from_index`` and friends), so the two stages cannot drift
+    into two separate sets of window knobs.
+    """
     return _choice('thinking.after_completion', 'After completion',
                    'thinking.after_completion', [
-        SettingChoice('keep', 'Keep', 'Leave the finished reasoning as it is'),
-        SettingChoice('label', 'Label', 'Collapse it into one label line',
+        SettingChoice('hidden', 'Hidden', 'Drop it once the thought is over'),
+        SettingChoice('label', 'Label only', 'One label line',
                       [_label_tokens_node()]),
-        SettingChoice('hide', 'Hide', 'Drop it once the answer starts'),
+        SettingChoice('partial', 'Partial window',
+                      'The same window the ongoing block uses'),
+        SettingChoice('full', 'Full', 'Show everything'),
     ])
 
 
@@ -199,19 +210,19 @@ def build_settings_tree(config: AppConfig) -> list[SettingNode]:
             ]),
             _label_tokens_node(),
         ]),
-        SettingChoice('partial', 'Partial window', 'Show a configurable window', [
-            *_partial_children('thinking.partial', 'thinking.from_index',
-                               'thinking.to_index', 'thinking.style',
-                               'thinking.gradient_top_alpha', 'thinking.ellipsis',
-                               'thinking.ellipsis_label'),
-            _after_completion_node(),
-        ]),
-        SettingChoice('full', 'Full', 'Show everything', [
-            _after_completion_node(),
-        ]),
+        SettingChoice('partial', 'Partial window', 'Show a configurable window',
+                      _partial_children('thinking.partial', 'thinking.from_index',
+                                        'thinking.to_index', 'thinking.style',
+                                        'thinking.gradient_top_alpha',
+                                        'thinking.ellipsis',
+                                        'thinking.ellipsis_label')),
+        SettingChoice('full', 'Full', 'Show everything'),
     ]
-    thinking_item = _choice('thinking.mode', 'Thinking display', 'thinking.mode',
+    # The thinking display is two stages: what is shown while the model
+    # reasons, and what is left of it once the block has finished.
+    thinking_item = _choice('thinking.mode', 'Ongoing', 'thinking.mode',
                             thinking_choices)
+    thinking_after = _after_completion_node()
 
     result_children = [
         _choice('tools.result_mode', 'Result display', 'tools.result_mode', [
@@ -341,10 +352,17 @@ def build_settings_tree(config: AppConfig) -> list[SettingNode]:
                                      for server in cfg.mcp_servers) or '(none)'),
     ]
 
-    # A named preset owns the thinking, tool and chain settings: /config shows
-    # them but leaves them read-only until the preset is switched to Custom.
+    # A named preset owns the thinking and tool settings it writes: /config
+    # shows them but leaves them read-only until the preset is Custom.  The
+    # collapse toggle and the second thinking stage are no preset's business,
+    # so they stay editable.
     for item in (thinking_item, tool_item, chain_item):
         item.lock = _locked_by_preset
+    collapse_item = _bool(
+        'steps.collapse', 'Collapse after completion',
+        'steps.collapse_after_completion',
+        'Once the answer is in, fold the turn\'s steps into one line: '
+        'Thought for N tokens, bash x2, edit')
 
     return [
         SettingNode(key='group:Appearance', label='Appearance', kind='group',
@@ -352,8 +370,10 @@ def build_settings_tree(config: AppConfig) -> list[SettingNode]:
         *appearance,
         SettingNode(key='group:Work steps', label='Work steps', kind='group',
                     choices=[]),
+        collapse_item,
         _step_preset_node(),
         thinking_item,
+        thinking_after,
         tool_item,
         chain_item,
         SettingNode(key='group:Footer', label='Footer status', kind='group',
@@ -403,7 +423,6 @@ class SettingsOverlay(Overlay):
         self.edit_error = ''
         self.edit_select_all = False
         self.notice = ''
-        self.snapshots: dict[str, dict[str, Any]] = {}
         self.nodes = build_settings_tree(config)
 
     # ── tree flattening ─────────────────────────────────────
@@ -479,16 +498,15 @@ class SettingsOverlay(Overlay):
             return False
 
     def _collapse_locked(self) -> None:
-        """Drop the expansions (and their undo snapshots) of locked items.
+        """Close the expansions of items the preset just locked.
 
-        Choosing a preset takes the thinking and tool settings back, so a
-        half-reverted expansion must not survive behind it.
+        The values stay as they are: the preset wrote them, and an expansion
+        left open would only invite an edit the lock refuses.
         """
         for key in list(self.expanded):
             node = self._find_node(key)
             if node is not None and self._locked(node):
                 self.expanded.remove(key)
-                self.snapshots.pop(key, None)
 
     def _get(self, node: SettingNode) -> Any:
         if not node.path:
@@ -505,33 +523,6 @@ class SettingsOverlay(Overlay):
             set_by_path(self.config, node.path, value)
         except Exception:
             return
-
-    def _snapshot_for(self, node: SettingNode) -> dict[str, Any]:
-        paths: set[str] = set()
-
-        def collect(current: SettingNode) -> None:
-            if current.path:
-                paths.add(current.path)
-            for choice in current.choices:
-                for child in choice.children:
-                    collect(child)
-
-        collect(node)
-        values: dict[str, Any] = {}
-        for path in paths:
-            try:
-                values[path] = copy.deepcopy(get_by_path(self.config, path))
-            except Exception:
-                pass
-        return values
-
-    def _restore(self, snapshot: dict[str, Any]) -> None:
-        for path, value in snapshot.items():
-            try:
-                set_by_path(self.config, path, value)
-            except Exception:
-                pass
-        self.on_change()
 
     # ── event handling ──────────────────────────────────────
     def _selectable(self, rows: list[Row]) -> list[int]:
@@ -568,11 +559,10 @@ class SettingsOverlay(Overlay):
             return True
         key = event.key
         if key == 'esc':
+            # Everything is applied and saved already, so leaving an item only
+            # closes it: no value is taken back.
             if self.expanded:
                 node_key = self.expanded.pop()
-                snapshot = self.snapshots.pop(node_key, None)
-                if snapshot is not None:
-                    self._restore(snapshot)
                 self._refocus(node_key)
                 self.on_change()
             else:
@@ -613,18 +603,7 @@ class SettingsOverlay(Overlay):
         if key == 'left':
             if self.expanded:
                 node_key = self.expanded.pop()
-                snapshot = self.snapshots.pop(node_key, None)
-                if snapshot is not None:
-                    self._restore(snapshot)
                 self._refocus(node_key)
-            return True
-        if key == 'ctrl+s':
-            # Every change is already saved; the chord only closes the
-            # panel, which is what esc does as well.
-            self.on_change()
-            self.closed = True
-            if self.on_close is not None:
-                self.on_close()
             return True
         return True
 
@@ -646,7 +625,6 @@ class SettingsOverlay(Overlay):
             if row.option.children:
                 if node.key not in self.expanded:
                     self.expanded.append(node.key)
-                    self.snapshots.setdefault(node.key, self._snapshot_for(node))
                 self._refocus(f'{node.key}::{row.option.value}')
             else:
                 self._confirm(node)
@@ -656,7 +634,6 @@ class SettingsOverlay(Overlay):
                 self._confirm(node)
             else:
                 self.expanded.append(node.key)
-                self.snapshots[node.key] = self._snapshot_for(node)
             return
         if node.kind == 'number':
             self._begin_edit(node, str(self._get(node)))
@@ -674,7 +651,6 @@ class SettingsOverlay(Overlay):
     def _confirm(self, node: SettingNode) -> None:
         if node.key in self.expanded:
             self.expanded.remove(node.key)
-            self.snapshots.pop(node.key, None)
         # Keep the cursor on the item that was just confirmed instead of
         # letting the stale option key fall back to the top of the tree.
         self._refocus(node.key)

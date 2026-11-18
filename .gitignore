@@ -6,8 +6,11 @@ __pycache__/
 .dsh-tool-vision/
 .zcode/
 sessions/
+images/
 config.json
 wires.json
+opencode_sessions.json
+.harness_todo.json
 .ruff_cache/
 .mypy_cache/
 harness-output/

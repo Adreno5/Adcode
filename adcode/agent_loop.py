@@ -37,6 +37,7 @@ from infra.orchestrator.failover import FailoverChat, FailoverEndpoint
 from adcode.agents.manager import AgentManager, AgentStatus
 from adcode.config import AppConfig, FailoverSettings, ModelConfig, ProviderConfig
 from adcode.llm.client import LLMClient
+from adcode.llm.session import OpencodeSessions
 from adcode import paths
 from adcode.system_prompt import build_system_prompt
 from adcode.tools.builtin import install_coding_tools, shutdown_shell_sessions
@@ -123,6 +124,9 @@ class AgentLoop:
             raise RuntimeError('no provider/model configured')
         self.provider, self.model = self._selected
         self._file_cache = FileIdCache(str(paths.image_file_ids()))
+        # Console's session ids, one per saved conversation: the client reads
+        # the live one on every request (see adcode.llm.session).
+        self._opencode = OpencodeSessions()
         # The app hands us an empty registry; the built-in suite is installed
         # here, and the collab / skill sources follow the engine's lifecycle.
         install_coding_tools(registry)
@@ -177,7 +181,8 @@ class AgentLoop:
 
     def _make_client(self, provider: ProviderConfig, model: ModelConfig) -> LLMClient:
         return LLMClient(provider, model, base_dir=self.cwd or '.',
-                         file_cache=self._file_cache, warn=self._warn)
+                         file_cache=self._file_cache, warn=self._warn,
+                         session_id=self.opencode_session_id)
 
     def _warn(self, text: str) -> None:
         engine = self._engine
@@ -195,9 +200,20 @@ class AgentLoop:
             reasoning=bool(model.reasoning),
         )
 
+    @staticmethod
+    def _keep_thinking_items(config: AppConfig) -> bool:
+        """Whether the engine has to record finished reasoning as items.
+
+        The steps summary counts them, so a collapsed turn needs them even
+        when the display policy hides them.
+        """
+        if config.steps.collapse_after_completion:
+            return True
+        return (config.thinking.after_completion not in ('hide', 'hidden')
+                and config.thinking.mode != 'hidden')
+
     def _engine_config(self, config: AppConfig) -> EngineConfig:
-        show_completed = (config.thinking.after_completion != 'hide'
-                          and config.thinking.mode != 'hidden')
+        show_completed = self._keep_thinking_items(config)
         return EngineConfig(
             context=ContextSettings(
                 auto_compact=config.context.auto_compact,
@@ -296,9 +312,14 @@ class AgentLoop:
             loop.close()
 
     def _client_for(self, provider: ProviderConfig, model: ModelConfig) -> LLMClient:
-        """Build a dedicated client for a child agent's provider::model."""
+        """Build a dedicated client for a child agent's provider::model.
+
+        A sub-agent works inside the same conversation, so it reports the same
+        Console session id and shares the prompt cache.
+        """
         return LLMClient(provider, model, base_dir=self.cwd or '.',
-                         file_cache=self._file_cache, warn=self._warn)
+                         file_cache=self._file_cache, warn=self._warn,
+                         session_id=self.opencode_session_id)
 
     def _sync_config(self, engine: ConversationEngine) -> None:
         """Copy the live config knobs into the engine before a turn.
@@ -317,6 +338,10 @@ class AgentLoop:
         context.reserved_output = self.config.context.reserved_output
         context.compaction_reasoning_effort = \
             self.config.context.compaction_reasoning_effort
+        # Turning the steps summary on has to take effect in the next turn:
+        # it needs the thinking items the hidden policy would otherwise skip.
+        engine.config.thinking.show_completed = self._keep_thinking_items(
+            self.config)
 
     def _submit_now(self, mode: str, text: str) -> None:
         # The queued event was emitted with the facade-side queue position
@@ -501,6 +526,15 @@ class AgentLoop:
         engine = self._engine
         return engine.session_title if engine is not None else ''
 
+    def opencode_session_id(self) -> str:
+        """The Console session id of the live conversation.
+
+        Read while a request is being built: the engine names its session
+        only after the first save, so the id follows that name as it appears.
+        """
+        engine = self._engine
+        return self._opencode.current(engine.session_name if engine is not None else '')
+
     def snapshot(self) -> AgentSnapshot:
         engine = self._engine
         if engine is None:
@@ -565,6 +599,8 @@ class AgentLoop:
             self._engine.session_title = ''
 
         self._sync_call(reset)
+        # The deleted conversation's Console id must not follow the next one.
+        self._opencode.forget()
 
     def rewind(self, turn: int) -> str:
         self._require_idle('rewind')

@@ -166,7 +166,7 @@ def test_compaction_keeps_retained_user_turn_addressable():
 
 class _QuietClient:
     def __init__(self, provider, model=None, *, base_dir='', file_cache=None,
-                 warn=None):
+                 warn=None, session_id=None):
         self.provider = provider
 
     async def stream(self, messages, tools=None, **kwargs):

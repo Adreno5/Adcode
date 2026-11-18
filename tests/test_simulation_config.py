@@ -60,10 +60,13 @@ def test_settings_panel_switches_the_theme_in_the_temp_config(harness):
         timeout=10.0, description='the light frame to render')
     assert harness.workspace.config_json()['ui']['theme'] == 'light'
 
-    harness.press('ctrl+s')
+    # Esc closes the panel and keeps the theme: there is no undo and no
+    # ctrl+s to press, every change is already saved.
+    harness.press('esc')
     harness.wait_until(
         lambda: harness.overlay is None and not harness.app.dirty,
         timeout=10.0, description='the settings overlay to close')
+    assert harness.app.config.ui.theme == 'light'
     assert harness.app.palette.name == 'light'
     assert harness.workspace.config_json()['ui']['theme'] == 'light'
     frame = harness.screen.latest

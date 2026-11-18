@@ -1,5 +1,7 @@
 
-from adcode.commands import COMMANDS, completion_candidates, dispatch, find
+from adcode.commands import (
+    COMMANDS, command_for, completion_candidates, dispatch, find,
+)
 from adcode.config import AppConfig
 from adcode.tui.provider_ui import normalize_base_url
 
@@ -61,6 +63,23 @@ def test_completion_subcommands():
     assert completion_candidates('/provider add x') == []
     assert completion_candidates('hello') == []
 
+
+def test_a_message_that_starts_with_a_path_is_not_a_command():
+    # the whole input used to be swallowed as a command, so the model never
+    # saw a message that began with a slash
+    text = '/home/darkstar/temp_workspace/CODE_STYLE.md review this file'
+    assert command_for(text) is None
+    assert command_for('/nope') is None
+    assert command_for('/') is None
+    assert command_for('hello /help') is None
+    assert command_for('') is None
+
+def test_a_registered_name_is_still_a_command():
+    assert command_for('/help').name == '/help'
+    assert command_for('  /help  ').name == '/help'
+    assert command_for('/config extra').name == '/config'
+    # a multi-line paste whose first word is a command stays a command
+    assert command_for('/help\nmore text').name == '/help'
 
 def test_dispatch_effort():
     app = FakeApp()

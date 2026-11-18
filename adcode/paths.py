@@ -61,3 +61,7 @@ def wire_cache_file() -> Path:
 def goals_file() -> Path:
     """The durable goal store."""
     return app_dir() / 'goals.json'
+
+def opencode_sessions_file() -> Path:
+    """Console session ids, keyed by the AdCode session they belong to."""
+    return app_dir() / 'opencode_sessions.json'

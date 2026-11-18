@@ -28,7 +28,7 @@ class ScriptedClient:
     """A client whose rounds are scripted by the last user message."""
 
     def __init__(self, provider=None, model=None, *, base_dir='', file_cache=None,
-                 warn=None):
+                 warn=None, session_id=None):
         self.provider = provider
         self.calls = 0
         self.script: list = []
