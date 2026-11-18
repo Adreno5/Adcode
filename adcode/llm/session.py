@@ -3,16 +3,11 @@
 OpenCode Console asks every harness to send a stable session id with each
 request so it can route a conversation consistently and reuse its prompt
 cache (see https://opencode.ai/docs/console/harnesses/#sessions and the Go
-plan's requirement).  AdCode has no wire-level session of its own -- the
-engine names a session only after its first save -- so the ids live here:
+plan's requirement). AdCode tracks the ID independently of the engine's
+display name so saving the same conversation under a new name keeps its ID.
 
-- one id per saved session name, remembered in
-  ``~/.adcode/opencode_sessions.json`` so a resumed conversation keeps the id
-  its prompt cache was written under;
-- a conversation the engine has not named yet (its first turn) carries an
-  unnamed id, bound to the name as soon as the engine assigns one;
-- :meth:`OpencodeSessions.forget` drops the binding, for the sessions a delete
-  or an archive takes away.
+The session database stores the name-to-ID bindings. An unnamed conversation
+carries a fresh ID that can be bound once the engine assigns a name.
 
 Whether the header is sent at all is the provider's ``opencode_session``
 setting: ``auto`` (the default) sends it to Console endpoints only, so no
@@ -25,14 +20,13 @@ carries it without threading anything through the request bodies.
 from __future__ import annotations
 
 import json
-import os
 import threading
 import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from adcode import paths
+from infra.store.sqlite import SqliteStore
 
 #: The header Console reads.
 SESSION_HEADER = 'x-opencode-session'
@@ -43,6 +37,7 @@ POLICIES = ('auto', 'on', 'off')
 #: The host Console is served from; ``auto`` sends the header there and to
 #: its subdomains.
 CONSOLE_HOST = 'opencode.ai'
+_IMPORT_MARKER = 'legacy-json-imported'
 
 
 def new_session_id() -> str:
@@ -50,11 +45,15 @@ def new_session_id() -> str:
     return f'ses_{uuid.uuid4().hex}'
 
 
-def _host(base_url: str) -> str:
+def is_console_endpoint(base_url: str) -> bool:
     try:
-        return (urlsplit(str(base_url or '')).hostname or '').lower()
+        url = urlsplit(base_url or '')
+        host = url.hostname or ''
     except ValueError:
-        return ''
+        return False
+    return (url.scheme == 'https'
+            and (host == CONSOLE_HOST or host.endswith('.' + CONSOLE_HOST))
+            and url.path.removeprefix('/').partition('/')[0] in ('inference', 'zen'))
 
 
 def sends_session_header(provider: Any) -> bool:
@@ -68,30 +67,25 @@ def sends_session_header(provider: Any) -> bool:
         return True
     if policy == 'off':
         return False
-    host = _host(getattr(provider, 'base_url', ''))
-    return host == CONSOLE_HOST or host.endswith('.' + CONSOLE_HOST)
+    return is_console_endpoint(getattr(provider, 'base_url', ''))
 
 
 class OpencodeSessions:
     """Console session ids, one per AdCode session name.
 
     The store is thread-safe because the id is read on the engine thread while
-    a request is built and rotated on the UI thread by session commands.
-
-    Args:
-        path: the json file the ids are remembered in; defaults to
-            ``~/.adcode/opencode_sessions.json``.
+    a request is built and rotated by session commands.
     """
 
-    def __init__(self, path: str | os.PathLike[str] | None = None) -> None:
-        self._path = (Path(path) if path is not None
-                      else paths.opencode_sessions_file())
+    def __init__(self, store: SqliteStore, *, legacy_path: Path | None = None) -> None:
+        self._store = store
         self._lock = threading.RLock()
-        self._ids: dict[str, str] | None = None
-        # The live conversation's id: bound to a session name once the engine
-        # has saved one, unbound ('' name) before that.
         self._id = new_session_id()
         self._bound = ''
+        store.execute('CREATE TABLE IF NOT EXISTS adcode_opencode_sessions ('
+                      'name TEXT PRIMARY KEY, session_id TEXT NOT NULL)')
+        if legacy_path is not None:
+            self._import_legacy(legacy_path)
 
     # ── the live id ─────────────────────────────────────────
     def current(self, name: str = '') -> str:
@@ -105,12 +99,26 @@ class OpencodeSessions:
         with self._lock:
             if not name or name == self._bound:
                 return self._id
-            stored = self._load().get(name, '')
-            self._id = stored or new_session_id()
-            self._bound = name
+            stored = self.of(name)
             if not stored:
-                self._remember(name, self._id)
+                candidate = new_session_id() if self._bound else self._id
+                self._store.execute(
+                    'INSERT OR IGNORE INTO adcode_opencode_sessions VALUES (?, ?)',
+                    (name, candidate))
+                # Another instance may already have registered this name.
+                stored = self.of(name) or candidate
+            self._id = stored
+            self._bound = name
             return self._id
+
+    def bind(self, name: str) -> None:
+        """Keep the current ID when this conversation is saved under another name."""
+        with self._lock:
+            self._store.execute(
+                'INSERT INTO adcode_opencode_sessions VALUES (?, ?) '
+                'ON CONFLICT(name) DO UPDATE SET session_id=excluded.session_id',
+                (name, self._id))
+            self._bound = name
 
     def forget(self) -> str:
         """Drop the binding: the next conversation starts under a new id."""
@@ -119,38 +127,37 @@ class OpencodeSessions:
             self._bound = ''
             return self._id
 
+    def remove(self, name: str) -> None:
+        """Delete the binding when the saved conversation is permanently deleted."""
+        with self._lock:
+            if name:
+                self._store.execute('DELETE FROM adcode_opencode_sessions WHERE name = ?',
+                                    (name,))
+            if name == self._bound:
+                self.forget()
+
     def of(self, name: str) -> str:
         """The remembered id for a session name ('' when there is none)."""
         if not name:
             return ''
-        with self._lock:
-            return self._load().get(name, '')
+        rows = self._store.execute(
+            'SELECT session_id FROM adcode_opencode_sessions WHERE name = ?', (name,))
+        return rows[0]['session_id'] if rows else ''
 
-    # ── persistence ─────────────────────────────────────────
-    def _load(self) -> dict[str, str]:
-        with self._lock:
-            if self._ids is None:
-                ids: dict[str, str] = {}
-                try:
-                    raw = json.loads(self._path.read_text('utf-8'))
-                except (OSError, ValueError):
-                    raw = {}
-                if isinstance(raw, dict):
-                    ids = {str(name): str(value) for name, value in raw.items()
-                           if isinstance(value, str) and value}
-                self._ids = ids
-            return self._ids
-
-    def _remember(self, name: str, session_id: str) -> None:
-        with self._lock:
-            ids = self._load()
-            ids[name] = session_id
-            target = self._path
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                temporary = target.with_suffix('.tmp')
-                temporary.write_text(json.dumps(ids, indent=2, sort_keys=True),
-                                     'utf-8')
-                os.replace(temporary, target)
-            except OSError:
-                pass    # remembered for this process; the file is a shortcut
+    def _import_legacy(self, path: Path) -> None:
+        # The empty name is reserved; an import must not revive deleted IDs.
+        if self._store.execute('SELECT 1 FROM adcode_opencode_sessions WHERE name = ?', ('',)):
+            return
+        try:
+            raw = json.loads(path.read_text('utf-8'))
+        except (OSError, ValueError):
+            return
+        if isinstance(raw, dict):
+            ids = {name: value for name, value in raw.items()
+                   if name and isinstance(value, str) and value}
+            ids[''] = _IMPORT_MARKER
+            self._store.execute(
+                'INSERT OR IGNORE INTO adcode_opencode_sessions '
+                'SELECT key, value FROM json_each(?) '
+                "WHERE NOT EXISTS (SELECT 1 FROM adcode_opencode_sessions WHERE name = '')",
+                (json.dumps(ids),))

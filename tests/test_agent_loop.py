@@ -311,8 +311,9 @@ def test_load_session_from_store(loop):
     loop.submit('hello there')
     wait_idle(loop)
     loop.save_active()
-    loop.clear()
     name = loop.snapshot().session_name
+    loop.clear()
+    assert loop.snapshot().session_name == ''
     assert loop.load_session(name) is True
     assert len(loop.context.committed) == 2
 

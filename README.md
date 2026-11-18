@@ -701,20 +701,19 @@ worker; explore, build, review) and can be replaced with custom definitions:
 the `x-opencode-session` header so it can route a conversation consistently
 and reuse its prompt cache; the Go plan requires it.
 
-AdCode keeps one id per session in `~/.adcode/opencode_sessions.json`, so a
-resumed conversation sends the id its cache was written under, a sub-agent
-reports the same one, and the conversation after a delete or an archive starts
-under a new one. Nothing else changes: the header rides on the HTTP request,
-not on the wire body, and every API path (OpenAI Chat Completions, OpenAI
-Responses, Anthropic Messages) carries it.
+AdCode stores IDs in its session database and imports existing IDs from
+`~/.adcode/opencode_sessions.json`. Resuming or saving under another name
+keeps the same ID; a new conversation or fork gets its own. Sub-agents use
+their parent conversation's ID. The header works with OpenAI Chat
+Completions, OpenAI Responses, and Anthropic Messages.
 
 Each provider says where the header goes:
 
 | `opencode_session` | Behaviour |
 |---|---|
-| `auto` (default) | `opencode.ai` endpoints only, so no other gateway ever sees a header it does not know |
-| `on` | every request to this provider, e.g. a proxy in front of Console |
-| `off` | never |
+| `auto` (default) | HTTPS inference endpoints on `opencode.ai` and its subdomains, including legacy `/zen` routes |
+| `on` | Requests to the configured origin, e.g. a proxy in front of Console |
+| `off` | Do not add the header automatically |
 
 ```json
 {

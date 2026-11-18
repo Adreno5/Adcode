@@ -26,7 +26,7 @@ import os
 import threading
 from typing import Any, AsyncGenerator, Callable, Generator
 
-from infra.net import build_async_http_client, build_http_client
+from infra.net import build_async_http_client, build_http_client, httpx_module
 from infra.orchestrator.anthropic import AnthropicCompatClient
 from infra.orchestrator.base import effort_stream_params, retrying_stream
 from infra.orchestrator.files import (
@@ -42,7 +42,7 @@ from harness.images import (
 from adcode import paths
 from adcode.config import ModelConfig, ProviderConfig
 from adcode.llm.session import (
-    SESSION_HEADER, sends_session_header,
+    SESSION_HEADER, is_console_endpoint, sends_session_header,
 )
 
 
@@ -183,17 +183,28 @@ def _image_parts(text: Any, *, base_dir: str = '', wire: str = 'chat',
     return parts if replaced else None
 
 
-def _stamp_session_header(session_id: Callable[[], str], request: Any) -> None:
+def _stamp_session_header(session_id: Callable[[], str], request: Any,
+                          accepts_url: Callable[[Any], bool]) -> None:
     """Set the Console session header on a request that is about to be sent."""
+    added = 'adcode.opencode_session_added'
+    if not accepts_url(request.url):
+        # Redirects inherit both headers and extensions from the prior request.
+        if request.extensions.pop(added, False):
+            request.headers.pop(SESSION_HEADER, None)
+        return
+    if SESSION_HEADER in request.headers:
+        return
     try:
         value = session_id()
     except Exception:      # noqa: BLE001 - a header must never fail a turn
         return
     if value:
         request.headers[SESSION_HEADER] = str(value)
+        request.extensions[added] = True
 
 
 def install_session_header(client: Any, session_id: Callable[[], str], *,
+                          accepts_url: Callable[[Any], bool],
                           asynchronous: bool = False) -> None:
     """Send ``x-opencode-session`` on every request this httpx client makes.
 
@@ -205,10 +216,10 @@ def install_session_header(client: Any, session_id: Callable[[], str], *,
     """
     if asynchronous:
         async def hook(request: Any) -> None:
-            _stamp_session_header(session_id, request)
+            _stamp_session_header(session_id, request, accepts_url)
     else:
         def hook(request: Any) -> None:
-            _stamp_session_header(session_id, request)
+            _stamp_session_header(session_id, request, accepts_url)
     try:
         client.event_hooks['request'].append(hook)
     except (AttributeError, KeyError, TypeError):
@@ -264,9 +275,17 @@ class LLMClient:
         # three wires and every request the SDKs make carry it.
         self.session_id = session_id
         if session_id is not None and sends_session_header(provider):
-            install_session_header(self._http, session_id)
+            forced = provider.opencode_session == 'on'
+            base = httpx_module().URL(provider.base_url)
+
+            def accepts_url(url: Any) -> bool:
+                if forced:
+                    return (url.scheme, url.netloc) == (base.scheme, base.netloc)
+                return is_console_endpoint(str(url))
+
+            install_session_header(self._http, session_id, accepts_url=accepts_url)
             install_session_header(self._async_http, session_id,
-                                   asynchronous=True)
+                                   accepts_url=accepts_url, asynchronous=True)
         if 'openai' in self.wire:
             protocol = 'responses' if 'responses' in self.wire else 'chat'
             self._client: Any = OpenAICompatClient(

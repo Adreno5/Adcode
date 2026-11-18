@@ -585,11 +585,6 @@ class AdCodeApp:
 
     def clear_conversation(self) -> None:
         if self.loop is not None:
-            if self.session_archived:
-                # /new in an archived session starts a session of its own: the
-                # engine would otherwise keep the archived name and save the
-                # fresh conversation back into the read-only row.
-                self.loop.forget_session()
             self.loop.clear()
         self.standalone_items.clear()
         self.transcript.invalidate()

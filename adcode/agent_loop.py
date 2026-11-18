@@ -126,7 +126,7 @@ class AgentLoop:
         self._file_cache = FileIdCache(str(paths.image_file_ids()))
         # Console's session ids, one per saved conversation: the client reads
         # the live one on every request (see adcode.llm.session).
-        self._opencode = OpencodeSessions()
+        self._opencode = OpencodeSessions(store.store, legacy_path=paths.opencode_sessions_file())
         # The app hands us an empty registry; the built-in suite is installed
         # here, and the collab / skill sources follow the engine's lifecycle.
         install_coding_tools(registry)
@@ -529,8 +529,7 @@ class AgentLoop:
     def opencode_session_id(self) -> str:
         """The Console session id of the live conversation.
 
-        Read while a request is being built: the engine names its session
-        only after the first save, so the id follows that name as it appears.
+        Read while a request is being built, after any session switch.
         """
         engine = self._engine
         return self._opencode.current(engine.session_name if engine is not None else '')
@@ -565,7 +564,13 @@ class AgentLoop:
 
     def save_as(self, name: str) -> None:
         self._require_idle('session rename')
-        self._sync_call(lambda: self._engine.save_as(name))
+
+        def save() -> None:
+            self.opencode_session_id()
+            self._engine.save_as(name.strip())
+            self._opencode.bind(self._engine.session_name)
+
+        self._sync_call(save)
 
     def load_session(self, name: str) -> bool:
         self._require_idle('session load')
@@ -580,8 +585,10 @@ class AgentLoop:
 
         def reset() -> None:
             self._engine.clear()
-            # The pane is empty again; the header bar starts clean too.
+            # The next turn must neither overwrite the old session nor reuse its ID.
+            self._engine.session_name = ''
             self._engine.session_title = ''
+            self._opencode.forget()
 
         self._sync_call(reset)
 
@@ -595,12 +602,11 @@ class AgentLoop:
         self._require_idle('session delete')
 
         def reset() -> None:
+            self._opencode.remove(self._engine.session_name)
             self._engine.session_name = ''
             self._engine.session_title = ''
 
         self._sync_call(reset)
-        # The deleted conversation's Console id must not follow the next one.
-        self._opencode.forget()
 
     def rewind(self, turn: int) -> str:
         self._require_idle('rewind')

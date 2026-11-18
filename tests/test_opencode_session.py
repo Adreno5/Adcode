@@ -12,9 +12,12 @@ pin the three parts of the feature:
 
 from __future__ import annotations
 
+import json
 import time
 
+import httpx2 as httpx
 import pytest
+from infra.store.sqlite import SqliteStore
 
 from adcode import paths
 from adcode.agent_loop import AgentLoop
@@ -22,6 +25,7 @@ from adcode.config import (
     AppConfig, ModelConfig, ProviderConfig, config_from_dict, config_to_dict,
 )
 from adcode.goals import GoalStore
+from adcode.llm import client as llm
 from adcode.llm.client import LLMClient
 from adcode.llm.session import (
     OpencodeSessions, SESSION_HEADER, new_session_id, sends_session_header,
@@ -60,12 +64,16 @@ def test_auto_sends_to_console_endpoints_only():
     for url in ('https://opencode.ai/inference',
                 'https://opencode.ai/inference/go/openai/v1',
                 'https://console.opencode.ai/inference',
+                'https://opencode.ai/zen/go/v1',
                 'HTTPS://OPENCODE.AI/inference'):
         assert sends_session_header(provider(url)), url
     for url in ('http://localhost:1234/v1',
                 'https://api.deepseek.com/v1',
                 'https://opencode.ai.evil.example/v1',
                 'https://notopencode.ai/v1',
+                'https://opencode.ai/docs/console',
+                'https://opencode.ai/inference-other/v1',
+                'http://opencode.ai/inference',
                 ''):
         assert not sends_session_header(provider(url)), url
 
@@ -107,9 +115,25 @@ def test_a_session_id_looks_like_consoles():
     assert new_session_id() != session_id
 
 
-def test_one_id_per_session_name(tmp_path):
-    store = OpencodeSessions(tmp_path / 'sessions.json')
+@pytest.fixture()
+def open_ids(tmp_path):
+    stores = []
+
+    def open_store():
+        db = SqliteStore(str(tmp_path / 'sessions.db'))
+        stores.append(db)
+        return OpencodeSessions(db, legacy_path=tmp_path / 'sessions.json')
+
+    yield open_store
+    for db in stores:
+        db.close()
+
+
+def test_one_id_per_session_name(open_ids):
+    store = open_ids()
+    unnamed = store.current()
     first = store.current('20250101_120000')
+    assert first == unnamed
     assert store.current('20250101_120000') == first     # stable across turns
     # an unnamed conversation (the engine names a session after its first save)
     # keeps the id it already has
@@ -119,16 +143,26 @@ def test_one_id_per_session_name(tmp_path):
     assert store.of('20250101_120000') == first
 
 
-def test_a_new_run_reads_the_ids_back(tmp_path):
-    path = tmp_path / 'sessions.json'
-    bound = OpencodeSessions(path).current('20250101_120000')
-    reopened = OpencodeSessions(path)
+def test_a_new_run_reads_the_ids_back(open_ids):
+    bound = open_ids().current('20250101_120000')
+    reopened = open_ids()
     assert reopened.of('20250101_120000') == bound
     assert reopened.current('20250101_120000') == bound
 
 
-def test_forget_rotates_the_live_id(tmp_path):
-    store = OpencodeSessions(tmp_path / 'sessions.json')
+def test_two_open_stores_do_not_overwrite_each_others_bindings(open_ids):
+    first, second = open_ids(), open_ids()
+    assert first.of('a') == second.of('a') == ''
+    a = first.current('a')
+    b = second.current('b')
+    reopened = open_ids()
+    assert reopened.of('a') == a
+    assert reopened.of('b') == b
+    assert reopened.of('a') != reopened.of('b')
+
+
+def test_forget_rotates_the_live_id(open_ids):
+    store = open_ids()
     bound = store.current('20250101_120000')
     after = store.forget()
     assert after != bound
@@ -137,13 +171,22 @@ def test_forget_rotates_the_live_id(tmp_path):
     assert store.of('20250101_120000') == bound
 
 
-def test_an_unreadable_store_is_ignored(tmp_path):
+def test_an_unreadable_legacy_store_is_ignored(tmp_path, open_ids):
     path = tmp_path / 'sessions.json'
     path.write_text('{ not json', 'utf-8')
-    store = OpencodeSessions(path)
+    store = open_ids()
     session_id = store.current('20250101_120000')
     assert session_id.startswith('ses_')
-    assert OpencodeSessions(path).of('20250101_120000') == session_id
+    assert open_ids().of('20250101_120000') == session_id
+
+
+def test_existing_ids_are_imported_once_without_reviving_deleted_bindings(tmp_path, open_ids):
+    (tmp_path / 'sessions.json').write_text(json.dumps({'existing': 'ses_legacy'}), 'utf-8')
+    store = open_ids()
+    assert store.current('existing') == 'ses_legacy'
+    assert open_ids().current('existing') == 'ses_legacy'
+    store.remove('existing')
+    assert open_ids().of('existing') == ''
 
 
 # ── the wire ──────────────────────────────────────────────
@@ -227,6 +270,41 @@ def test_an_unwired_client_sends_nothing(gateway):
     assert SESSION_HEADER not in headers(gateway.requests[-1])
 
 
+@pytest.mark.parametrize('policy', ['auto', 'on'])
+@pytest.mark.parametrize('asynchronous', [False, True])
+def test_redirect_keeps_the_id_within_the_endpoint_but_not_across_origins(
+        monkeypatch, policy, asynchronous):
+    seen = []
+
+    def respond(request):
+        seen.append(request.headers.get(SESSION_HEADER))
+        if len(seen) == 1:
+            return httpx.Response(307, headers={'location': '/inference/models'})
+        if len(seen) == 2:
+            return httpx.Response(307, headers={'location': 'https://example.test/models'})
+        return httpx.Response(200, json={'object': 'list', 'data': []})
+
+    transport = httpx.MockTransport(respond)
+    monkeypatch.setattr(llm, 'build_http_client', lambda **kwargs: httpx.Client(
+        transport=transport, follow_redirects=True, **kwargs))
+    monkeypatch.setattr(llm, 'build_async_http_client', lambda **kwargs: httpx.AsyncClient(
+        transport=transport, follow_redirects=True, **kwargs))
+    client = LLMClient(provider('https://opencode.ai/inference/openai/v1', policy=policy),
+                       session_id=lambda: 'ses_test')
+    try:
+        if asynchronous:
+            async def list_models():
+                async with client._async_http:
+                    await client._client._async_client.models.list()
+
+            llm.asyncio_run(list_models())
+        else:
+            client.list_models()
+    finally:
+        client.close()
+    assert seen == ['ses_test', 'ses_test', None]
+
+
 # ── the conversation ──────────────────────────────────────
 @pytest.fixture()
 def app_home(tmp_path):
@@ -253,13 +331,13 @@ def wait_idle(loop: AgentLoop, timeout: float = 10.0) -> None:
 
 
 def test_the_id_follows_the_conversation(gateway, app_home, tmp_path):
-    """One turn, a second turn, a delete and a load: the id tracks each one."""
+    """A live ID survives saving and resuming but not clearing or forking."""
     gateway.responder = EchoResponder()
     config = build_config(gateway.base_url)
     config.providers[0].opencode_session = 'on'
+    store = DbSessionStore(db_path=tmp_path / 'sessions' / 'adcode.db')
     loop = AgentLoop(
-        config, ToolRegistry(),
-        DbSessionStore(db_path=tmp_path / 'sessions' / 'adcode.db'),
+        config, ToolRegistry(), store,
         GoalStore(tmp_path / 'goals.json'),
         SkillRegistry(config.skills, str(tmp_path)),
         emit=lambda kind, payload: None, cwd=str(tmp_path))
@@ -273,15 +351,20 @@ def test_the_id_follows_the_conversation(gateway, app_home, tmp_path):
         assert first == loop.opencode_session_id()
         assert first.startswith('ses_')
         # the binding is on disk, so a later run resumes the same id
-        assert OpencodeSessions().of(name) == first
+        assert OpencodeSessions(store.store).of(name) == first
 
         loop.submit('still the same conversation')
         wait_idle(loop)
         assert headers(gateway.requests[-1])[SESSION_HEADER] == first
 
-        # /perish: the row goes away, the id must not follow the next one
-        loop.forget_session()
+        loop.save_as('renamed')
+        loop.submit('same conversation after saving under another name')
+        wait_idle(loop)
+        assert headers(gateway.requests[-1])[SESSION_HEADER] == first
+
+        # /new from an ordinary conversation must detach from the saved row.
         loop.clear()
+        assert loop.session_name == ''
         loop.submit('a new conversation')
         wait_idle(loop)
         loop.save_active()
@@ -293,5 +376,26 @@ def test_the_id_follows_the_conversation(gateway, app_home, tmp_path):
         loop.submit('back to the first conversation')
         wait_idle(loop)
         assert headers(gateway.requests[-1])[SESSION_HEADER] == first
+
+        forked = loop.fork()
+        assert loop.load_session(forked)
+        loop.submit('a fork of the first conversation')
+        wait_idle(loop)
+        assert headers(gateway.requests[-1])[SESSION_HEADER] not in (first, second)
     finally:
         loop.shutdown()
+        store.store.close()
+
+    reopened = DbSessionStore(db_path=tmp_path / 'sessions' / 'adcode.db')
+    loop = AgentLoop(config, ToolRegistry(), reopened,
+                     GoalStore(tmp_path / 'goals.json'),
+                     SkillRegistry(config.skills, str(tmp_path)), cwd=str(tmp_path))
+    loop.start()
+    try:
+        assert loop.load_session('renamed')
+        loop.submit('resume after restarting AdCode')
+        wait_idle(loop)
+        assert headers(gateway.requests[-1])[SESSION_HEADER] == first
+    finally:
+        loop.shutdown()
+        reopened.store.close()
