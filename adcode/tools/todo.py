@@ -5,9 +5,10 @@ events.  This module only adapts it to the shape adcode's tools use
 (``handler(**args) -> str``, ``Error: ...`` text on failure) and hands the UI
 the same store instance, so a panel and the model never disagree.
 
-The list lives in ``.harness_todo.json`` at the project root, so it survives a
-restart and every agent in the session (including sub-agents, which share the
-tool registry) works the same list.
+The plan lives in the **state database**, one document per project, so it
+survives a restart and every agent in the session (including sub-agents,
+which share the tool registry) works the same list -- without a
+``.harness_todo.json`` appearing in the project the agent is working on.
 """
 
 from __future__ import annotations
@@ -17,8 +18,9 @@ import threading
 from pathlib import Path
 from typing import Any, Optional
 
-from harness.todo import TodoPlan, TodoStore, default_todo_path
+from harness.todo import TodoPlan, TodoStore
 
+from adcode.state import KEY_TODO, state_store
 from adcode.tools.registry import AnnotatedTool
 from adcode.tools.runtime import current_context
 
@@ -33,13 +35,49 @@ def _key(cwd: str = '') -> str:
     return str(Path(base).resolve())
 
 
+def _document_key(root: str) -> str:
+    """The document key for a project: one plan per project."""
+    return f'{KEY_TODO}:{root}'
+
+
+def _import_legacy(root: str) -> None:
+    """Take over a plan an older version left in the project.
+
+    The file used to be ``.harness_todo.json`` in the project root.  It is
+    read once, put into the database, and removed -- a repository is for
+    code, and that file was never code.
+
+    The old file may hold either shape (a document, or a bare list of
+    items), so the store itself does the reading: it knows how a flat list
+    becomes a plan.
+    """
+    legacy = Path(root) / TODO_FILE
+    if not legacy.exists():
+        return
+    try:
+        document = TodoStore(legacy).to_dict()
+    except Exception:      # noqa: BLE001 - an unreadable file stays put
+        return
+    try:
+        documents = state_store().documents
+        if documents.load(_document_key(root)) is None:
+            documents.save(_document_key(root), document)
+        legacy.unlink()
+    except Exception:      # noqa: BLE001
+        pass
+
+
 def todo_store(cwd: str = '') -> TodoStore:
     """The store for a project; one instance per directory, shared by all."""
     key = _key(cwd)
     with _STORES_LOCK:
         store = _STORES.get(key)
         if store is None:
-            store = TodoStore(default_todo_path(key))
+            # An older version left the plan in the project root; take it
+            # over before the store reads the database.
+            _import_legacy(key)
+            store = TodoStore(backend=state_store().documents,
+                              key=_document_key(key))
             _STORES[key] = store
         return store
 

@@ -16,16 +16,33 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from adcode.access import ACCESS_LEVELS
 from adcode.config import (
     REASONING_EFFORTS, STEPS_CUSTOM, STEP_PRESETS,
     AppConfig, apply_step_preset, get_by_path, set_by_path,
 )
+from adcode.i18n import locale_label, t
 from adcode.theme import ACCENT_PRESETS, Palette
 from adcode.tui.canvas import BOLD, DIM, Canvas, text_width, truncate_text
 from adcode.tui.dialogs import (
     Overlay, _draw_backdrop, _draw_frame, _draw_hint, _panel_geometry, wheel_step,
 )
 from adcode.tui.input import KeyEvent, get_clipboard, is_paste_key
+
+
+#: The names of the access levels, in the interface.
+ACCESS_LABELS = {
+    'readonly': 'Read-only',
+    'workspace': 'Workspace',
+    'full': 'Full access',
+}
+
+#: What each level means, in one line.
+ACCESS_DESCRIPTIONS = {
+    'readonly': 'The project can be read; nothing can be changed',
+    'workspace': 'Files inside the project may be changed',
+    'full': 'No boundary; the agent runs with your own rights',
+}
 
 
 @dataclass
@@ -127,6 +144,56 @@ def _label_tokens_node() -> SettingNode:
                  'Append the size of the reasoning to the label')
 
 
+def _access_node() -> SettingNode:
+    """The default access level: what a project without a rule gets.
+
+    The three levels are the same everywhere -- read-only, workspace,
+    full -- and they are ordered by how much they allow.  A project can
+    have a level of its own; that one is the node below.
+    """
+    choices = [
+        SettingChoice(level, ACCESS_LABELS[level],
+                      ACCESS_DESCRIPTIONS.get(level, ''))
+        for level in ACCESS_LEVELS
+    ]
+    return SettingNode(key='security.access', label='Project access',
+                       kind='choice', path='security.access',
+                       choices=choices,
+                       hint='The default for every project')
+
+
+def _project_access_node() -> SettingNode:
+    """The access level of the project this session is working on.
+
+    This one writes the project's own rule, so a trusted folder can be
+    opened up while the default stays strict.  "Use the default" hands the
+    project back to the default.
+    """
+    choices = [
+        SettingChoice(level, ACCESS_LABELS[level],
+                      ACCESS_DESCRIPTIONS.get(level, ''))
+        for level in ACCESS_LEVELS
+    ]
+    choices.append(SettingChoice('', 'Use the default',
+                                  'Follow the default access level'))
+    return SettingNode(key='security.project_access',
+                       label='This project', kind='access',
+                       path='security.access_by_project', choices=choices,
+                       hint='The rule for the project of this session')
+
+
+def _language_node() -> SettingNode:
+    """The language of the interface.
+
+    The choices are named in their own language, so the entry reads the way
+    a speaker of that language would write it.
+    """
+    return _choice('ui.locale', 'Language', 'ui.locale', [
+        SettingChoice('en', locale_label('en'), 'English'),
+        SettingChoice('zh', locale_label('zh'), '简体中文'),
+    ], 'The language of the interface')
+
+
 def _after_completion_node() -> SettingNode:
     """The second stage of the thinking display: a finished thought.
 
@@ -171,6 +238,36 @@ def _partial_children(prefix: str, from_path: str, to_path: str,
     ]
 
 
+def _clone_node(node: SettingNode, key: str) -> SettingNode:
+    """A copy of a setting under a new key.
+
+    The pinned ``Recents`` section shows the settings a user changes most
+    often.  Those entries are copies: they carry the same path and the same
+    choices, so writing one writes the setting itself, but their keys are
+    their own -- a copy must not share the key of the original, or the two
+    would expand and collapse as one.
+    """
+    def clone_children(items: list[SettingNode], prefix: str) -> list[SettingNode]:
+        out: list[SettingNode] = []
+        for child in items:
+            copied = _clone_node(child, f'{prefix}::{child.key}')
+            out.append(copied)
+        return out
+
+    choices: list[SettingChoice] = []
+    for choice in node.choices:
+        choices.append(SettingChoice(
+            choice.value, choice.label, choice.description,
+            clone_children(choice.children, f'{key}::{choice.value}'),
+            choice.on_select))
+    return SettingNode(
+        key=key, label=node.label, kind=node.kind, path=node.path,
+        choices=choices,
+        minimum=node.minimum, maximum=node.maximum, hint=node.hint,
+        action=node.action, value_text=node.value_text, lock=node.lock,
+    )
+
+
 def build_settings_tree(config: AppConfig) -> list[SettingNode]:
 
     accent_choices = [
@@ -184,8 +281,9 @@ def build_settings_tree(config: AppConfig) -> list[SettingNode]:
     accent = _choice('ui.accent', 'Accent colour', 'ui.accent', accent_choices)
     accent_text = _text('ui.accent_custom', 'Custom accent (hex)', 'ui.accent',
                         'Type a #rrggbb value')
+    language = _language_node()
     appearance = [
-        theme, accent, accent_text,
+        theme, accent, accent_text, language,
         _bool('ui.header', 'Show header', 'ui.show_header'),
         _bool('ui.tokens', 'Show token status', 'ui.show_token_status'),
         _number('ui.scroll', 'Mouse wheel lines', 'ui.mouse_scroll_lines', 1, 30),
@@ -294,9 +392,11 @@ def build_settings_tree(config: AppConfig) -> list[SettingNode]:
         _number('hold.delay', 'Seconds between retries', 'hold.delay', 0, 600),
     ]
 
+    effort_node = _choice('reasoning.effort', 'Reasoning effort', 'reasoning.effort',
+                          [SettingChoice(value, value.capitalize())
+                           for value in REASONING_EFFORTS])
     reasoning = [
-        _choice('reasoning.effort', 'Reasoning effort', 'reasoning.effort',
-                [SettingChoice(value, value.capitalize()) for value in REASONING_EFFORTS]),
+        effort_node,
         _bool('reasoning.force', 'Force reasoning parameters', 'reasoning.force',
               'Send reasoning fields even when model metadata is missing'),
         _number('max_output', 'Max output tokens', 'max_output_tokens', 256, 2_000_000),
@@ -346,6 +446,24 @@ def build_settings_tree(config: AppConfig) -> list[SettingNode]:
                    str(path) for path in _skill_roots(cfg))),
     ]
 
+    security = [
+        _choice('security.mode', 'Approval mode', 'security.mode', [
+            SettingChoice('off', 'Off', 'Everything runs; every call is audited'),
+            SettingChoice('ask', 'Ask', 'Effectful tools wait for your yes'),
+        ], 'Ask before the shell, the network or spawning a worker'),
+        _access_node(),
+        _project_access_node(),
+        _label('security.project', 'Project', lambda cfg: str(_project_root())),
+        _text('security.network', 'Allowed hosts',
+              'security.network_allowlist', 'Empty allows every host'),
+        _text('security.deny', 'Refused tools', 'security.deny_tools',
+              'Separate names with ;'),
+        _number('security.timeout', 'Approval timeout (s)',
+                'security.approval_timeout', 5, 3600),
+        _label('security.audit', 'Audit trail',
+               lambda cfg: str(_audit_path())),
+    ]
+
     mcp = [
         _label('mcp.servers', 'Configured servers',
                lambda cfg: ', '.join(str(server.get('name', '?'))
@@ -363,15 +481,32 @@ def build_settings_tree(config: AppConfig) -> list[SettingNode]:
         'steps.collapse_after_completion',
         'Once the answer is in, fold the turn\'s steps into one line: '
         'Thought for N tokens, bash x2, edit')
+    preset_node = _step_preset_node()
+
+    # The pinned section: the settings a user changes most often, in one
+    # place at the top of the tree.  The entries are copies of the real
+    # settings -- same paths, same choices -- so editing one here edits the
+    # setting itself and both copies stay in step.
+    recents = [
+        _clone_node(theme, 'recent:ui.theme'),
+        _clone_node(language, 'recent:ui.locale'),
+        _clone_node(accent, 'recent:ui.accent'),
+        _clone_node(preset_node, 'recent:steps.preset'),
+        _clone_node(effort_node, 'recent:reasoning.effort'),
+        _clone_node(chain_item, 'recent:tools.chain'),
+    ]
 
     return [
+        SettingNode(key='group:Recents', label='Recents', kind='group',
+                    choices=[]),
+        *recents,
         SettingNode(key='group:Appearance', label='Appearance', kind='group',
                     choices=[], value_text=None),
         *appearance,
         SettingNode(key='group:Work steps', label='Work steps', kind='group',
                     choices=[]),
         collapse_item,
-        _step_preset_node(),
+        preset_node,
         thinking_item,
         thinking_after,
         tool_item,
@@ -394,9 +529,30 @@ def build_settings_tree(config: AppConfig) -> list[SettingNode]:
         *agents,
         SettingNode(key='group:Skills', label='Skills', kind='group', choices=[]),
         *skills,
+        SettingNode(key='group:Security', label='Security', kind='group',
+                    choices=[]),
+        *security,
         SettingNode(key='group:MCP', label='MCP', kind='group', choices=[]),
         *mcp,
     ]
+
+
+def _audit_path():
+    """Where the audit trail lives: the state database."""
+    from adcode.paths import db_path
+    return db_path()
+
+
+def _project_root() -> str:
+    from adcode.paths import project_root
+    return project_root() or '(the current directory)'
+
+
+def _effective_access(config: AppConfig) -> str:
+    """The access level in force for the project of this session."""
+    from adcode.access import effective_access
+    from adcode.paths import project_root
+    return effective_access(config, project_root())
 
 
 def _skill_roots(config: AppConfig):
@@ -440,8 +596,8 @@ class SettingsOverlay(Overlay):
                 rows.append(Row('setting', depth, node.key, node))
                 if node.key not in self.expanded or self._locked(node):
                     continue
-                if node.kind in ('choice', 'bool'):
-                    options = node.choices if node.kind == 'choice' else [
+                if node.kind in ('choice', 'bool', 'access'):
+                    options = node.choices if node.kind in ('choice', 'access') else [
                         SettingChoice(True, 'Yes', 'Enabled'),
                         SettingChoice(False, 'No', 'Disabled'),
                     ]
@@ -509,6 +665,10 @@ class SettingsOverlay(Overlay):
                 self.expanded.remove(key)
 
     def _get(self, node: SettingNode) -> Any:
+        if node.kind == 'access':
+            # The rule this project has of its own ('' when it follows
+            # the default).
+            return self._project_rule()
         if not node.path:
             return None
         try:
@@ -517,12 +677,33 @@ class SettingsOverlay(Overlay):
             return None
 
     def _set(self, node: SettingNode, value: Any) -> None:
+        if node.kind == 'access':
+            self._set_project_rule(str(value or ''))
+            return
         if not node.path:
             return
         try:
             set_by_path(self.config, node.path, value)
         except Exception:
             return
+
+    def _project_rule(self) -> str:
+        """The access rule stored for the project of this session."""
+        from adcode.paths import project_root
+        root = project_root()
+        rules = getattr(self.config.security, 'access_by_project', None) or {}
+        return str(rules.get(root, '') or '')
+
+    def _set_project_rule(self, level: str) -> None:
+        """Write (or drop) the rule for the project of this session."""
+        from adcode.paths import project_root
+        root = project_root()
+        rules = dict(getattr(self.config.security, 'access_by_project', None) or {})
+        if level:
+            rules[root] = level
+        else:
+            rules.pop(root, None)
+        self.config.security.access_by_project = rules
 
     # ── event handling ──────────────────────────────────────
     def _selectable(self, rows: list[Row]) -> list[int]:
@@ -612,8 +793,9 @@ class SettingsOverlay(Overlay):
         if node is None:
             return
         if self._locked(node):
-            self.notice = (f'{node.label} is read-only under this preset; '
-                           'choose Custom to edit it')
+            self.notice = self._tr(
+                '{label} is read-only under this preset; '
+                'choose Custom to edit it').format(label=self._tr(node.label))
             return
         self.notice = ''
         if row.kind == 'option' and row.option is not None:
@@ -629,7 +811,7 @@ class SettingsOverlay(Overlay):
             else:
                 self._confirm(node)
             return
-        if node.kind in ('choice', 'bool'):
+        if node.kind in ('choice', 'bool', 'access'):
             if node.key in self.expanded:
                 self._confirm(node)
             else:
@@ -766,6 +948,11 @@ class SettingsOverlay(Overlay):
                     values.append(values[-1] if values else 400)
                 self._set(node, [max(50, min(5_000, value)) for value in values])
                 return True
+            if node.path in ('security.network_allowlist', 'security.deny_tools'):
+                parts = [item.strip() for item in text.replace(';', ',').split(',')
+                         if item.strip()]
+                self._set(node, parts)
+                return True
             if node.path == 'skills.extra_paths':
                 parts = [item.strip() for item in text.replace(';', os.pathsep).split(os.pathsep)
                          if item.strip()]
@@ -780,13 +967,17 @@ class SettingsOverlay(Overlay):
         return False
 
     # ── rendering ───────────────────────────────────────────
+    def _tr(self, text: str) -> str:
+        """The text in the language the configuration asks for."""
+        return t(text, getattr(self.config.ui, 'locale', 'en'))
+
     def render(self, canvas: Canvas, width: int, height: int,
                palette: Palette, now: float) -> None:
         x, y, w, h = _panel_geometry(width, height, min(96, width - 6),
                                      desired_height=min(max(12, height - 6),
                                                         height - 2))
         _draw_backdrop(canvas, width, height, palette)
-        _draw_frame(canvas, x, y, w, h, palette, 'Settings')
+        _draw_frame(canvas, x, y, w, h, palette, self._tr('Settings'))
         rows = self._flatten()
         self._sync_cursor(rows)
         body_top = y + 2
@@ -806,10 +997,11 @@ class SettingsOverlay(Overlay):
                 canvas.fill_rect(x + 1, row_y, w - 2, 1, bg)
             indent = 2 + row.depth * 2
             if row.kind == 'group':
-                canvas.draw_text(x + 2, row_y, truncate_text(row.node.label, w - 4),
+                canvas.draw_text(x + 2, row_y,
+                                 truncate_text(self._tr(row.node.label), w - 4),
                                  palette.accent, None, BOLD)
             elif row.kind == 'label':
-                label = row.node.label + ':'
+                label = self._tr(row.node.label) + ':'
                 canvas.draw_text(x + indent, row_y, truncate_text(label, w // 2),
                                  palette.subtext, bg)
                 value = row.node.value_text(self.config) if row.node.value_text else ''
@@ -824,7 +1016,7 @@ class SettingsOverlay(Overlay):
                 canvas.draw_text(x + indent, row_y, marker,
                                  palette.muted if locked or not expanded
                                  else palette.accent, bg)
-                label = row.node.label
+                label = self._tr(row.node.label)
                 canvas.draw_text(x + indent + 2, row_y,
                                  truncate_text(label, max(8, w // 2)),
                                  palette.muted if locked else palette.text, bg,
@@ -843,14 +1035,16 @@ class SettingsOverlay(Overlay):
                 glyph = '● ' if chosen else '○ '
                 canvas.draw_text(x + indent, row_y, glyph,
                                  palette.accent if chosen else palette.muted, bg)
+                option_label = self._tr(row.option.label)
                 canvas.draw_text(x + indent + 2, row_y,
-                                 truncate_text(row.option.label, w - indent - 6),
+                                 truncate_text(option_label, w - indent - 6),
                                  palette.text, bg, BOLD if selected else 0)
                 if row.option.description:
-                    desc_x = x + indent + 3 + text_width(row.option.label)
+                    desc_x = x + indent + 3 + text_width(option_label)
                     if desc_x < x + w - 4:
                         canvas.draw_text(desc_x, row_y, truncate_text(
-                            row.option.description, x + w - 4 - desc_x),
+                            self._tr(row.option.description),
+                            x + w - 4 - desc_x),
                             palette.muted, bg, DIM)
             if selected and self.editing and row.kind == 'setting' \
                     and row.node.key == self.edit_key:
@@ -860,13 +1054,20 @@ class SettingsOverlay(Overlay):
             row_y += 1
         if self.edit_error:
             canvas.draw_text(x + 2, y + h - 3, self.edit_error, palette.error)
-        hint = ('type a value · enter apply · esc cancel' if self.editing
-                else '↑↓ move · enter expand/select · esc back')
+        hint = (self._tr('type a value · enter apply · esc cancel') if self.editing
+                else self._tr('↑↓ move · enter expand/select · esc back'))
         if self.notice and not self.editing:
             hint = self.notice
         _draw_hint(canvas, x, y + h - 2, w, hint, palette)
 
     def _display_value(self, node: SettingNode) -> str:
+        if node.kind == 'access':
+            rule = self._project_rule()
+            if rule:
+                return self._tr(ACCESS_LABELS.get(rule, rule))
+            default = getattr(self.config.security, 'access', 'full')
+            return self._tr('{} (default)'.format(
+                ACCESS_LABELS.get(default, default)))
         if node.kind == 'bool':
             return 'on' if self._get(node) else 'off'
         if node.kind in ('number',):
@@ -884,7 +1085,7 @@ class SettingsOverlay(Overlay):
             current = self._get(node)
             for choice in node.choices:
                 if _same(choice.value, current):
-                    return choice.label
+                    return self._tr(choice.label)
             return str(current) if current is not None else ''
         return ''
 

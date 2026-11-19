@@ -16,6 +16,29 @@ from adcode.theme import build_palette  # noqa: E402
 from bench.app import AppHarness  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def isolated_state(tmp_path, monkeypatch):
+    """Every test gets its own state directory.
+
+    The state -- the database, the documents, the audit trail -- lives in
+    one place now, and a test must neither read nor write the real one.
+    The directory sits *next to* the test's workspace, not inside it: the
+    rule "state never lands in the project" applies to the tests too.
+    """
+    from adcode import paths
+    from adcode.state import reset_state_store
+
+    state_dir = tmp_path.parent / f'{tmp_path.name}-state'
+    monkeypatch.setenv('ADCODE_HOME', str(state_dir))
+    paths.set_app_dir(None)
+    paths.set_project_root('')
+    reset_state_store()
+    yield
+    reset_state_store()
+    paths.set_app_dir(None)
+    paths.set_project_root('')
+
+
 @pytest.fixture()
 def config() -> AppConfig:
     cfg = AppConfig()

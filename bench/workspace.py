@@ -142,7 +142,7 @@ class Workspace:
         from harness.transcript import DbSessionStore
 
         return DbSessionStore(
-            db_path=self.root / 'adcode-home' / 'sessions' / 'adcode.db')
+            db_path=self.root / 'adcode-home' / 'adcode.db')
 
     def session_payload(self, name: str = '__last__') -> dict[str, Any]:
         return self.session_store().load(name).to_json() \

@@ -9,6 +9,7 @@ from adcode.tui.provider_ui import normalize_base_url
 class FakeApp:
     def __init__(self):
         self.config = AppConfig()
+        self.cwd = '.'
         self.loop = None
         self.notices = []
         self.messages = []
@@ -104,6 +105,29 @@ def test_dispatch_help_and_max_tokens():
     assert app.config.max_output_tokens == 2048
     dispatch(app, '/max_tokens abc')
     assert any('Usage' in text for _, text in app.notices)
+
+
+def test_permissions_shows_and_sets_the_level(tmp_path):
+    """``/permissions`` is the switch for the project's access level."""
+    from adcode import paths
+
+    paths.set_project_root(str(tmp_path))
+    app = FakeApp()
+    app.config.security.access = 'readonly'
+
+    dispatch(app, '/permissions')
+    assert app.messages and app.messages[0][0] == 'select', app.messages
+
+    dispatch(app, '/permissions workspace')
+    root = str(tmp_path.resolve())
+    assert app.config.security.access_by_project.get(root) == 'workspace'
+    assert app.notices, app.notices
+
+    dispatch(app, '/permissions default')
+    assert root not in app.config.security.access_by_project
+
+    dispatch(app, '/permissions nonsense')
+    assert any('nonsense' in text for _, text in app.notices), app.notices
 
 
 def test_normalize_base_url():

@@ -32,7 +32,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from adcode import paths
 
 #: The header Console reads.
 SESSION_HEADER = 'x-opencode-session'
@@ -84,8 +83,9 @@ class OpencodeSessions:
     """
 
     def __init__(self, path: str | os.PathLike[str] | None = None) -> None:
-        self._path = (Path(path) if path is not None
-                      else paths.opencode_sessions_file())
+        # No path means the state database (the default); a path means the
+        # file route, for tools and tests.
+        self._path = Path(path) if path is not None else None
         self._lock = threading.RLock()
         self._ids: dict[str, str] | None = None
         # The live conversation's id: bound to a session name once the engine
@@ -126,25 +126,67 @@ class OpencodeSessions:
         with self._lock:
             return self._load().get(name, '')
 
+    def rename(self, old: str, new: str) -> str:
+        """Move the id of one session name to another.
+
+        A renamed conversation keeps the Console id it was written under, so
+        the prompt cache of the session survives the rename.
+        """
+        old = str(old or '')
+        new = str(new or '')
+        if not new or old == new:
+            return self.of(new)
+        with self._lock:
+            ids = self._load()
+            session_id = ids.pop(old, '')
+            if session_id:
+                ids[new] = session_id
+                self._remember(new, session_id)
+            if self._bound == old:
+                self._bound = new
+                self._id = session_id or self._id
+            return session_id
+
     # ── persistence ─────────────────────────────────────────
     def _load(self) -> dict[str, str]:
         with self._lock:
             if self._ids is None:
+                raw = self._read()
                 ids: dict[str, str] = {}
-                try:
-                    raw = json.loads(self._path.read_text('utf-8'))
-                except (OSError, ValueError):
-                    raw = {}
                 if isinstance(raw, dict):
                     ids = {str(name): str(value) for name, value in raw.items()
                            if isinstance(value, str) and value}
                 self._ids = ids
             return self._ids
 
+    def _read(self) -> Any:
+        """The ids, from the database or from the file."""
+        if self._path is None:
+            from adcode.state import KEY_OPENCODE, documents
+            from adcode.state import import_legacy_document
+            try:
+                import_legacy_document(KEY_OPENCODE,
+                                       'opencode_sessions.json')
+                document = documents().load(KEY_OPENCODE) or {}
+            except Exception:      # noqa: BLE001 - no database, no ids
+                return {}
+            return document.get('ids', document)
+        try:
+            return json.loads(self._path.read_text('utf-8'))
+        except (OSError, ValueError):
+            return {}
+
     def _remember(self, name: str, session_id: str) -> None:
         with self._lock:
             ids = self._load()
             ids[name] = session_id
+            if self._path is None:
+                from adcode.state import KEY_OPENCODE, documents
+                try:
+                    documents().save(KEY_OPENCODE, {'ids': dict(ids)})
+                except Exception:      # noqa: BLE001 - remembered for this run
+                    pass
+                return
             target = self._path
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)

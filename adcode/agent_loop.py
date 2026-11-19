@@ -40,7 +40,10 @@ from adcode.llm.client import LLMClient
 from adcode.llm.session import OpencodeSessions
 from adcode import paths
 from adcode.system_prompt import build_system_prompt
+from adcode.access import effective_access
+from adcode.security import AuditSink, build_guard
 from adcode.tools.builtin import install_coding_tools, shutdown_shell_sessions
+from adcode.tools.specs import attach_registry_specs, set_sandbox_level
 from adcode.tools.todo import install_todo_tool
 
 # The snapshot the TUI renders is the engine's own dataclass; the fields are
@@ -106,7 +109,9 @@ class AgentLoop:
 
     def __init__(self, config: AppConfig, registry, store: Any,
                  goals, skills, emit: Callable[[str, dict[str, Any]], None] | None = None,
-                 mcp_manager: Any = None, cwd: str = '') -> None:
+                 mcp_manager: Any = None, cwd: str = '',
+                 approval_ask: Any = None,
+                 notice: Any = None) -> None:
         self.config = config
         self.mcp = mcp_manager
         self.cwd = cwd
@@ -133,6 +138,29 @@ class AgentLoop:
         install_todo_tool(registry)
         registry.unregister_source('collab')
         registry.unregister_source('skill')
+        # Every tool declares what it does; the guard reads those declarations.
+        attach_registry_specs(registry)
+        # One door in front of every tool call: policy, approval, sandbox and
+        # the audit trail.  In 'off' mode nothing waits for a human, but the
+        # trail is written either way.
+        self.audit = AuditSink(on_event=self._on_audit_event,
+                               session_id=lambda: self.session_name)
+        self._approval_ask = approval_ask
+        # a place to put a line in the user's transcript (the app owns it)
+        self._notice = notice or (lambda text, level: None)
+        # What the agent may do to this project, right now.
+        self.access = effective_access(config, self.cwd)
+        self.guard = build_guard(config.security, sink=self.audit,
+                                 ask=approval_ask,
+                                 session_id=self.session_name,
+                                 access=self.access,
+                                 workspace=self.cwd)
+        attach = getattr(registry, 'attach_guard', None)
+        if attach is not None:
+            attach(self.guard)
+        # the declaration follows the setting: 'none' must not be audited as
+        # 'workspace'
+        set_sandbox_level(registry, self.access)
         # The engine talks to one IChatClient; with failover it is a chain
         # that tries the other providers when the selected one is down.
         self._endpoints: list[LLMClient] = []
@@ -145,6 +173,13 @@ class AgentLoop:
         self._pump: threading.Thread | None = None
         self._ready = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
+
+    def _on_audit_event(self, kind: str, event: dict[str, Any]) -> None:
+        """A refused call is something the user must see right away."""
+        if kind != 'audit.denied':
+            return
+        from adcode.security import format_audit_event
+        self._notice(format_audit_event(event), 'warning')
 
     def _rebuild_clients(self, failover: FailoverSettings) -> None:
         """Build the selected client and, when enabled, the fallback chain.
@@ -282,6 +317,9 @@ class AgentLoop:
             cwd=self.cwd or '.', model=self._model_info(self.provider, self.model),
             config=self._engine_config(self.config))
         self._engine = engine
+        # The session name is only known now; the guard and the approval
+        # broker key their decisions by it.
+        self.guard.session_id = engine.session_name
         # Every endpoint stops its stream at the next chunk when the turn is
         # interrupted, so an interrupt is not stuck behind a slow response.
         for endpoint in self._endpoints:
@@ -450,6 +488,27 @@ class AgentLoop:
         if self.agents is not None:
             self.agents.set_model(provider, model, model_info, client)
 
+    def apply_access(self) -> str:
+        """Rebuild the guard for the access level that applies now.
+
+        The level can change while the session runs (the user picks another
+        one in the settings, or opens a different project), and the guard
+        holds the policy, the approval broker and the sandbox -- so it has
+        to be rebuilt, not patched.  Returns the level now in force.
+        """
+        access = effective_access(self.config, self.cwd)
+        self.access = access
+        self.guard = build_guard(self.config.security, sink=self.audit,
+                                 ask=self._approval_ask,
+                                 session_id=self.session_name,
+                                 access=access,
+                                 workspace=self.cwd)
+        attach = getattr(self._registry, 'attach_guard', None)
+        if attach is not None:
+            attach(self.guard)
+        set_sandbox_level(self._registry, access)
+        return access
+
     def refresh_tools(self) -> None:
         self._require_idle('tool refresh')
         registry = self._registry
@@ -460,6 +519,7 @@ class AgentLoop:
         specs = self.skills.tool_specs() if self.skills is not None else []
         for tool in specs:
             registry.register(tool, replace=True, source='skill')
+        attach_registry_specs(registry)
         self._call(lambda: self._engine.refresh_tools())
 
     def shutdown(self) -> None:
@@ -518,7 +578,9 @@ class AgentLoop:
 
     @property
     def session_name(self) -> str:
-        engine = self._engine
+        # The engine exists only after the loop starts, so the property has
+        # to tolerate its absence.
+        engine = getattr(self, '_engine', None)
         return engine.session_name if engine is not None else ''
 
     @property
@@ -566,6 +628,35 @@ class AgentLoop:
     def save_as(self, name: str) -> None:
         self._require_idle('session rename')
         self._sync_call(lambda: self._engine.save_as(name))
+
+    def rename_session(self, name: str) -> str:
+        """Rename the live conversation and move its saved row.
+
+        The engine saves the conversation under the new name; the row the
+        old name left behind is deleted, so a rename moves the session
+        instead of copying it.  The Console id follows the session, so the
+        prompt cache it was written under survives the rename.
+        """
+        self._require_idle('session rename')
+        new_name = str(name or '').strip()
+        if not new_name:
+            raise ValueError('session name must not be empty')
+        old_name = self.session_name
+
+        def rename() -> str:
+            engine = self._engine
+            engine.session_name = new_name
+            engine.save_active()
+            return new_name
+
+        result = self._sync_call(rename)
+        if old_name and old_name != new_name:
+            try:
+                self._store.delete(old_name)
+            except Exception:
+                pass
+        self._opencode.rename(old_name, new_name)
+        return str(result)
 
     def load_session(self, name: str) -> bool:
         self._require_idle('session load')

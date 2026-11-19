@@ -119,6 +119,28 @@ required.
 - **Sub-agents and agent teams** — configurable agent types, background ReAct
   workers, a shared workspace, mailboxes, recursive delegation limits, and
   team spawning.
+- **Logs in a file, never on the screen** — the interface owns the terminal:
+  every log record goes to `~/.adcode/adcode.log`, so a warning from a
+  library can never land on the frame and shred it.
+- **A guard in front of every tool call** — every call goes through the sdk's
+  `ToolGuard`: each tool declares what it does (read, write, shell, network,
+  collaboration), a policy decides what may run, the effectful ones can wait
+  for your yes (answered once per tool, not once per call), and every call
+  lands in an append-only audit trail (`/audit`).  `/config` holds the
+  switches.
+- **Three permissions per project** — *read-only* (the project can be read,
+  nothing can be changed), *workspace* (files inside the project may be
+  changed, nothing outside it) and *full access* (no boundary at all).  The
+  level belongs to the folder: `/permissions` sets it for the project you are
+  in, the settings browser sets the default for every project, and the level
+  takes effect at once — the policy, the sandbox and the shell all follow it.
+- **State in the database, never in your repository** — the sessions, the
+  todo plan, the goals, the wire cache, the prediction state, the
+  configuration and the audit trail live in one sqlite file under
+  `~/.adcode`.  The project keeps only what it owns: your code, and the work
+  the agent does.  `ADCODE_HOME` may point the state somewhere else, but
+  never into a checkout: a directory that is (or is inside) a repository is
+  refused, because a repository is for code and session state is not.
 - **Sub-agent visibility** — while background workers run, a strip above the
   prompt lists them with their state, elapsed time, the step they are on and a
   tail of what they are producing; `ctrl+g` (or `/agents show`) opens any
@@ -162,6 +184,17 @@ Or with uv:
 
 ```bash
 uv sync
+```
+
+The engine sdk (`aicf-core`) is the foundation of this app. The app needs
+`aicf-core>=1.0.0rc2`, which is where the **document store**
+(`infra.store.documents`) and the **sandbox write level** that follows the
+tool's own declaration (`ToolSpec.sandbox='readonly'`) landed. To work on
+the sdk itself, use the local checkout instead:
+
+```bash
+# the sdk the app is developed against
+pip install -e ~/DSN-exp          # harness/ + infra/ from the local checkout
 ```
 
 Run it:
@@ -379,7 +412,8 @@ is sent to the model like every other message.
 | Command | Description |
 |---|---|
 | `/help` | Commands and key bindings |
-| `/config` | Open the settings browser |
+| `/config` or `/settings` | Open the settings browser |
+| `/permissions [level]` | What the agent may do to this project |
 | `/keys` | Open the key bindings panel |
 | `/model [list\|edit]` | Switch models or edit the selected model's capabilities |
 | `/provider add\|edit\|remove\|list` | Manage providers and their models |
@@ -401,6 +435,7 @@ is sent to the model like every other message.
 | `/respawn` | Restore this archived session and accept messages again |
 | `/perish` | Delete this session for good (asks first) |
 | `/save [name]` / `/load [name]` | Save / load a session |
+| `/rename [name]` | Rename the current session; without a name it asks for one |
 | `/rewind` | Roll the conversation back to an earlier turn |
 | `/edit` | Rewind to a turn and prefill its message for editing |
 | `/fork [name]` | Fork the conversation into a new session |
@@ -411,7 +446,8 @@ is sent to the model like every other message.
 
 ## Settings (`/config`)
 
-`/config` is a tree of grouped settings rendered as a modal panel:
+`/config` opens a tree of grouped settings rendered as a modal panel.
+`/settings` is the same command under its other name.
 
 - **Move** with Up/Down.
 - **Enter** expands a setting vertically, selects an option, or starts inline
@@ -420,6 +456,36 @@ is sent to the model like every other message.
   closes the panel. Nothing is taken back: every change is applied and saved
   the moment it is made, which is also why there is no Ctrl+S to press.
 - **Enter on an expanded setting's title** confirms it and collapses it.
+
+The tree opens with a pinned **Recents** section: the settings that are
+changed most often (theme, language, accent colour, work-step preset,
+reasoning effort, call chain), each one a copy of the real setting, so
+editing it there edits the setting itself.
+
+### Language
+
+The interface speaks English and Simplified Chinese. The language is a
+setting like any other: **Appearance → Language**, or the pinned **Recents**
+entry, switches it at once; `adcode --locale zh` sets it for one run. A
+string without a Chinese counterpart simply stays English.
+
+### Project access
+
+**Security → Project access** is the default for every project;
+**Security → This project** is the rule for the folder you are working in
+(the two differ only when you have set one). The three levels are:
+
+| level | what the agent may do |
+|---|---|
+| Read-only | read the project; change nothing, not even a temporary file |
+| Workspace | change files inside the project; nothing outside it |
+| Full access | no boundary — the agent runs with your own rights |
+
+Read access is the same in all three: a read-only project is still
+readable, that is the point of it. The level takes effect at once — the
+policy, the sandbox and the shell are rebuilt the moment it changes, and
+the approval dialog tells you which level is in force. `/permissions` does
+the same thing without opening the settings.
 
 Selecting an option that has children expands its sub-settings automatically.
 Changes apply to the running app immediately (theme and accent included) and
@@ -661,6 +727,7 @@ there automatically on first load. A minimal file looks like this:
         }
     ],
     "selected_model": "DeepSeek::deepseek-chat",
+    "ui": {"theme": "dark", "accent": "#8fa7d6", "locale": "en"},
     "thinking": {"mode": "partial", "style": "gradient"},
     "tools": {"mode": "both", "chain": "separate", "result_mode": "partial"},
     "hold": {"enabled": false, "max_retries": 20, "delay": 2},
@@ -672,6 +739,9 @@ there automatically on first load. A minimal file looks like this:
     "agent_teams": {}
 }
 ```
+
+`ui.locale` is the interface language (`en` or `zh`); it is the same setting
+as **Appearance → Language** in the settings browser.
 
 `selected_model` uses the `provider::model` form. `agent_types` and
 `agent_teams` default to the built-in sets (general, explorer, reviewer,
@@ -785,6 +855,10 @@ session files are migrated on load.
   and resend.
 - `/fork` copies the conversation into a new session and continues there.
 - `/save` / `/load` / `/sessions` manage named sessions.
+- `/rename` renames the session you are in: the conversation is saved under
+  the new name and the old row is removed, so the session is moved, not
+  copied.  The Console session id follows it, so the prompt cache of the
+  conversation survives the rename.
 
 ### Archived sessions
 
@@ -803,7 +877,7 @@ new run resumes.
   send a turn or rewrite the stored conversation (`/btw`, `/compact`,
   `/edit`, `/fork`, `/goal`, `/image`, `/rewind`, `/save`), and the ones
   that retune the engine behind it (`/effort`, `/hold`, `/max_tokens`,
-  `/model`, `/provider`, `/steps`, `/thinking`).  Every other command keeps
+  `/model`, `/provider`, `/steps`, `/thinking`), and `/rename`.  Every other command keeps
   working -- `/help`, `/config`, `/keys`, `/sessions`, `/load`, `/diff`,
   `/quit`, and `/new`, which starts a live session and leaves the archived
   one exactly as it was.
@@ -818,8 +892,8 @@ new run resumes.
   modifiers](#chords-on-punctuation-and-held-modifiers).  In the web UI the
   `Alt` button on the key bar sends the same event.
 
-Goals live in `sessions/goals.json` and are injected into the system prompt
-while active. Global instructions are read from `~/.adcode/AGENTS.md` and
+Goals live in the state database (`~/.adcode/adcode.db`) and are injected
+into the system prompt while active. Global instructions are read from `~/.adcode/AGENTS.md` and
 project instructions from `AGENTS.md` (or `prompt`) in the working directory.
 Both are inserted into the system prompt; when they conflict, the project
 instructions take precedence.

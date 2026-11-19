@@ -53,7 +53,13 @@ def test_the_panel_appears_above_the_prompt_and_follows_updates(harness):
     harness.wait_idle(20.0)
     frame = harness.wait_for_text('write the fix')
 
-    assert (harness.workspace.project / '.harness_todo.json').exists()
+    # the plan lives in the state database -- the project stays clean
+    assert not (harness.workspace.project / '.harness_todo.json').exists()
+    from adcode.tools.todo import todo_store
+    plan = todo_store(str(harness.workspace.project)).active_plan()
+    assert plan is not None
+    assert [item.title for item in plan.items] == ['read the collab code',
+                                                   'write the fix']
 
     # the panel sits directly above the input bar, carrying the real state
     rows = _panel_rows(frame)

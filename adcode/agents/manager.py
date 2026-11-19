@@ -182,6 +182,16 @@ class AgentManager(SdkAgentManager):
         """The goal tool rides along with the collaboration suite."""
         return self._goal_tools()
 
+    def reinstall_tools(self) -> None:
+        """Re-register the collaboration tools, with their declared specs.
+
+        The sdk's collaboration tools carry no spec, which would make the
+        guard treat spawning a worker as the strictest case there is.
+        """
+        super().reinstall_tools()
+        from adcode.tools.specs import attach_registry_specs
+        attach_registry_specs(self._registry)
+
     # ── goal tool ───────────────────────────────────────────
     def _goal_tools(self) -> list[AnnotatedTool]:
         def update_goal(status: str = '', result: str = '') -> str:

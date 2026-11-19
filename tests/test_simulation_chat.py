@@ -114,7 +114,10 @@ def test_alt_v_sends_a_native_image_part(harness_factory, wire):
     session = harness.workspace.session_payload()
     assert session
     content = session['messages'][0]['content']
-    assert isinstance(content, str) and '[image: sessions/images/paste-' in content
+    # the marker points at the state directory, not at the project
+    assert isinstance(content, str) and '[image: ' in content
+    assert '/images/paste-' in content
+    assert 'sessions/images' not in content
     assert 'base64' not in content
     user_items = [text for kind, text in harness.transcript_texts()
                   if kind == 'user']

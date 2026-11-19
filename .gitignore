@@ -5,12 +5,19 @@ __pycache__/
 .pi/
 .dsh-tool-vision/
 .zcode/
+# The state of an older version: it used to drop these into the project.
+# AdCode keeps its state in the database now (see the README), so these
+# entries are only a safety net for a checkout that still has them.
 sessions/
 images/
 config.json
 wires.json
 opencode_sessions.json
 .harness_todo.json
+audit.jsonl
+adcode.log
+predictor.json
+*.db
 .ruff_cache/
 .mypy_cache/
 harness-output/

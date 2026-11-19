@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 import secrets
 import sys
+
+from adcode.i18n import LOCALES
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -32,10 +35,24 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--no-resume', action='store_true',
         help='start a new conversation instead of resuming the last one')
+    parser.add_argument(
+        '--locale', default=None, choices=list(LOCALES),
+        help='language of the interface: en or zh '
+             '(default: the one saved in the configuration)')
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    # The project comes first: the state directory is resolved against it,
+    # and the log file is one of the things that lives there.  Without this
+    # the log file would be opened before the app knows which directory it
+    # is working in -- and it would land in the wrong place.
+    from adcode import paths
+    paths.set_project_root(os.getcwd())
+    # Before anything else: the logs go to a file.  A stray warning on
+    # stderr would land on the full-screen interface and destroy the frame.
+    from adcode.logging_setup import configure_logging
+    configure_logging()
     args = _build_parser().parse_args(argv)
     if args.web:
         from adcode.web.server import run_web
@@ -56,6 +73,11 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as error:
         print(f'AdCode failed to start: {error}', file=sys.stderr)
         return 1
+    if args.locale:
+        # The flag wins over the saved language for this run; the settings
+        # browser can change it again.
+        app.config.ui.locale = args.locale
+        app.config_changed()
     try:
         app.run()
     except KeyboardInterrupt:

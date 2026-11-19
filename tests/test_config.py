@@ -73,7 +73,8 @@ def test_roundtrip(tmp_path):
     assert reloaded.selected()[1].id == 'm'
 
 
-def test_legacy_config_moves_to_home(tmp_path, monkeypatch):
+def test_the_legacy_config_file_moves_into_the_database(tmp_path, monkeypatch):
+    """The configuration is state, and state lives in the database now."""
     legacy = tmp_path / 'checkout' / 'config.json'
     legacy.parent.mkdir()
     legacy.write_text(json.dumps({
@@ -88,8 +89,12 @@ def test_legacy_config_moves_to_home(tmp_path, monkeypatch):
     cfg = ConfigStore().load()
 
     assert cfg.thinking.mode == 'partial'
-    assert target.exists()
-    assert not legacy.exists()
+    from adcode.state import KEY_CONFIG, documents
+    document = documents().load(KEY_CONFIG)
+    assert document, 'the configuration must be in the database'
+    assert document['thinking']['mode'] == 'partial'
+    assert not legacy.exists(), 'the old file is taken over, not left behind'
+    assert not target.exists(), 'the configuration is not a file any more'
 
 
 def test_model_metadata():

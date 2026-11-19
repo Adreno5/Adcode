@@ -40,11 +40,11 @@ def test_settings_panel_switches_the_theme_in_the_temp_config(harness):
     harness.press('down')
     harness.wait_until(
         lambda: harness.overlay is not None
-        and getattr(harness.overlay, 'row_key', '') == 'ui.theme',
+        and getattr(harness.overlay, 'row_key', '') == 'recent:ui.theme',
         timeout=5.0, description='the Theme row to be selected')
     harness.press('enter')
     harness.wait_until(
-        lambda: 'ui.theme' in getattr(harness.overlay, 'expanded', []),
+        lambda: 'recent:ui.theme' in getattr(harness.overlay, 'expanded', []),
         timeout=5.0, description='the Theme row to expand')
     harness.press('down')
     harness.press('down')
@@ -81,27 +81,27 @@ def test_settings_panel_keeps_the_cursor_on_the_edited_item(harness):
                        description='the settings overlay')
     harness.press('down')
     harness.wait_until(
-        lambda: getattr(harness.overlay, 'row_key', '') == 'ui.theme',
+        lambda: getattr(harness.overlay, 'row_key', '') == 'recent:ui.theme',
         timeout=5.0, description='the Theme row to be selected')
     harness.press('enter')
     harness.wait_until(
-        lambda: 'ui.theme' in getattr(harness.overlay, 'expanded', []),
+        lambda: 'recent:ui.theme' in getattr(harness.overlay, 'expanded', []),
         timeout=5.0, description='the Theme row to expand')
     harness.press('down')
     harness.press('down')
     harness.wait_until(
-        lambda: getattr(harness.overlay, 'row_key', '') == 'ui.theme::light',
+        lambda: getattr(harness.overlay, 'row_key', '') == 'recent:ui.theme::light',
         timeout=5.0, description='the Light option to be highlighted')
     harness.press('enter')
 
     # Choosing an option with no children collapses the item; the cursor has
     # to stay on that item instead of falling back to the top of the tree.
     harness.wait_until(
-        lambda: getattr(harness.overlay, 'row_key', '') == 'ui.theme',
+        lambda: getattr(harness.overlay, 'row_key', '') == 'recent:ui.theme',
         timeout=5.0, description='the cursor to stay on the Theme row')
     harness.press('down')
     harness.wait_until(
-        lambda: getattr(harness.overlay, 'row_key', '') == 'ui.accent',
+        lambda: getattr(harness.overlay, 'row_key', '') == 'recent:ui.locale',
         timeout=5.0, description='the next row after Theme to be selected')
 
     harness.press('esc')
@@ -115,16 +115,16 @@ def test_escape_restores_the_values_captured_when_an_item_expanded(harness):
                        description='the settings overlay')
     harness.press('down')
     harness.wait_until(
-        lambda: getattr(harness.overlay, 'row_key', '') == 'ui.theme',
+        lambda: getattr(harness.overlay, 'row_key', '') == 'recent:ui.theme',
         timeout=5.0, description='the Theme row to be selected')
     harness.press('enter')
     harness.wait_until(
-        lambda: 'ui.theme' in getattr(harness.overlay, 'expanded', []),
+        lambda: 'recent:ui.theme' in getattr(harness.overlay, 'expanded', []),
         timeout=5.0, description='the Theme row to expand')
     harness.press('down')
     harness.press('down')
     harness.wait_until(
-        lambda: getattr(harness.overlay, 'row_key', '') == 'ui.theme::light',
+        lambda: getattr(harness.overlay, 'row_key', '') == 'recent:ui.theme::light',
         timeout=5.0, description='the Light option to be highlighted')
     assert harness.app is not None
     assert harness.app.config.ui.theme == 'dark'
@@ -152,11 +152,11 @@ def test_a_setting_is_persisted_without_pressing_ctrl_s(harness):
                        description='the settings overlay')
     harness.press('down')
     harness.wait_until(
-        lambda: getattr(harness.overlay, 'row_key', '') == 'ui.theme',
+        lambda: getattr(harness.overlay, 'row_key', '') == 'recent:ui.theme',
         timeout=5.0, description='the Theme row to be selected')
     harness.press('enter')
     harness.wait_until(
-        lambda: 'ui.theme' in getattr(harness.overlay, 'expanded', []),
+        lambda: 'recent:ui.theme' in getattr(harness.overlay, 'expanded', []),
         timeout=5.0, description='the Theme row to expand')
     harness.press('down')
     harness.press('down')

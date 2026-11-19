@@ -42,9 +42,9 @@ def current(overlay):
 def test_tree_contains_all_groups(config):
     tree = build_settings_tree(config)
     groups = [node.label for node in tree if node.kind == 'group']
-    assert groups == ['Appearance', 'Work steps', 'Footer status', 'Hold',
-                      'Failover', 'Reasoning', 'Context',
-                      'Sub-agents and teams', 'Skills', 'MCP']
+    assert groups == ['Recents', 'Appearance', 'Work steps', 'Footer status',
+                      'Hold', 'Failover', 'Reasoning', 'Context',
+                      'Sub-agents and teams', 'Skills', 'Security', 'MCP']
 
 
 def test_expand_and_choose(config):
@@ -182,7 +182,8 @@ def test_accent_and_custom_hex(config):
 def test_first_down_reaches_the_first_setting(config):
     overlay = SettingsOverlay(config, lambda: None)
     overlay.handle(key('down'))
-    assert current(overlay) == 'ui.theme'
+    # The pinned Recents section comes first: the theme is its first entry.
+    assert current(overlay) == 'recent:ui.theme'
 
 
 def test_cursor_stays_after_choosing_a_bool_value(config):
@@ -381,3 +382,48 @@ def test_every_label_position_offers_the_token_count(config):
     walk_to(overlay, 'thinking.label_tokens::True')
     overlay.handle(key('enter'))
     assert config.thinking.label_tokens is True
+
+
+def test_the_access_levels_are_in_the_security_group(config):
+    tree = build_settings_tree(config)
+    keys = [node.key for node in tree]
+    assert 'security.access' in keys, 'the default level'
+    assert 'security.project_access' in keys, 'the level of this project'
+    node = next(node for node in tree if node.key == 'security.access')
+    assert [choice.value for choice in node.choices] == ['readonly',
+                                                         'workspace', 'full']
+
+
+def test_the_default_level_is_chosen_in_the_browser(config):
+    overlay = SettingsOverlay(config, lambda: None)
+    focus(overlay, 'security.access')
+    overlay.handle(key('enter'))
+    index, _ = find_row(overlay, 'security.access::readonly')
+    overlay.row = index
+    overlay.row_key = 'security.access::readonly'
+    overlay.handle(key('enter'))
+    assert config.security.access == 'readonly'
+
+
+def test_the_project_rule_is_its_own_setting(config, tmp_path, monkeypatch):
+    """The level of the project this session is in."""
+    from adcode import paths
+
+    monkeypatch.setattr(paths, 'PROJECT_ROOT', str(tmp_path))
+    overlay = SettingsOverlay(config, lambda: None)
+    focus(overlay, 'security.project_access')
+    overlay.handle(key('enter'))
+    index, _ = find_row(overlay, 'security.project_access::workspace')
+    overlay.row = index
+    overlay.row_key = 'security.project_access::workspace'
+    overlay.handle(key('enter'))
+    assert config.security.access_by_project[str(tmp_path.resolve())] == 'workspace'
+
+    # and back to the default
+    focus(overlay, 'security.project_access')
+    overlay.handle(key('enter'))
+    index, _ = find_row(overlay, 'security.project_access::')
+    overlay.row = index
+    overlay.row_key = 'security.project_access::'
+    overlay.handle(key('enter'))
+    assert str(tmp_path.resolve()) not in config.security.access_by_project

@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import threading
 from typing import Any, AsyncGenerator, Callable, Generator
 
@@ -39,7 +38,6 @@ from harness.images import (
     iter_segments, resolve_image,
 )
 
-from adcode import paths
 from adcode.config import ModelConfig, ProviderConfig
 from adcode.llm.session import (
     SESSION_HEADER, sends_session_header,
@@ -79,15 +77,22 @@ _WIRE_CACHE_LOCK = threading.RLock()
 _wire_cache: dict[str, dict[str, str]] | None = None
 
 
+def _read_wire_cache() -> Any:
+    """The learned wires, from the state database."""
+    try:
+        from adcode.state import KEY_WIRES, documents, import_legacy_document
+        import_legacy_document(KEY_WIRES, 'wires.json')
+        return documents().load(KEY_WIRES) or {}
+    except Exception:      # noqa: BLE001 - no database, no lessons
+        return {}
+
+
 def _load_wire_cache() -> dict[str, dict[str, str]]:
     global _wire_cache
     with _WIRE_CACHE_LOCK:
         if _wire_cache is None:
             overrides: dict[str, dict[str, str]] = {}
-            try:
-                raw = json.loads(paths.wire_cache_file().read_text('utf-8'))
-            except (OSError, ValueError):
-                raw = {}
+            raw = _read_wire_cache()
             if isinstance(raw, dict):
                 for scope, mapping in raw.items():
                     if not isinstance(mapping, dict):
@@ -115,14 +120,11 @@ def remember_wire(scope: str, broken: str, working: str) -> None:
             return
         overrides.setdefault(scope, {})[broken] = working
         _wire_cache = overrides
-        target = paths.wire_cache_file()
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_suffix('.tmp')
-            temporary.write_text(json.dumps(overrides, indent=2), 'utf-8')
-            os.replace(temporary, target)
-        except OSError:
-            pass      # learned for this process; the file is a shortcut only
+            from adcode.state import KEY_WIRES, documents
+            documents().save(KEY_WIRES, overrides)
+        except Exception:      # noqa: BLE001 - learned for this process only
+            pass
 
 
 _SEQUENCE_ERRORS = (IndexError, AssertionError, RuntimeError)

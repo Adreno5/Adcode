@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from adcode.i18n import t
 from adcode.theme import Palette
 from adcode.tui.canvas import BOLD, DIM, Canvas, text_width, truncate_text
 from adcode.tui.input import KeyEvent, get_clipboard, is_paste_key
@@ -222,9 +223,9 @@ class MessageDialog(Overlay):
             _draw_spans(canvas, x + 3, y + 2 + index, line, palette)
         _draw_scroll_marker(canvas, x + w - 1, y + 2, body_rows, len(body), top,
                             palette)
-        hint = 'enter / esc close'
+        hint = t('enter / esc close')
         if self.body.scrollable():
-            hint = '↑↓ / wheel scroll · ' + hint
+            hint = t('↑↓ / wheel scroll · ') + hint
         _draw_hint(canvas, x, y + h - 2, w, hint, palette)
 
 
@@ -361,8 +362,9 @@ class SelectDialog(Overlay):
         total = len(visible)
         if total == 0:
             _draw_frame(canvas, x, y, w, h, palette, self.title)
-            canvas.draw_text(x + 3, y + 2, '(nothing to select)', palette.muted)
-            _draw_hint(canvas, x, y + h - 2, w, 'esc close', palette)
+            canvas.draw_text(x + 3, y + 2, t('(nothing to select)'),
+                             palette.muted)
+            _draw_hint(canvas, x, y + h - 2, w, t('esc close'), palette)
             return
         self.index = max(0, min(self.index, total - 1))
         body_height = h - 5
@@ -405,11 +407,11 @@ class SelectDialog(Overlay):
                     palette.muted, bg, DIM)
             row += 1
         if self.allow_filter and self.filter:
-            canvas.draw_text(x + 2, y + h - 3, 'filter: ' + self.filter,
+            canvas.draw_text(x + 2, y + h - 3, t('filter: ') + self.filter,
                              palette.subtext, None, DIM)
-        hint = self.footer or '↑↓ move · enter select · esc cancel'
+        hint = self.footer or t('↑↓ move · enter select · esc cancel')
         if self.allow_filter:
-            hint += ' · type to filter'
+            hint += t(' · type to filter')
         _draw_hint(canvas, x, y + h - 2, w, hint, palette)
 
 
@@ -600,9 +602,9 @@ class MultiSelectDialog(Overlay):
                     palette.muted, bg, DIM)
             row += 1
         if self.allow_filter and self.filter:
-            canvas.draw_text(x + 2, y + h - 3, 'filter: ' + self.filter,
+            canvas.draw_text(x + 2, y + h - 3, t('filter: ') + self.filter,
                              palette.subtext, None, DIM)
-        hint = '↑↓ move · space toggle · enter confirm · esc cancel'
+        hint = t('↑↓ move · space toggle · enter confirm · esc cancel')
         if self.allow_manual:
             hint += ' · + adds a custom entry'
         _draw_hint(canvas, x, y + h - 2, w, hint, palette)
@@ -830,7 +832,8 @@ class TextPrompt(Overlay):
         if self.hint:
             canvas.draw_text(x + 3, y + 6, truncate_text(self.hint, inner_width),
                              palette.muted, None, DIM)
-        _draw_hint(canvas, x, y + h - 2, w, 'enter confirm · esc cancel', palette)
+        _draw_hint(canvas, x, y + h - 2, w, t('enter confirm · esc cancel'),
+                   palette)
 
 
 class ConfirmDialog(Overlay):
@@ -883,7 +886,7 @@ class ConfirmDialog(Overlay):
             _draw_spans(canvas, x + 3, y + 2 + index, line, palette)
         _draw_scroll_marker(canvas, x + w - 1, y + 2, body_rows, len(body), top,
                             palette)
-        hint = 'enter / y confirm · esc / n cancel'
+        hint = t('enter / y confirm · esc / n cancel')
         if self.body.scrollable():
-            hint = '↑↓ / wheel scroll · ' + hint
+            hint = t('↑↓ / wheel scroll · ') + hint
         _draw_hint(canvas, x, y + h - 2, w, hint, palette)

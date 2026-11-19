@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
+from adcode.i18n import t
 from adcode.theme import Palette
 from adcode.tui.canvas import BOLD, DIM, Canvas, text_width, truncate_text
 from adcode.tui.dialogs import (
@@ -37,7 +38,7 @@ class _Row:
 class KeybindingsPanel(Overlay):
     def __init__(self, settings: object, on_change: Callable[[], None]) -> None:
         super().__init__()
-        self.title = 'Key bindings'
+        self.title = t('Key bindings')
         self.settings = settings
         self.on_change = on_change
         self.rows = self._build_rows()
@@ -252,7 +253,7 @@ class KeybindingsPanel(Overlay):
     def _draw_row(self, canvas: Canvas, x: int, w: int, row: int,
                   absolute: int, item: _Row, palette: Palette) -> None:
         if item.kind == 'header':
-            canvas.draw_text(x + 2, row, item.group.upper(),
+            canvas.draw_text(x + 2, row, t(item.group).upper(),
                              palette.muted, None, DIM)
             return
         binding = item.binding
@@ -266,14 +267,14 @@ class KeybindingsPanel(Overlay):
         canvas.draw_text(x + 2, row, marker,
                          palette.accent if selected else palette.muted,
                          bg, BOLD if selected else 0)
-        label = truncate_text(binding.label, _LABEL_WIDTH)
+        label = truncate_text(t(binding.label), _LABEL_WIDTH)
         canvas.draw_text(x + 4, row, label, fg, bg, BOLD if selected else 0)
         desc_x = x + 4 + _LABEL_WIDTH + 2
         key_text = self._key_of(binding.action) or '(unbound)'
         key_x = max(desc_x, x + w - 2 - text_width(key_text))
         if key_x > desc_x:
             canvas.draw_text(desc_x, row, truncate_text(
-                binding.description, key_x - 1 - desc_x),
+                t(binding.description), key_x - 1 - desc_x),
                 palette.muted, bg, DIM)
         key_colour = palette.muted if not self._key_of(binding.action) \
             else palette.accent
@@ -282,17 +283,18 @@ class KeybindingsPanel(Overlay):
 
     def _status_text(self) -> str:
         if self.mode == 'capture':
-            label = self._selected_binding().label
-            return f'press a key for «{label}» · esc cancels'
+            label = t(self._selected_binding().label)
+            return t('press a key for «{label}» · esc cancels').format(label=label)
         if self.mode == 'conflict' and self.pending is not None:
             _, key, other = self.pending
-            return (f'«{key}» is bound to {binding_of(other).label} -- '
-                    'take over? enter yes · esc no')
+            return (t('«{key}» is bound to {other} -- '
+                      'take over? enter yes · esc no')
+                    .format(key=key, other=t(binding_of(other).label)))
         return self.message
 
     def _hint_text(self) -> str:
         if self.mode == 'capture':
-            return 'press a key · esc cancel'
+            return t('press a key · esc cancel')
         if self.mode == 'conflict':
-            return 'enter take over · esc cancel'
-        return 'enter rebind · r reset · esc close'
+            return t('enter take over · esc cancel')
+        return t('enter rebind · r reset · esc close')

@@ -62,7 +62,8 @@ def test_create_then_update_tracks_progress(tmp_path):
     assert [item['title'] for item in view['items']] == ['read the code',
                                                         'write the fix']
     assert view['open'] == 2 and view['status'] == 'executing'
-    assert (tmp_path / TODO_FILE).exists()
+    # The plan lives in the state database -- not in the project.
+    assert not (tmp_path / TODO_FILE).exists()
 
     text, _, error = _call(registry, {
         'action': 'update', 'id': 'item-00', 'status': 'completed'}, tmp_path)

@@ -17,8 +17,10 @@ def key(name):
 @pytest.fixture()
 def app(tmp_path):
     from adcode import paths as paths_module
-    # Keep the session store, goals and image cache out of the real ~/.adcode.
-    paths_module.set_app_dir(tmp_path / 'adcode-home')
+    # Keep the session store, goals and image cache out of the real ~/.adcode
+    # -- and out of the project: the state never lands inside the project
+    # the app is working on, so it goes next to it.
+    paths_module.set_app_dir(tmp_path.parent / f'{tmp_path.name}-adcode-home')
     instance = AdCodeApp(cwd=str(tmp_path), resume=False,
                          config_path=str(tmp_path / 'config.json'))
     try:

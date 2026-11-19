@@ -13,15 +13,18 @@ import os
 import queue
 import re
 import threading
+import uuid
 import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
+from adcode.access import effective_access
 from adcode.agent_loop import AgentLoop, AgentSnapshot
 from adcode.commands import ARCHIVED_HINT, ARCHIVED_REFUSAL
-from adcode.config import AppConfig, ConfigStore, ProviderConfig, ModelConfig
+from adcode.config import AppConfig, set_current_config, ConfigStore, ProviderConfig, ModelConfig
 from adcode.goals import GoalStore
+from adcode.i18n import t, tf
 from adcode.images import (
     ImageStore, count_image_markers, file_uri_to_path, image_marker, is_image_url,
     read_clipboard_image, resolve_image,
@@ -30,7 +33,7 @@ from infra.policy.predictor import DurationPredictor
 
 from adcode.mcp.manager import get_mcp_manager
 from adcode import paths
-from adcode.paths import goals_file, sessions_db
+from adcode.paths import sessions_db
 from adcode.session import (
     ArchivedSessionStore, TranscriptItem,
 )
@@ -55,6 +58,7 @@ from adcode.tui.text import (
     split_line_columns,
 )
 from adcode.tui import agents_panel, todo_panel
+from adcode.tui.approval import ApprovalDialog
 from adcode.tui.transcript import LiveRender, TranscriptRenderer
 
 SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
@@ -266,8 +270,27 @@ class AdCodeApp:
                  input_queue: 'queue.Queue[KeyEvent] | None' = None,
                  input_thread: InputThread | None = None) -> None:
         self.cwd = cwd or os.getcwd()
+        # The state never lands inside the project being worked on.  This has
+        # to be known before anything writes: the state directory, the
+        # database, the images, the log.
+        paths.set_project_root(self.cwd)
+        # Older versions kept their state in files -- some of them in the
+        # project itself.  The database takes over first (it has to move
+        # before anything opens it), the documents and the audit trail
+        # follow.
+        from adcode.state import (import_legacy_audit, merge_legacy_databases,
+                                  migrate_legacy_database,
+                                  migrate_legacy_images)
+        migrate_legacy_database()
+        # The logs belong in the log file: a stray warning on stderr would
+        # land on the full-screen interface and shred the frame.
+        from adcode.logging_setup import configure_logging
+        configure_logging()
         self.store = ConfigStore(config_path)
         self.config: AppConfig = self.store.load()
+        # the tools read their settings from here (they run in worker threads
+        # and have no handle on the app)
+        set_current_config(self.config)
         self.keymap = KeyMap(self.config.keys)
         # The terminal pieces are injectable so a harness can drive the real
         # application loop without owning a console (see the test harness).
@@ -280,12 +303,22 @@ class AdCodeApp:
             input_thread if input_thread is not None
             else InputThread(self.input_queue))
         self.posted: 'queue.Queue[Callable[[], None]]' = queue.Queue()
+        # One database holds the sessions, the documents and the audit
+        # trail -- and one connection writes it, so the two stores never
+        # fight over the write lock.
+        from adcode.state import state_store
+        self.state = state_store()
+        import_legacy_audit()
+        merge_legacy_databases()
+        migrate_legacy_images()
         # The store keeps the archived set beside the sessions themselves, so
         # archiving is a property of the session and not of its messages.
-        self.session_store = ArchivedSessionStore(db_path=str(sessions_db()))
-        self.images = ImageStore(os.path.join(self.cwd, 'sessions', 'images'),
-                                 self.cwd)
-        self.goals = GoalStore(str(goals_file()))
+        self.session_store = ArchivedSessionStore(store=self.state.store,
+                                                  db_path=str(sessions_db()))
+        # Images live with the state, not in the project: a repository is
+        # for code.
+        self.images = ImageStore(str(paths.images_dir()), self.cwd)
+        self.goals = GoalStore()
         self.skills = SkillRegistry(self.config.skills, self.cwd).scan()
         self.registry = ToolRegistry()
         self.mcp = get_mcp_manager(self.registry)
@@ -296,6 +329,10 @@ class AdCodeApp:
         self._todo_revision: int | None = None
         # what each sub-agent is doing right now, from its 'agent_event's
         self.agent_steps: dict[str, str] = {}
+        # approvals waiting for an answer: id -> (request, decision holder)
+        self._approvals: dict[str, dict[str, Any]] = {}
+        # the access level in force for this project (see adcode.access)
+        self._applied_access: str = effective_access(self.config, self.cwd)
         # the second currently painted in the strip's elapsed column; the
         # panel ticks once per second even while the root agent is idle
         self._agent_clock: int | None = None
@@ -377,7 +414,7 @@ class AdCodeApp:
         self.connect_retrying = False
         # Learns how long a request takes from the finished ones; the footer
         # turns that into an estimate while the provider is silent.
-        self._predictor = DurationPredictor.load(str(paths.predictor_file()))
+        self._predictor = self._load_predictor()
         self._last_cache_hit: float | None = None
         self._last_usage: dict[str, Any] = {}
         self._resume = resume
@@ -420,6 +457,8 @@ class AdCodeApp:
         self.loop = AgentLoop(
             self.config, self.registry, self.session_store, self.goals,
             self.skills, emit=self._wake, mcp_manager=self.mcp, cwd=self.cwd,
+            approval_ask=self.request_approval,
+            notice=self.notify,
         )
         self.loop.start()
         self._start_mcp_load()
@@ -465,6 +504,14 @@ class AdCodeApp:
     def _shutdown(self) -> None:
         try:
             self.input_thread.stop()
+            # A tool that is waiting for an approval must not be cancelled
+            # mid-flight: refusing it lets the turn finish on its own, which
+            # keeps the engine's cleanup quiet.
+            if self._approvals:
+                self.refuse_pending_approvals('the session is closing')
+                deadline = time.monotonic() + 2.0
+                while self._approvals and time.monotonic() < deadline:
+                    time.sleep(0.02)
             if self.loop is not None:
                 self.loop.shutdown()
                 self.loop.save_active()
@@ -515,10 +562,11 @@ class AdCodeApp:
 
     # ── notifications ───────────────────────────────────────
     def notify(self, text: str, level: str = 'info') -> None:
+        message = t(text)
         if self.loop is not None:
-            self.loop.add_notice(text, level)
+            self.loop.add_notice(message, level)
         else:
-            self.standalone_items.append(TranscriptItem(kind='notice', text=text,
+            self.standalone_items.append(TranscriptItem(kind='notice', text=message,
                                                         level=level))
         self.dirty = True
 
@@ -528,7 +576,9 @@ class AdCodeApp:
 
     def config_changed(self) -> None:
         self.save_config()
+        set_current_config(self.config)
         self.config_version += 1
+        self._apply_access()
         self.keymap = KeyMap(self.config.keys)
         self.palette = build_palette(self.config.ui.theme, self.config.ui.accent)
         self.canvas.palette = self.palette
@@ -545,6 +595,25 @@ class AdCodeApp:
             # reach it while it runs.
             self.loop.apply_hold()
         self.dirty = True
+
+    def _apply_access(self) -> None:
+        """Put the access level in force.
+
+        The level decides what the agent may change, so it cannot wait for
+        the next turn: the guard, the policy and the declared sandbox of
+        every tool are rebuilt the moment the setting changes.
+        """
+        from adcode.access import effective_access
+        level = effective_access(self.config, self.cwd)
+        if level == getattr(self, '_applied_access', ''):
+            return
+        self._applied_access = level
+        if self.loop is not None:
+            self.loop.apply_access()
+        from adcode.i18n import tf
+        from adcode.tui.settings import ACCESS_LABELS
+        self.notify(tf('Project access: {level}',
+                       level=ACCESS_LABELS.get(level, level)), 'info')
 
     def _tool_config_signature(self) -> tuple[Any, ...]:
         return (
@@ -623,7 +692,7 @@ class AdCodeApp:
                         'warning')
             return False
         if self.session_store.is_archived(target):
-            self.notify(f'Session "{target}" is already archived.', 'info')
+            self.notify(tf('Session "{name}" is already archived.', name=target), 'info')
             self._sync_archive_state()
             return False
         current = target == self._session_name()
@@ -634,13 +703,13 @@ class AdCodeApp:
                         'warning')
             return False
         if not self.session_store.archive(target):
-            self.notify(f'Session not found: {target}', 'error')
+            self.notify(tf('Session not found: {name}', name=target), 'error')
             return False
         if current:
             self._sync_archive_state()
-            self.status_hint = ARCHIVED_HINT
-        self.notify(f'Archived "{target}" · /respawn restores it, '
-                    '/perish deletes it', 'info')
+            self.status_hint = t(ARCHIVED_HINT)
+        self.notify(tf('Archived "{name}" · /respawn restores it, '
+                       '/perish deletes it', name=target), 'info')
         self.dirty = True
         return True
 
@@ -653,9 +722,47 @@ class AdCodeApp:
         self.session_store.unarchive(name)
         self._sync_archive_state()
         self.status_hint = ''
-        self.notify(f'"{name}" is back · messages are accepted again.',
-                    'success')
+        self.notify(tf('"{name}" is back · messages are accepted again.',
+                                name=name), 'success')
         self.dirty = True
+        return True
+
+    def rename_session(self, name: str) -> bool:
+        """Rename the loaded session.
+
+        The conversation keeps its content: it is saved under the new name
+        and the row of the old name is removed, so the session is moved
+        rather than copied.
+        """
+        new_name = str(name or '').strip()
+        if not new_name:
+            self.notify('A session needs a name.', 'warning')
+            return False
+        if self.loop is None:
+            self.notify('No active session.', 'warning')
+            return False
+        if self.phase != 'idle':
+            self.notify('Wait for the turn to finish before renaming it.',
+                        'warning')
+            return False
+        old_name = self._session_name()
+        if old_name == new_name:
+            self.notify(f'Session is already named {new_name}.', 'info')
+            return False
+        try:
+            self.loop.rename_session(new_name)
+        except Exception as error:
+            self.notify(f'Could not rename the session: {error}', 'error')
+            return False
+        # The archive remembers a session by name: a renamed session that
+        # was archived stays archived, under its new name.
+        if old_name and self.session_store.is_archived(old_name):
+            self.session_store.archive(new_name)
+            self.session_store.unarchive(old_name)
+        self._sync_archive_state()
+        self._update_title()
+        self.dirty = True
+        self.notify(tf('Session renamed to {name}.', name=new_name), 'success')
         return True
 
     def perish_session(self) -> bool:
@@ -674,7 +781,7 @@ class AdCodeApp:
             # row that was just deleted.
             self.loop.forget_session()
         self.clear_conversation()
-        self.notify(f'Deleted "{name}".', 'success')
+        self.notify(tf('Deleted "{name}".', name=name), 'success')
         self.dirty = True
         return True
 
@@ -689,7 +796,7 @@ class AdCodeApp:
             self.dirty = True
             self._sync_archive_state()
         else:
-            self.notify(f'Session not found: {name}', 'error')
+            self.notify(tf('Session not found: {name}', name=name), 'error')
 
     # ── provider selection helpers ──────────────────────────
     def ensure_selection(self) -> tuple[ProviderConfig, ModelConfig] | None:
@@ -1136,6 +1243,7 @@ class AdCodeApp:
                 self.prompt.completion_closed_for = self.prompt.text
                 self.prompt.anchor = None
             elif self.phase != 'idle' and self.loop is not None:
+                self.refuse_pending_approvals('turn interrupted')
                 self.loop.interrupt()
             else:
                 self.prompt.anchor = None
@@ -1179,7 +1287,7 @@ class AdCodeApp:
             if self.prompt.selection()[0] != self.prompt.selection()[1]:
                 copied = self.prompt.copy()
                 if copied and not set_clipboard(copied):
-                    self.status_hint = 'the clipboard is not available'
+                    self.status_hint = t('the clipboard is not available')
                 self.prompt.anchor = None
             elif self.prompt.text:
                 self.prompt.set_text('')
@@ -1190,7 +1298,7 @@ class AdCodeApp:
             else:
                 self.exit_armed = True
                 chord = self.keymap.key_of('exit_chord') or 'ctrl+c'
-                self.status_hint = f'press {chord} again to exit'
+                self.status_hint = t('press {chord} again to exit').format(chord=chord)
             self.dirty = True
             return
         if action == 'exit_eof':
@@ -1210,7 +1318,7 @@ class AdCodeApp:
         if action == 'cut':
             cut = self.prompt.cut()
             if cut and not set_clipboard(cut):
-                self.status_hint = 'the clipboard is not available'
+                self.status_hint = t('the clipboard is not available')
             self.dirty = True
             return
         if action == 'select_all':
@@ -1307,7 +1415,7 @@ class AdCodeApp:
             # Read-only until /respawn: keep the message in the prompt so it is
             # still there afterwards.  Commands fall through -- the dispatcher
             # refuses the ones that work on this session and runs the rest.
-            self.status_hint = ARCHIVED_HINT
+            self.status_hint = t(ARCHIVED_HINT)
             self.dirty = True
             return
         self.prompt.history.append(self.prompt.text)
@@ -1625,9 +1733,9 @@ class AdCodeApp:
         if not text.strip():
             return False
         if not set_clipboard(text):
-            self.status_hint = 'the clipboard is not available'
+            self.status_hint = t('the clipboard is not available')
         else:
-            self.status_hint = f'copied {len(text)} characters'
+            self.status_hint = t('copied {count} characters').format(count=len(text))
         self.dirty = True
         return True
 
@@ -1648,9 +1756,9 @@ class AdCodeApp:
         """Copy the latest assistant reply (Markdown) to the clipboard."""
         text = self._last_reply_text()
         if not text.strip():
-            self.status_hint = 'no assistant reply to copy'
+            self.status_hint = t('no assistant reply to copy')
         elif not set_clipboard(text):
-            self.status_hint = 'the clipboard is not available'
+            self.status_hint = t('the clipboard is not available')
         else:
             lines = text.count('\n') + 1
             self.status_hint = f'copied last reply ({lines} lines) as Markdown'
@@ -2027,14 +2135,14 @@ class AdCodeApp:
         if phase == 'connecting':
             # Reconnecting is the same wait, but the user deserves to know the
             # first attempt already failed.
-            verb = 'reconnecting' if self.connect_retrying else 'connecting'
+            verb = t('reconnecting') if self.connect_retrying else t('connecting')
             elapsed = self._connect_elapsed()
             suffix = f' {elapsed:.1f}s' if elapsed >= 1.0 else ''
             status = f'{frame} {verb}{suffix}{self._connect_eta()}'
         elif phase == 'thinking':
-            status = f'{frame} thinking'
+            status = f'{frame} {t("thinking")}'
         elif phase == 'answering':
-            status = f'{frame} writing'
+            status = f'{frame} {t("writing")}'
         elif phase == 'tool':
             if progress is not None:
                 # The command reports its progress: the line says what runs
@@ -2043,15 +2151,15 @@ class AdCodeApp:
             else:
                 status = f'{frame} {self._current_action()}'
         elif phase == 'compacting':
-            status = f'{frame} compacting'
+            status = f'{frame} {t("compacting")}'
         elif phase == 'aside':
-            status = f'{frame} aside'
+            status = f'{frame} {t("aside")}'
         elif self.session_archived:
             # Read-only until /respawn: the line says so instead of offering
             # a prompt that will refuse the message.
-            status = 'archived'
+            status = t('archived')
         else:
-            status = 'ready'
+            status = t('ready')
         color = {
             'connecting': 'info', 'thinking': 'subtext', 'answering': 'text',
             'tool': 'accent', 'compacting': 'info', 'aside': 'accent',
@@ -2085,37 +2193,37 @@ class AdCodeApp:
             extras.append(f'cache {round(100 * self._last_cache_hit)}%')
         queued = snap.queued
         if queued:
-            extras.append(f'{queued} queued')
+            extras.append(f'{queued} {t("queued")}')
         attached = count_image_markers(self.prompt.text)
         if attached:
-            extras.append(f'{attached} image{"s" if attached > 1 else ""}')
+            extras.append(f'{attached} {t("images") if attached > 1 else t("image")}')
         if self.btw_mode:
-            extras.append('aside question mode')
+            extras.append(t('aside question mode'))
         if self.exit_armed:
-            extras.append('ctrl+c again to exit')
+            extras.append(t('ctrl+c again to exit'))
         agents = [row for row in (snap.agents or [])
                   if row.get('status') not in
                   ('completed', 'errored', 'interrupted', 'shutdown', None)
                   and not (isinstance(row.get('status'), dict))
                   and row.get('name') != 'root']
         if agents and self.config.agents.show_activity:
-            extras.append(f'{len(agents)} agent{"s" if len(agents) > 1 else ""}')
+            extras.append(f'{len(agents)} {t("agents") if len(agents) > 1 else t("agent")}')
         if self.config.steps.collapse_after_completion:
-            extras.append('steps collapse when done')
+            extras.append(t('steps collapse when done'))
         elif self.config.tools.chain == 'merged':
-            extras.append('merged steps')
+            extras.append(t('merged steps'))
         thinking = self.config.thinking
         if thinking.label_tokens and 'label' in (thinking.mode,
                                                  thinking.after_completion):
-            extras.append('token count')
+            extras.append(t('token count'))
         if self.config.hold.enabled:
             extras.append(f'hold ×{self.config.hold.max_retries}')
         if self.scroll > 0:
-            extras.append(f'↑ {self.scroll} lines')
+            extras.append(f'↑ {self.scroll} {t("lines")}')
         selected = self._selection_range()
         if selected is not None:
             length = len(self._selection_text())
-            extras.append(f'{length} selected · ctrl+c copies')
+            extras.append(t('{count} selected · ctrl+c copies').format(count=length))
         # The extras are dropped from the right until they fit: half a word
         # on the line reads like a bug.  The separator in front of the first
         # one counts towards the room.
@@ -2276,6 +2384,25 @@ class AdCodeApp:
             self._stream_started = time.time()
         self._stream_tokens += estimate_text_tokens(text)
 
+    def _document_store(self) -> Any:
+        """The document store of the state database."""
+        try:
+            return self.state.documents
+        except Exception:      # noqa: BLE001
+            return None
+
+    def _load_predictor(self) -> Any:
+        """The duration predictor, out of the state database."""
+        from adcode.state import KEY_PREDICTOR, import_legacy_document
+        try:
+            import_legacy_document(KEY_PREDICTOR, 'predictor.json')
+        except Exception:      # noqa: BLE001
+            pass
+        try:
+            return DurationPredictor.load(backend=self._document_store())
+        except Exception:      # noqa: BLE001
+            return DurationPredictor()
+
     def _learn_request_duration(self, payload: dict[str, Any]) -> None:
         """Teach the duration predictor from a finished request.
 
@@ -2296,8 +2423,8 @@ class AdCodeApp:
             int(payload.get('output_tokens') or 0),
             elapsed)
         try:
-            predictor.save(str(paths.predictor_file()))
-        except OSError:
+            predictor.save(backend=self._document_store())
+        except Exception:      # noqa: BLE001 - a lost lesson is not a crash
             pass
 
     def _connect_eta(self) -> str:
@@ -2484,7 +2611,7 @@ class AdCodeApp:
     def open_command_palette(self) -> None:
         """Open the command palette (ctrl+p)."""
         from adcode.commands import COMMANDS
-        items = [DialogItem(command.name, command.name, command.description)
+        items = [DialogItem(command.name, command.name, command.label())
                  for command in COMMANDS]
         if not items:
             self.notify('No commands are registered.', 'warning')
@@ -2537,19 +2664,80 @@ class AdCodeApp:
         # An empty list still opens: everything may be archived, and Alt is
         # how those sessions are found again.
         self.open_overlay(SelectDialog(
-            'Sessions', listing, choose, width=86,
+            t('Sessions'), listing, choose, width=86,
             on_delete=archive, on_alt=reveal,
-            footer='↑↓ move · enter load · del archive · alt archived '
-                   '· esc close'))
+            footer=t('↑↓ move · enter load · del archive · alt archived '
+                     '· esc close')))
 
     @staticmethod
     def _session_item(row: dict[str, Any]) -> DialogItem:
         archived = bool(row.get('archived'))
-        description = f'{row["updated"]} · {row["messages"]} messages'
+        description = t('{count} messages').format(count=row['messages'])
+        description = f'{row["updated"]} · {description}'
         if archived:
-            description += ' · archived'
+            description += ' · ' + t('archived')
         return DialogItem(str(row['name']), row['title'] or row['name'],
                           description, dim=archived)
+
+    # ── approvals: the agent asks before it acts ─────────────
+    def request_approval(self, request: Any) -> Any:
+        """Ask the user whether a tool call may run.
+
+        Called from the tool's worker thread: the guard's chain is waiting
+        there.  The question is put on the ui thread (the app is still
+        responsive while the tool waits) and this thread blocks until the
+        answer arrives.  No answer within the timeout is a refusal -- the
+        sdk's rule is that "nobody answered" must never read as "yes".
+        """
+        from harness.approval.base import ApprovalDecision
+
+        holder: dict[str, Any] = {}
+        done = threading.Event()
+        request_id = str(getattr(request, 'id', '') or uuid.uuid4().hex)
+
+        def decide(choice: str) -> None:
+            if choice == 'y':
+                holder['decision'] = ApprovalDecision.approve(
+                    by='user', reason='allowed once')
+            elif choice == 'a':
+                holder['decision'] = ApprovalDecision.approve(
+                    by='user', reason='allowed for this session',
+                    scope=f'tool:{getattr(request, "tool", "")}')
+            else:
+                holder['decision'] = ApprovalDecision.deny(
+                    by='user', reason='refused by the user')
+            done.set()
+
+        def show() -> None:
+            self._approvals[request_id] = {'request': request,
+                                           'holder': holder, 'done': done}
+            self.open_overlay(ApprovalDialog(request, decide,
+                                             access=self._applied_access,
+                                             project=self.cwd))
+            self.status_hint = 'waiting for your approval'
+            self.dirty = True
+
+        self.post(show)
+        timeout = max(5.0, float(self.config.security.approval_timeout))
+        if not done.wait(timeout=timeout):
+            holder.setdefault('decision', ApprovalDecision.timeout(
+                by='auto-deny', reason='no answer before the timeout'))
+        self._approvals.pop(request_id, None)
+        return holder.get('decision') or ApprovalDecision.deny(
+            by='auto-deny', reason='no answer was received')
+
+    def refuse_pending_approvals(self, reason: str = 'turn interrupted') -> None:
+        """An interrupted turn must not leave a call waiting to be approved."""
+        from harness.approval.base import ApprovalDecision
+        for entry in list(self._approvals.values()):
+            holder = entry.get('holder')
+            if holder is not None and 'decision' not in holder:
+                holder['decision'] = ApprovalDecision.deny(
+                    by='auto-deny', reason=reason)
+            done = entry.get('done')
+            if done is not None:
+                done.set()
+        self._approvals.clear()
 
     # ── sub-agents: browse and read their output ────────────
     def open_agents_browser(self) -> None:
@@ -2587,19 +2775,19 @@ class AdCodeApp:
         self.post(lambda: self.open_message(title, body))
 
     def open_message(self, title: str, message: str) -> None:
-        self.open_overlay(MessageDialog(title, message))
+        self.open_overlay(MessageDialog(t(title), message))
 
     def open_select(self, title: str, items: list[DialogItem],
                     on_select: Callable[[Any], None],
                     width: int = 72) -> None:
-        self.open_overlay(SelectDialog(title, items, on_select, width=width))
+        self.open_overlay(SelectDialog(t(title), items, on_select, width=width))
 
     def open_confirm(self, title: str, message: str,
                      on_result: Callable[[bool], None]) -> None:
-        self.open_overlay(ConfirmDialog(title, message, on_result))
+        self.open_overlay(ConfirmDialog(t(title), message, on_result))
 
     def open_text_prompt(self, title: str, label: str, initial: str,
                          on_submit: Callable[[str], None],
                          hint: str = '', password: bool = False) -> None:
-        self.open_overlay(TextPrompt(title, label, initial, on_submit,
-                                     hint=hint, password=password))
+        self.open_overlay(TextPrompt(t(title), t(label), initial, on_submit,
+                                     hint=t(hint), password=password))

@@ -49,12 +49,21 @@ def _now() -> str:
 
 
 class GoalStore:
-    def __init__(self, path: str | os.PathLike[str] = 'sessions/goals.json') -> None:
-        self.path = Path(path)
+    """The durable goals.
+
+    Two routes: the state database (the default -- the goals are structured
+    state, and a json file next to the project is what this app stopped
+    doing) or a file, for tools and tests that want a file they can read.
+    """
+
+    def __init__(self, path: str | os.PathLike[str] | None = None) -> None:
+        self.path = Path(path) if path is not None else None
         self.goals: list[Goal] = []
         self.load()
 
     def load(self) -> list[Goal]:
+        if self.path is None:
+            return self._load_document()
         try:
             raw = json.loads(self.path.read_text(encoding='utf-8-sig'))
         except (FileNotFoundError, UnicodeError, json.JSONDecodeError, OSError):
@@ -67,7 +76,34 @@ class GoalStore:
         self.goals = [goal for goal in self.goals if goal.objective]
         return self.goals
 
+    def _load_document(self) -> list[Goal]:
+        """Read the goals out of the state database."""
+        from adcode.state import KEY_GOALS, documents, import_legacy_document
+        try:
+            import_legacy_document(KEY_GOALS, 'goals.json')
+            document = documents().load(KEY_GOALS) or {}
+        except Exception:      # noqa: BLE001 - no database, no goals
+            document = {}
+        raw = document.get('goals', []) if isinstance(document, dict) else []
+        if not isinstance(raw, list):
+            raw = []
+        self.goals = [Goal.from_dict(item) for item in raw if isinstance(item, dict)]
+        self.goals = [goal for goal in self.goals if goal.objective]
+        return self.goals
+
+    def _save_document(self) -> None:
+        from adcode.state import KEY_GOALS, documents
+        try:
+            documents().save(KEY_GOALS, {
+                'version': 1,
+                'goals': [goal.as_dict() for goal in self.goals]})
+        except Exception:      # noqa: BLE001 - an unwritable database
+            pass
+
     def save(self) -> None:
+        if self.path is None:
+            self._save_document()
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(
             {'version': 1, 'goals': [goal.as_dict() for goal in self.goals]},

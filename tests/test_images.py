@@ -598,7 +598,10 @@ def test_view_image_stores_the_file_and_returns_a_marker(tmp_path):
     stored = Path(match.group(1))
     assert stored.is_absolute() and stored.exists()
     assert stored.read_bytes() == (tmp_path / 'shot.png').read_bytes()
-    assert '/.adcode/images/' in match.group(1)
+    # the image lives in the state directory -- not in the project
+    from adcode.paths import images_dir
+    assert str(images_dir()) in match.group(1)
+    assert not (tmp_path / 'images').exists()
 
 
 def test_view_image_deduplicates_the_same_bytes(tmp_path):

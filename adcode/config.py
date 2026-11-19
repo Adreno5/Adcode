@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from adcode.crypto import decrypt_secret, encrypt_secret
+from adcode.i18n import normalize_locale
 from adcode.tui.keymap import BINDINGS, validate_key_name
 
 CONFIG_DIR = Path.home() / '.adcode'
@@ -24,6 +25,9 @@ CONFIG_PATH = CONFIG_DIR / 'config.json'
 # AdCode 2.x kept the file next to the package; migrate it on first load.
 LEGACY_CONFIG_PATH = Path(__file__).resolve().parent.parent / 'config.json'
 CONFIG_VERSION = 2
+
+#: The document key the configuration is stored under.
+CONFIG_KEY = 'config'
 
 API_WIRES = (
     'openai chat completions',
@@ -500,6 +504,26 @@ class ReasoningSettings:
         )
 
 
+#: How much the agent has to ask for.
+SECURITY_MODES = ('off', 'ask')
+
+#: What the agent may do to a project folder.
+#:
+#: ``readonly``   read the project; change nothing (not even a temp file)
+#: ``workspace``  change files inside the project; nothing outside it
+#: ``full``       no boundary at all -- the user's own permissions
+#:
+#: The three are cumulative in write scope: each one allows strictly less
+#: than the next.  Read access is the same in all of them -- a read-only
+#: project is still readable, that is the point of it.
+ACCESS_LEVELS = ('readonly', 'workspace', 'full')
+
+#: The old name of the sandbox setting.  Kept so an older configuration
+#: file still reads: ``none`` meant "no boundary" (= ``full``) and
+#: ``workspace`` meant "writes inside the project".
+SANDBOX_MODES = ('none', 'workspace')
+
+
 @dataclass
 class AgentsSettings:
     enabled: bool = True
@@ -553,9 +577,69 @@ class SkillsSettings:
 
 
 @dataclass
+class SecuritySettings:
+    """How much the agent may do, and how much it has to ask for.
+
+    ``mode``
+        ``off``  -- everything is allowed, but every call is still audited.
+        ``ask``  -- the effectful tools (shell, network, collaboration) wait
+                    for a yes; the answer can be remembered for the session.
+    ``access``
+        What the agent may do to the project folder:
+        ``readonly`` / ``workspace`` / ``full`` (see :data:`ACCESS_LEVELS`).
+    ``access_by_project``
+        Per-project overrides: the project root -> the level for it.  A
+        project the user trusts can be ``full`` while the default stays
+        ``readonly``; the level travels with the folder, not with the app.
+    ``network_allowlist``
+        Hosts the ``fetch`` tool may reach.  Empty means "no restriction".
+    ``deny_tools``
+        Tool names that are refused outright.
+    ``approval_timeout``
+        Seconds to wait for an answer; after that the call is refused.
+    """
+
+    mode: str = 'off'
+    access: str = 'full'
+    access_by_project: dict[str, str] = field(default_factory=dict)
+    network_allowlist: list[str] = field(default_factory=list)
+    deny_tools: list[str] = field(default_factory=list)
+    approval_timeout: float = 120.0
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> 'SecuritySettings':
+        raw = raw if isinstance(raw, dict) else {}
+        hosts = raw.get('network_allowlist')
+        denied = raw.get('deny_tools')
+        by_project = raw.get('access_by_project')
+        access = _choice(raw.get('access'), ACCESS_LEVELS, '')
+        if not access:
+            # An older configuration: the sandbox setting said how far the
+            # shell was fenced.  'none' meant no boundary at all.
+            legacy = _choice(raw.get('sandbox'), SANDBOX_MODES, '')
+            access = {'none': 'full', 'workspace': 'workspace'}.get(legacy, '')
+        return cls(
+            mode=_choice(raw.get('mode'), SECURITY_MODES, 'off'),
+            access=access or 'full',
+            access_by_project={
+                str(root): _choice(level, ACCESS_LEVELS, 'full')
+                for root, level in (by_project or {}).items()
+            } if isinstance(by_project, dict) else {},
+            network_allowlist=[str(item) for item in hosts]
+            if isinstance(hosts, list) else [],
+            deny_tools=[str(item) for item in denied]
+            if isinstance(denied, list) else [],
+            approval_timeout=float(_bounded_int(
+                raw.get('approval_timeout'), 5, 3_600, 120)),
+        )
+
+
+@dataclass
 class UiSettings:
     theme: str = 'dark'
     accent: str = '#8fa7d6'
+    #: The language of the interface: ``en`` or ``zh``.
+    locale: str = 'en'
     mouse_scroll_lines: int = 3
     show_header: bool = True
     show_token_status: bool = True
@@ -569,6 +653,7 @@ class UiSettings:
         return cls(
             theme=_choice(raw.get('theme'), THEMES, 'dark'),
             accent=_str(raw.get('accent'), '#8fa7d6') or '#8fa7d6',
+            locale=normalize_locale(raw.get('locale')),
             mouse_scroll_lines=_bounded_int(raw.get('mouse_scroll_lines'), 1, 30, 3),
             show_header=_bool(raw.get('show_header'), True),
             show_token_status=_bool(raw.get('show_token_status'), True),
@@ -712,6 +797,7 @@ class AppConfig:
     reasoning: ReasoningSettings = field(default_factory=ReasoningSettings)
     agents: AgentsSettings = field(default_factory=AgentsSettings)
     skills: SkillsSettings = field(default_factory=SkillsSettings)
+    security: SecuritySettings = field(default_factory=SecuritySettings)
     ui: UiSettings = field(default_factory=UiSettings)
     keys: KeysSettings = field(default_factory=KeysSettings)
     max_output_tokens: int = 8_192
@@ -807,6 +893,12 @@ def migrate_legacy(raw: dict[str, Any]) -> AppConfig:
     if isinstance(theme, str) and theme.startswith('\x1b['):
         config.ui.accent = '#c8cbd1' if '37m' in theme else config.ui.accent
 
+    # A file that already carries the newer ui block keeps it: the legacy
+    # path only fills in what it knows about.
+    legacy_ui = raw.get('ui')
+    if isinstance(legacy_ui, dict):
+        config.ui = UiSettings.from_dict(legacy_ui)
+
     for model in (model for provider in config.providers for model in provider.models):
         if model.max_output_tokens == 8_192:
             model.max_output_tokens = min(max_output, 2_000_000)
@@ -846,6 +938,7 @@ def config_from_dict(raw: dict[str, Any]) -> AppConfig:
     config.reasoning = ReasoningSettings.from_dict(raw.get('reasoning'))
     config.agents = AgentsSettings.from_dict(raw.get('agents'))
     config.skills = SkillsSettings.from_dict(raw.get('skills'))
+    config.security = SecuritySettings.from_dict(raw.get('security'))
     config.ui = UiSettings.from_dict(raw.get('ui'))
     config.keys = KeysSettings.from_dict(raw.get('keys'))
     config.max_output_tokens = _bounded_int(
@@ -878,12 +971,51 @@ def config_to_dict(config: AppConfig) -> dict[str, Any]:
     return data
 
 
-class ConfigStore:
-    """Loads, migrates, and atomically saves the config file."""
+#: The configuration of the running session.  Tools run in worker threads and
+#: have no handle on the app, so the app publishes its config here; the
+#: security settings (which hosts may be reached) are read from it.
+_CURRENT: "AppConfig | None" = None
 
-    def __init__(self, path: str | os.PathLike[str] | None = None) -> None:
-        self.path = Path(path) if path is not None else CONFIG_PATH
+
+def set_current_config(config: "AppConfig | None") -> None:
+    """Publish the configuration the running session uses."""
+    global _CURRENT
+    _CURRENT = config
+
+
+def current_config() -> "AppConfig | None":
+    """The published configuration, if a session is running."""
+    return _CURRENT
+
+
+class ConfigStore:
+    """Loads, migrates, and saves the configuration.
+
+    Two routes:
+
+    * **the state database** (the default) -- the configuration is
+      structured state, and a JSON file lying around is exactly what this
+      app stopped doing.  The document key is ``config``.
+    * **a file** -- for tools, for tests, and for anybody who wants to
+      read the configuration with ``cat``.
+
+    The old file (``~/.adcode/config.json``, or the one next to the
+    package) is imported into the database on first load and then removed.
+    """
+
+    def __init__(self, path: str | os.PathLike[str] | None = None, *,
+                 documents: Any = None) -> None:
+        self.path = Path(path) if path is not None else None
+        self._documents = documents
         self.config = AppConfig()
+
+    # ── the store behind the store ─────────────────────────
+    def _document_store(self) -> Any:
+        """The document store to use (the state database by default)."""
+        if self._documents is None:
+            from adcode.state import state_store
+            self._documents = state_store().documents
+        return self._documents
 
     def load(self) -> AppConfig:
         raw, legacy = self._read_payload()
@@ -898,6 +1030,23 @@ class ConfigStore:
 
     def _read_payload(self) -> tuple[Any, Path | None]:
         """Read the config payload, falling back to the pre-``~/.adcode`` file."""
+        if self.path is None:
+            # The database route: the document first, the old file second.
+            try:
+                document = self._document_store().load(CONFIG_KEY)
+            except Exception:      # noqa: BLE001 - no database, no config
+                document = None
+            if isinstance(document, dict) and document:
+                return document, None
+            for legacy_path in (CONFIG_PATH, LEGACY_CONFIG_PATH):
+                if not legacy_path.exists():
+                    continue
+                try:
+                    raw = json.loads(legacy_path.read_text(encoding='utf-8-sig'))
+                except (OSError, ValueError):
+                    continue
+                return raw, legacy_path
+            return {}, None
         if (not self.path.exists() and self.path == CONFIG_PATH
                 and LEGACY_CONFIG_PATH.exists()):
             try:
@@ -929,6 +1078,12 @@ class ConfigStore:
 
     def save(self) -> bool:
         payload = config_to_dict(self.config)
+        if self.path is None:
+            try:
+                self._document_store().save(CONFIG_KEY, payload)
+                return True
+            except Exception:      # noqa: BLE001 - an unwritable database
+                return False       # must not take the agent down
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             fd, temp_name = tempfile.mkstemp(

@@ -5,7 +5,9 @@ description = "A configurable full-screen terminal coding agent"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "aicf-core>=0.6.1",
+    # The engine sdk.  1.0.0rc2 is where the document store
+    # (infra.store.documents) and the sandbox write level landed.
+    "aicf-core>=1.0.0rc2",
     "anthropic>=0.116.0",
     "cryptography>=44.0.0",
     "httpx2[socks]>=2.16.0",
@@ -21,6 +23,9 @@ adcode = "adcode.cli:main"
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    # bench/demo.py renders the recorded tour (pillow draws the frames,
+    # ffmpeg assembles the gif/webm).
+    "pillow>=10.0.0",
 ]
 
 [tool.pytest.ini_options]

@@ -14,6 +14,7 @@ from adcode.config import (
     apply_step_preset,
 )
 from adcode.diff import git_worktree_diff
+from adcode.i18n import t, tf
 from adcode.theme import ACCENT_PRESETS, THEMES
 from adcode.tui.dialogs import DialogItem
 from adcode.tui.keymap import BINDINGS
@@ -27,6 +28,10 @@ class Command:
     usage: str
     handler: Callable[[Any, str], None]
     subcommands: list[tuple[str, str]] = field(default_factory=list)
+
+    def label(self) -> str:
+        """The description in the language of the interface."""
+        return t(self.description)
 
 
 COMMANDS: list[Command] = []
@@ -64,6 +69,7 @@ _ARCHIVED_DENIED = frozenset({
     '/model',       # re-points this session's engine at another model
     '/provider',    # the same, through the provider wizard
     '/rewind',      # rolls the history back
+    '/rename',      # renames the saved session
     '/save',        # writes this conversation under another name
     '/steps',       # request shape of this session
     '/thinking',    # request shape of this session
@@ -101,7 +107,7 @@ def dispatch(app: Any, text: str) -> None:
     head, _, tail = text.partition(' ')
     item = find(head)
     if item is None:
-        app.notify(f'Unknown command: {head} · type /help', 'warning')
+        app.notify(tf('Unknown command: {name} · type /help', name=head), 'warning')
         return
     if head in _ARCHIVED_DENIED and getattr(app, 'session_archived', False):
         app.notify(ARCHIVED_REFUSAL, 'warning')
@@ -109,7 +115,7 @@ def dispatch(app: Any, text: str) -> None:
     try:
         item.handler(app, tail.strip())
     except Exception as error:
-        app.notify(f'Command failed: {error}', 'error')
+        app.notify(tf('Command failed: {error}', error=error), 'error')
 
 
 def completion_candidates(text: str) -> list[tuple[str, str, str]]:
@@ -123,7 +129,7 @@ def completion_candidates(text: str) -> list[tuple[str, str, str]]:
         candidates: list[tuple[str, str, str]] = []
         for item in COMMANDS:
             if item.name.startswith(token):
-                candidates.append((item.name + ' ', item.name, item.description))
+                candidates.append((item.name + ' ', item.name, item.label()))
         return candidates
     head = stripped[:head_end]
     item = find(head)
@@ -135,7 +141,7 @@ def completion_candidates(text: str) -> list[tuple[str, str, str]]:
     candidates = []
     for sub, description in item.subcommands:
         if sub.startswith(tail):
-            candidates.append((f'{head} {sub} ', sub, description))
+            candidates.append((f'{head} {sub} ', sub, t(description)))
     return candidates
 
 
@@ -143,10 +149,10 @@ def completion_candidates(text: str) -> list[tuple[str, str, str]]:
 
 @command('/help', 'Show commands and key bindings')
 def cmd_help(app: Any, args: str) -> None:
-    rows = [f'{item.usage or item.name:<22} {item.description}' for item in COMMANDS]
+    rows = [f'{item.usage or item.name:<22} {item.label()}' for item in COMMANDS]
     keys = [
-        'enter              send · esc  interrupt the turn / close overlays',
-        'mouse drag         select text in the transcript',
+        t('enter              send · esc  interrupt the turn / close overlays'),
+        t('mouse drag         select text in the transcript'),
         '',
     ]
     # Live bindings when the real app provides them; defaults otherwise.
@@ -167,11 +173,11 @@ def cmd_help(app: Any, args: str) -> None:
     for item, chord in zip(BINDINGS, chords):
         if item.group != group:
             group = item.group
-            keys.append(f'— {group} —')
-        keys.append(f'{chord:<{chord_width}} {item.label} — {item.description}')
-    keys += ['', 'rebind any of these with /keys.']
-    app.open_message('Help', '**Commands**\n' + '\n'.join(rows)
-                     + '\n\n**Keys**\n' + '\n'.join(keys))
+            keys.append(f'— {t(group)} —')
+        keys.append(f'{chord:<{chord_width}} {t(item.label)} — {t(item.description)}')
+    keys += ['', t('rebind any of these with /keys.')]
+    app.open_message(t('Help'), t('**Commands**') + '\n' + '\n'.join(rows)
+                     + '\n\n' + t('**Keys**') + '\n' + '\n'.join(keys))
 
 
 @command('/image', 'Attach an image file or URL to your next message',
@@ -192,6 +198,12 @@ def cmd_new(app: Any, args: str) -> None:
 
 @command('/config', 'Open the settings browser')
 def cmd_config(app: Any, args: str) -> None:
+    app.open_settings()
+
+
+@command('/settings', 'Open the settings browser')
+def cmd_settings(app: Any, args: str) -> None:
+    """The same command as ``/config``, under the name it is known by."""
     app.open_settings()
 
 
@@ -499,6 +511,123 @@ def cmd_prefix(app: Any, args: str) -> None:
         f'provider: {prefix.provider}\n'
         f'stable tokens: ~{tokens}\n\n'
         f'`{prefix.fingerprint}`')
+
+
+# ── permissions ───────────────────────────────────────────────────────
+
+@command('/permissions', 'What the agent may do to this project',
+         usage='/permissions [level]',
+         subcommands=[('readonly', 'Read the project; change nothing'),
+                      ('workspace', 'Change files inside the project'),
+                      ('full', 'No boundary at all'),
+                      ('default', 'Follow the default level')])
+def cmd_permissions(app: Any, args: str) -> None:
+    """The access level of this project -- and a way to change it.
+
+    Three levels, one per project: read-only, workspace (changes inside the
+    project), full (no boundary).  The level travels with the folder, so a
+    trusted project can be opened up while the default stays strict.
+
+    With no argument the level is shown and a picker opens; with a level
+    the rule is written straight away.
+    """
+    from adcode.access import ACCESS_LEVELS, describe, effective_access
+    from adcode.paths import project_root
+
+    root = project_root() or app.cwd
+    level = effective_access(app.config, app.cwd)
+    parts = args.split()
+    if parts:
+        wanted = parts[0].strip().lower()
+        if wanted not in ACCESS_LEVELS and wanted != 'default':
+            app.notify(f'Unknown level: {wanted}. '
+                       'Use readonly, workspace or full.', 'warning')
+            return
+        _write_project_rule(app, root, '' if wanted == 'default' else wanted)
+        app.config_changed()
+        app.notify(describe(_rule_for(app, root)), 'info')
+        return
+
+    items = []
+    for candidate in ACCESS_LEVELS:
+        items.append(DialogItem(candidate, _level_label(candidate),
+                                 describe(candidate),
+                                 selected=candidate == level))
+    items.append(DialogItem('', 'Use the default',
+                             'Follow the default level '
+                             f'({_level_label(app.config.security.access)})',
+                             selected=not _own_rule(app, root)))
+    app.open_select('Project access', items,
+                    lambda choice: _choose(app, root, choice), width=64)
+
+
+def _own_rule(app: Any, root: str) -> bool:
+    """Does this project have a rule of its own?"""
+    rules = getattr(app.config.security, 'access_by_project', None) or {}
+    return str(rules.get(root, '') or '') in ('readonly', 'workspace', 'full')
+
+
+def _rule_for(app: Any, root: str) -> str:
+    """The level in force for this project."""
+    from adcode.access import effective_access
+    return effective_access(app.config, app.cwd)
+
+
+def _level_label(level: str) -> str:
+    from adcode.tui.settings import ACCESS_LABELS
+    return ACCESS_LABELS.get(level, level)
+
+
+def _write_project_rule(app: Any, root: str, level: str) -> None:
+    """Write (or drop) the rule for this project."""
+    rules = dict(getattr(app.config.security, 'access_by_project', None) or {})
+    if level:
+        rules[root] = level
+    else:
+        rules.pop(root, None)
+    app.config.security.access_by_project = rules
+
+
+def _choose(app: Any, root: str, choice: Any) -> None:
+    """The picker answered: write the rule and apply it."""
+    _write_project_rule(app, root, str(choice or ''))
+    app.config_changed()
+    from adcode.access import describe
+    app.notify(describe(_rule_for(app, root)), 'info')
+
+
+# ── audit ───────────────────────────────────────────────────
+
+@command('/audit', 'Show the tool-call audit trail', usage='/audit [count]',
+         subcommands=[('recent', 'The calls of this session'),
+                      ('history', 'Every call, from the database')])
+def cmd_audit(app: Any, args: str) -> None:
+    """The audit trail: what the agent called, and what was refused."""
+    from adcode.security import format_audit_event
+
+    parts = args.split()
+    source = parts[0] if parts else 'recent'
+    count = 40
+    if len(parts) > 1:
+        try:
+            count = max(1, min(500, int(parts[1])))
+        except ValueError:
+            app.notify('Count must be an integer.', 'warning')
+            return
+    loop = app.loop
+    sink = getattr(loop, 'audit', None) if loop is not None else None
+    if sink is None:
+        app.notify('The audit trail is not available.', 'info')
+        return
+    events = (sink.read_history(count) if source == 'history'
+              else sink.recent(count))
+    if not events:
+        app.notify('No tool calls recorded yet.', 'info')
+        return
+    lines = [format_audit_event(event) for event in events]
+    title = ('Audit trail (history)' if source == 'history'
+             else 'Audit trail (session)')
+    app.open_message(title, '\n'.join(lines))
 
 
 # ── goals ──────────────────────────────────────────────────
@@ -930,6 +1059,28 @@ def cmd_load(app: Any, args: str) -> None:
         cmd_sessions(app, '')
         return
     app.load_session(name)
+
+
+@command('/rename', 'Rename the current session', usage='/rename [name]')
+def cmd_rename(app: Any, args: str) -> None:
+    """Rename the session the conversation is saved under.
+
+    Without a name the command asks for one; with a name it renames the
+    session right away.
+    """
+    name = args.strip()
+    if not name:
+        current = app.loop.session_name if app.loop is not None else ''
+
+        def submit(value: str) -> None:
+            cmd_rename(app, value)
+        # The field starts empty: the new name is typed, not edited, so the
+        # old name never ends up in front of it.
+        app.open_text_prompt('Rename session', 'New name', '', submit,
+                             hint=tf('Current name: {name}', name=current)
+                             if current else '')
+        return
+    app.rename_session(name)
 
 
 @command('/rewind', 'Roll the conversation back to an earlier turn')
