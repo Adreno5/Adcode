@@ -187,10 +187,10 @@ uv sync
 ```
 
 The engine sdk (`aicf-core`) is the foundation of this app. The app needs
-`aicf-core>=1.0.0rc2`, which is where the **document store**
-(`infra.store.documents`) and the **sandbox write level** that follows the
-tool's own declaration (`ToolSpec.sandbox='readonly'`) landed. To work on
-the sdk itself, use the local checkout instead:
+`aicf-core>=1.0.0rc3`, which is where the **document store**
+(`infra.store.documents`), the **sandbox write level** that follows the
+tool's own declaration (`ToolSpec.sandbox='readonly'`) and the **control
+plane** landed. To work on the sdk itself, use the local checkout instead:
 
 ```bash
 # the sdk the app is developed against

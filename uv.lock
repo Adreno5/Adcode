@@ -25,7 +25,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aicf-core", specifier = ">=1.0.0rc2" },
+    { name = "aicf-core", specifier = ">=1.0.0rc3" },
     { name = "anthropic", specifier = ">=0.116.0" },
     { name = "cryptography", specifier = ">=44.0.0" },
     { name = "httpx2", extras = ["socks"], specifier = ">=2.16.0" },
@@ -43,7 +43,7 @@ dev = [
 
 [[package]]
 name = "aicf-core"
-version = "1.0.0rc2"
+version = "1.0.0rc3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "openai" },
@@ -51,9 +51,9 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/65/1b/8ae15a5233abfbc1bf98e56887b5a11e32a6ac9f31308e0861d3bfa8c355/aicf_core-1.0.0rc2.tar.gz", hash = "sha256:a4b69dc8f7c0c6445f7a8d33328aff1cb68b8df1a447668a5542f1533fee6d3c", size = 769082, upload-time = "2026-11-19T15:10:49.225Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d2/db/636b3d2bb03e157d9018f74cd461ec532bbc0c56e32f9360c33a71ea6f0e/aicf_core-1.0.0rc3.tar.gz", hash = "sha256:46eff1fc486d64efb48fc25ab05d302fdfcbd84b51895ca6153a4369c99c0e19", size = 839590, upload-time = "2026-11-20T03:59:52.265Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/70/e9/486649189dd725970aa89032eca0ddc27f18da610ed55143df02dbde43f2/aicf_core-1.0.0rc2-py3-none-any.whl", hash = "sha256:eadd4bdbae9ad8f2f5f93649629d0cbf326ffe919655852e24a0df3cddf592ca", size = 742992, upload-time = "2026-11-19T15:10:47.521Z" },
+    { url = "https://files.pythonhosted.org/packages/fd/14/80495b376370bec5252b2a14781a88a5055661208d0a9d4a77808231a212/aicf_core-1.0.0rc3-py3-none-any.whl", hash = "sha256:ffca8955119085ac7916113e767ee67292338cc1202cec291e9389e2e9b0b171", size = 805978, upload-time = "2026-11-20T03:59:50.58Z" },
 ]
 
 [[package]]
