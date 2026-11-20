@@ -325,12 +325,22 @@ class Canvas:
                 self._bg[right] = bg
                 self._touched[y] = 1
 
-    def _blit(self, x: int, y: int, ch: str, fg: int, bg: int, attrs: int) -> None:
+    def _blit(self, x: int, y: int, ch: str, fg: int | None, bg: int | None,
+              attrs: int) -> None:
         if not self._visible(x, y):
             return
         index = y * self.width + x
         if self._st[index] != self._frame:
             self._materialize(index)
+        # None means "keep whatever this cell holds".  It has to be resolved
+        # here and not by the caller: the planes still contain the previous
+        # frame until the cell is materialized, so a caller that reads them
+        # first writes that old colour back and the frame never loses it --
+        # which is how the status line kept a trail of its light.
+        if fg is None:
+            fg = self._fg[index]
+        if bg is None:
+            bg = self._bg[index]
         if is_control(ch):
             # A raw escape sequence inside tool output would otherwise be
             # written straight into the frame and corrupt the whole screen.
@@ -600,12 +610,7 @@ class Canvas:
                 # wide one has to as well -- the buffer ends there.
                 col += width
                 continue
-            index = row_base + col
-            self._blit(
-                col, y, ch,
-                fgs[index] if fg_packed is None else fg_packed,
-                bgs[index] if bg_packed is None else bg_packed,
-                attrs)
+            self._blit(col, y, ch, fg_packed, bg_packed, attrs)
             col += width
         return col - start
 
@@ -630,7 +635,7 @@ class Canvas:
                 continue
             width = char_width(ch)
             if width == 0:
-                if col > x:
+                if col > x and self._cx0 <= col - 1 < self._cx1:
                     index = y * self.width + col - 1
                     if (self._st[index] == self._frame
                             and not (self._fl[index] & _CONT)):
@@ -786,6 +791,51 @@ class Canvas:
         if not (0 <= y < self.height):
             return ''
         return self._row_text(y)
+
+    def row_runs(self, y: int) -> list[tuple[str, int, int, int]]:
+        """Serialize one row as style runs: (text, fg, bg, attrs).
+
+        The ANSI serializer below is one consumer of the cell grid; a browser
+        renderer is another, and re-parsing escape sequences back into cells
+        would throw information away.  A run carries the state one SGR
+        sequence encodes, so a renderer paints text and colours directly.
+        REVERSE is folded into the two colours, exactly as _sgr does it, and
+        continuation cells are skipped: the wide glyph that owns them is
+        already in the run before them.
+        """
+        if not (0 <= y < self.height):
+            return []
+        line = self.width
+        base = y * line
+        chs, fgs, bgs, ats = self._ch, self._fg, self._bg, self._at
+        fls, stamps = self._fl, self._st
+        frame = self._frame
+        fg_blank = self._fg_blank
+        bg_blank = self._bg_blank
+        runs: list[tuple[str, int, int, int]] = []
+        text: list[str] = []
+        cur_fg = cur_bg = cur_attrs = -1
+        for offset in range(line):
+            index = base + offset
+            if stamps[index] != frame:
+                fg, bg, attrs, glyph = fg_blank, bg_blank, 0, ' '
+            else:
+                if fls[index] & _CONT:
+                    continue
+                fg, bg, attrs, glyph = (
+                    fgs[index], bgs[index], ats[index], chs[index])
+                if attrs & REVERSE:
+                    fg, bg = bg, fg
+                    attrs &= ~REVERSE
+            if fg != cur_fg or bg != cur_bg or attrs != cur_attrs:
+                if text:
+                    runs.append((''.join(text), cur_fg, cur_bg, cur_attrs))
+                    text = []
+                cur_fg, cur_bg, cur_attrs = fg, bg, attrs
+            text.append(glyph)
+        if text:
+            runs.append((''.join(text), cur_fg, cur_bg, cur_attrs))
+        return runs
 
     def render(self) -> str:
         """Serialize the whole canvas as one full-frame payload."""

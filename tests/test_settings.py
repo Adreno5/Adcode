@@ -42,8 +42,9 @@ def current(overlay):
 def test_tree_contains_all_groups(config):
     tree = build_settings_tree(config)
     groups = [node.label for node in tree if node.kind == 'group']
-    assert groups == ['Appearance', 'Work steps', 'Hold', 'Reasoning',
-                      'Context', 'Sub-agents and teams', 'Skills', 'MCP']
+    assert groups == ['Recents', 'Appearance', 'Work steps', 'Footer status',
+                      'Hold', 'Failover', 'Reasoning', 'Context',
+                      'Sub-agents and teams', 'Skills', 'Security', 'MCP']
 
 
 def test_expand_and_choose(config):
@@ -59,9 +60,10 @@ def test_expand_and_choose(config):
     keys = [row.key for row in overlay._flatten()]
     assert 'thinking.partial.from' in keys
     assert 'thinking.partial.to' in keys
-    # Escape reverts the whole item.
+    # Escape closes the item and keeps what was chosen: every change is
+    # applied and saved as it is made, so there is nothing to take back.
     overlay.handle(key('esc'))
-    assert config.thinking.mode == 'label'
+    assert config.thinking.mode == 'partial'
     assert overlay.expanded == []
 
 
@@ -180,7 +182,8 @@ def test_accent_and_custom_hex(config):
 def test_first_down_reaches_the_first_setting(config):
     overlay = SettingsOverlay(config, lambda: None)
     overlay.handle(key('down'))
-    assert current(overlay) == 'ui.theme'
+    # The pinned Recents section comes first: the theme is its first entry.
+    assert current(overlay) == 'recent:ui.theme'
 
 
 def test_cursor_stays_after_choosing_a_bool_value(config):
@@ -230,3 +233,197 @@ def test_escape_leaves_the_cursor_on_the_collapsed_item(config):
     overlay.handle(key('esc'))
     assert overlay.expanded == []
     assert current(overlay) == 'context.auto'
+
+def test_the_work_steps_group_starts_with_the_collapse_toggle(config):
+    overlay = SettingsOverlay(config, lambda: None)
+    keys = [row.key for row in overlay._flatten()]
+    start = keys.index('group:Work steps')
+    assert keys[start + 1] == 'steps.collapse'
+    assert keys[start + 2] == 'steps.preset'
+    assert keys[start + 3] == 'thinking.mode'
+    assert keys[start + 4] == 'thinking.after_completion'
+    focus(overlay, 'steps.preset')
+    overlay.handle(key('enter'))
+    options = [row.key for row in overlay._flatten() if row.kind == 'option']
+    assert options == [f'steps.preset::{level}'
+                       for level in ('concise', 'standard', 'detailed', 'custom')]
+
+
+def test_the_collapse_toggle_is_no_presets_business(config):
+    overlay = SettingsOverlay(config, lambda: None)
+    walk_to(overlay, 'steps.preset')
+    overlay.handle(key('enter'))
+    walk_to(overlay, 'steps.preset::detailed')
+    overlay.handle(key('enter'))
+    assert config.steps.preset == 'detailed'
+    # A preset keeps the thinking and tool settings read-only, but the
+    # toggle above it stays the user's own switch.
+    walk_to(overlay, 'thinking.mode')
+    overlay.handle(key('enter'))
+    assert 'thinking.mode::full' not in [row.key for row in overlay._flatten()]
+    walk_to(overlay, 'steps.collapse')
+    overlay.handle(key('enter'))
+    index, _ = find_row(overlay, 'steps.collapse::True')
+    overlay.row, overlay.row_key = index, 'steps.collapse::True'
+    overlay.handle(key('enter'))
+    assert config.steps.collapse_after_completion is True
+
+def test_a_preset_writes_its_settings_and_locks_them(config):
+    overlay = SettingsOverlay(config, lambda: None)
+    walk_to(overlay, 'steps.preset')
+    overlay.handle(key('enter'))
+    walk_to(overlay, 'steps.preset::standard')
+    overlay.handle(key('enter'))
+    assert config.steps.preset == 'standard'
+    assert config.thinking.mode == 'partial'
+    assert config.tools.chain == 'separate'
+    # The settings the preset owns are read-only: they show their value but
+    # do not open, and the panel says why.
+    walk_to(overlay, 'thinking.mode')
+    overlay.handle(key('enter'))
+    assert overlay.editing is False
+    assert 'thinking.mode::full' not in [row.key for row in overlay._flatten()]
+    assert config.thinking.mode == 'partial'
+    assert 'Custom' in overlay.notice
+    walk_to(overlay, 'tools.chain')
+    overlay.handle(key('enter'))
+    assert config.tools.chain == 'separate'
+
+def test_custom_unlocks_the_work_step_settings(config):
+    config.steps.preset = 'concise'
+    config.thinking.mode = 'label'
+    config.thinking.label_tokens = True
+    overlay = SettingsOverlay(config, lambda: None)
+    walk_to(overlay, 'steps.preset')
+    overlay.handle(key('enter'))
+    walk_to(overlay, 'steps.preset::custom')
+    overlay.handle(key('enter'))
+    assert config.steps.preset == 'custom'
+    # Nothing else moved: the hand-edited values stay as they were.
+    assert config.thinking.mode == 'label'
+    assert config.thinking.label_tokens is True
+    walk_to(overlay, 'thinking.mode')
+    overlay.handle(key('enter'))
+    walk_to(overlay, 'thinking.mode::full')
+    overlay.handle(key('enter'))
+    assert config.thinking.mode == 'full'
+
+def test_choosing_a_preset_collapses_what_it_locked(config):
+    overlay = SettingsOverlay(config, lambda: None)
+    walk_to(overlay, 'thinking.mode')
+    overlay.handle(key('enter'))
+    walk_to(overlay, 'steps.preset')
+    overlay.handle(key('enter'))
+    walk_to(overlay, 'steps.preset::concise')
+    overlay.handle(key('enter'))
+    # An expansion of a setting the preset just locked must not linger: its
+    # rows are gone, and the lock would refuse every edit inside it anyway.
+    assert overlay.expanded == []
+    assert config.thinking.mode == 'label'        # written by the preset
+
+
+def test_the_thinking_display_is_two_stages(config):
+    overlay = SettingsOverlay(config, lambda: None)
+    walk_to(overlay, 'thinking.mode')
+    overlay.handle(key('enter'))
+    # The finished-thought choice is its own item now, not a child of the
+    # live block's options.
+    rows = [row for row in overlay._flatten()
+            if row.key == 'thinking.after_completion']
+    assert [(row.kind, row.depth) for row in rows] == [('setting', 0)], rows
+    walk_to(overlay, 'thinking.mode::partial')
+    overlay.handle(key('enter'))
+    assert config.thinking.mode == 'partial'
+    # The second stage offers the same four modes.
+    walk_to(overlay, 'thinking.after_completion')
+    overlay.handle(key('enter'))
+    options = [row.key for row in overlay._flatten()
+               if row.key.startswith('thinking.after_completion::')]
+    assert options == ['thinking.after_completion::hidden',
+                       'thinking.after_completion::label',
+                       'thinking.after_completion::partial',
+                       'thinking.after_completion::full'], options
+    walk_to(overlay, 'thinking.after_completion::label')
+    overlay.handle(key('enter'))
+    assert config.thinking.after_completion == 'label'
+    assert config.thinking.mode == 'partial'      # the live block is untouched
+
+def test_the_token_count_belongs_to_the_label(config):
+    overlay = SettingsOverlay(config, lambda: None)
+    walk_to(overlay, 'thinking.mode')
+    overlay.handle(key('enter'))
+    options = [row.key for row in overlay._flatten() if row.kind == 'option']
+    assert 'thinking.mode::summary' not in options
+    # The label owns the count: it is one of its settings, not a mode.
+    walk_to(overlay, 'thinking.mode::label')
+    overlay.handle(key('enter'))
+    assert config.thinking.mode == 'label'
+    walk_to(overlay, 'thinking.label_tokens')
+    overlay.handle(key('enter'))
+    walk_to(overlay, 'thinking.label_tokens::True')
+    overlay.handle(key('enter'))
+    assert config.thinking.label_tokens is True
+
+def test_every_label_position_offers_the_token_count(config):
+    overlay = SettingsOverlay(config, lambda: None)
+    walk_to(overlay, 'thinking.mode')
+    overlay.handle(key('enter'))
+    walk_to(overlay, 'thinking.mode::full')
+    overlay.handle(key('enter'))
+    # The label collapse after the thought finishes shows a label too, so it
+    # carries the same switch (and the same setting).
+    walk_to(overlay, 'thinking.after_completion')
+    overlay.handle(key('enter'))
+    walk_to(overlay, 'thinking.after_completion::label')
+    overlay.handle(key('enter'))
+    assert config.thinking.after_completion == 'label'
+    walk_to(overlay, 'thinking.label_tokens')
+    overlay.handle(key('enter'))
+    walk_to(overlay, 'thinking.label_tokens::True')
+    overlay.handle(key('enter'))
+    assert config.thinking.label_tokens is True
+
+
+def test_the_access_levels_are_in_the_security_group(config):
+    tree = build_settings_tree(config)
+    keys = [node.key for node in tree]
+    assert 'security.access' in keys, 'the default level'
+    assert 'security.project_access' in keys, 'the level of this project'
+    node = next(node for node in tree if node.key == 'security.access')
+    assert [choice.value for choice in node.choices] == ['readonly',
+                                                         'workspace', 'full']
+
+
+def test_the_default_level_is_chosen_in_the_browser(config):
+    overlay = SettingsOverlay(config, lambda: None)
+    focus(overlay, 'security.access')
+    overlay.handle(key('enter'))
+    index, _ = find_row(overlay, 'security.access::readonly')
+    overlay.row = index
+    overlay.row_key = 'security.access::readonly'
+    overlay.handle(key('enter'))
+    assert config.security.access == 'readonly'
+
+
+def test_the_project_rule_is_its_own_setting(config, tmp_path, monkeypatch):
+    """The level of the project this session is in."""
+    from adcode import paths
+
+    monkeypatch.setattr(paths, 'PROJECT_ROOT', str(tmp_path))
+    overlay = SettingsOverlay(config, lambda: None)
+    focus(overlay, 'security.project_access')
+    overlay.handle(key('enter'))
+    index, _ = find_row(overlay, 'security.project_access::workspace')
+    overlay.row = index
+    overlay.row_key = 'security.project_access::workspace'
+    overlay.handle(key('enter'))
+    assert config.security.access_by_project[str(tmp_path.resolve())] == 'workspace'
+
+    # and back to the default
+    focus(overlay, 'security.project_access')
+    overlay.handle(key('enter'))
+    index, _ = find_row(overlay, 'security.project_access::')
+    overlay.row = index
+    overlay.row_key = 'security.project_access::'
+    overlay.handle(key('enter'))
+    assert str(tmp_path.resolve()) not in config.security.access_by_project

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from adcode.i18n import t
 from adcode.theme import Palette
 from adcode.tui.canvas import DIM, Canvas, text_width
 
@@ -161,9 +162,9 @@ def paint_welcome(canvas: Canvas, top: int, bottom: int, width: int,
     y += 1
     usage = tip.usage or tip.name
     segments = (
-        ('try ', palette.muted, DIM),
+        (t('try '), palette.muted, DIM),
         (usage, palette.accent, 0),
-        (f' — {tip.description}', palette.subtext, DIM),
+        (f' — {t(tip.description)}', palette.subtext, DIM),
     )
     total = sum(text_width(text) for text, _, _ in segments)
     x = max(0, (width - total) // 2)

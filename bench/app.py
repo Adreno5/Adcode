@@ -224,7 +224,7 @@ class AppHarness:
             # screen, so the run is only over once the queue is empty and the
             # frame that follows has been drawn.
             return (not app.loop.busy and app.loop._work.qsize() == 0
-                    and app.loop._events.empty() and not app.dirty)
+                    and app.loop._sink.depth == 0 and not app.dirty)
 
         return self.wait_until(idle, timeout, 'the agent loop to become idle')
 

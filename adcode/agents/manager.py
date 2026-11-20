@@ -1,20 +1,17 @@
 """Sub-agent collaboration on the engine sdk.
 
-Delegation, mailboxes and waiting come from ``harness.agent.collab``; this
-module adds what stays application-shaped: adcode's agent types (per-type
-model, system and tool allowlist), the ``update_goal`` tool backed by the
-GoalStore, and the ``AgentEvent`` stream the TUI pumps.
+Delegation, mailboxes, agent types and waiting come from
+``harness.agent.collab``; this module keeps what stays application-shaped:
+the agent types the config defines (mapped onto the sdk's ``AgentTypeSpec``
+registry), the model resolver behind ``provider::model``, the identity swap
+in a child's system prompt, the ``update_goal`` tool and the ``AgentEvent``
+stream the TUI pumps.
 """
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
-import copy
 import json
-import re
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -22,13 +19,14 @@ from harness.agent.collab import (
     ACTIVE_STATES,
     AgentManager as SdkAgentManager,
     AgentRecord,
-    ROOT_AGENT,
-    SUBAGENT_SYSTEM,
+    AgentTypeSpec,
 )
 from harness.agent.engine import ConversationEngine
-from harness.agent.engine_config import AgentSettings, EngineConfig, ModelInfo
+from harness.agent.engine_config import AgentSettings, ModelInfo
 
-from adcode.config import AgentsSettings, AppConfig, ModelConfig, ProviderConfig
+from adcode.config import (
+    AgentTypeConfig, AgentsSettings, AppConfig, ModelConfig, ProviderConfig,
+)
 from adcode.system_prompt import RUNTIME_NAME, replace_identity
 from adcode.tools.registry import AnnotatedTool, ManagedToolRegistry
 
@@ -55,17 +53,6 @@ class AgentEvent:
     tool_args: dict[str, Any] = field(default_factory=dict)
     status: str = ''
     file_diff: Any = None
-    created_at: float = field(default_factory=time.time)
-
-
-def _child_sink(engine: ConversationEngine,
-                sink_into: Callable[[tuple[str, dict[str, Any]]], None]) -> Any:
-    from harness.agent.events import EventSink
-
-    def emit(kind: str, payload: dict[str, Any]) -> None:
-        sink_into((kind, {'agent': engine.agent_name, **payload}))
-
-    return EventSink(emit=emit)
 
 
 def _model_info(provider: ProviderConfig, model: ModelConfig) -> ModelInfo:
@@ -92,12 +79,15 @@ class AgentManager(SdkAgentManager):
     The root engine is attached with ``attach``; children are spawned through
     the ``spawn_agent`` tool.  Each child is a full ``ConversationEngine``
     sharing the registry; its model / system / tool allowlist come from the
-    configured agent type.
+    registered agent type.
     """
 
     def __init__(self, config: AppConfig, settings: AgentsSettings,
                  registry: ManagedToolRegistry, client: Any,
-                 model_info: ModelInfo, *, goal_store=None,
+                 model_info: ModelInfo, *,
+                 provider: ProviderConfig | None = None,
+                 model_config: ModelConfig | None = None,
+                 goal_store=None,
                  client_factory: Optional[
                      Callable[[ProviderConfig, ModelConfig], Any]] = None,
                  cwd: str = '', store=None) -> None:
@@ -113,271 +103,94 @@ class AgentManager(SdkAgentManager):
                 default_type=settings.default_type,
                 system_suffix=settings.system_suffix,
             ),
-            cwd=cwd, store=store,
+            cwd=cwd, store=store, model_resolver=self._resolve_model,
         )
         self.app_config = config
         self.settings = settings
+        # The sdk stamps ``created_at`` with the wall clock but ``updated_at``
+        # with the monotonic clock, so neither can be subtracted from the
+        # other.  The UI's elapsed column runs on the monotonic samples this
+        # manager takes while an agent is visible instead.
+        self._agent_started: dict[str, float] = {}
+        self._agent_stopped: dict[str, float] = {}
         self.goal_store = goal_store
         self._client_factory = client_factory
         self._shared_client = client
-        self._provider: ProviderConfig | None = None
-        self._model_config: ModelConfig | None = None
-        # Child activity for the facade's pump.  The engine-side pump is
-        # deliberately inert (drain_events returns empty) so exactly one
-        # consumer - the facade - turns these into AgentEvents.
-        self._agent_events: deque[tuple[str, dict[str, Any]]] = deque(maxlen=2_000)
-        # Sub-agent updates handed to a turn, kept until that turn commits.
-        self._pending_mailbox: dict[int, list[str]] = {}
-
-    # ── mailbox bookkeeping ─────────────────────────────────
-    def consume_mailbox(self, engine: ConversationEngine) -> list[str]:
-        """Take the inbox, but remember it until the turn that used it commits.
-
-        The sdk clears the inbox as it hands the updates over and the engine
-        never puts them back.  A turn that fails or is interrupted after the
-        updates were staged therefore drops the results of the sub-agents for
-        good -- the parent never learns what they found.  The copy kept here
-        lets :meth:`settle_mailbox` return the undelivered updates.
-        """
-        messages = super().consume_mailbox(engine)
-        if messages:
-            self._pending_mailbox.setdefault(id(engine), []).extend(messages)
-        return messages
-
-    def settle_mailbox(self, engine: ConversationEngine) -> int:
-        """Requeue the sub-agent updates a turn never put into the history.
-
-        Returns how many updates were put back.  Called when the turn ends:
-        the engine has committed or rolled back by then, so the history says
-        which updates made it through.
-        """
-        pending = self._pending_mailbox.pop(id(engine), [])
-        if not pending:
-            return 0
-        history = ''
-        try:
-            for message in engine.conversation.committed:
-                content = message.get('content')
-                if isinstance(content, str):
-                    history += content
-        except Exception:
-            history = ''
-        lost = [text for text in pending if text not in history]
-        if lost:
-            self.requeue_mailbox(engine, lost)
-        return len(lost)
-
-    # ── wiring ──────────────────────────────────────────────
-    def attach(self, engine: ConversationEngine) -> None:
-        # The facade creates the loop before run_forever and injects it here;
-        # a bare get_running_loop only works when attach runs inside the loop.
-        if self._loop is None or self._condition is None:
-            self._loop = asyncio.get_running_loop()
-            self._condition = asyncio.Condition()
-        self._agents[ROOT_AGENT] = AgentRecord(
-            name=ROOT_AGENT, parent=None, depth=0, engine=engine,
-            status=AgentStatus.RUNNING)
-        engine.collab = self
-        for tool in self._collab_tools() + self._goal_tools():
-            self._registry.register(tool, replace=True, source='agent')
-
-    def reinstall_tools(self) -> None:
-        """Re-register the collaboration tools after a registry refresh."""
-        for tool in self._collab_tools() + self._goal_tools():
-            self._registry.register(tool, replace=True, source='agent')
+        self._provider = provider
+        self._model_config = model_config
+        for name, agent_type in config.agent_types.items():
+            self.register_agent_type(AgentTypeSpec(
+                name=name, system=agent_type.system, model=agent_type.model,
+                tools=list(agent_type.tools)))
 
     def set_model(self, provider: ProviderConfig, model: ModelConfig,
                   model_info: ModelInfo, client: Any) -> None:
         """Future children spawn with the new model; the client is shared."""
         self._provider = provider
         self._model_config = model
-        self._model = model_info
-        self._shared_client = client
+        super().set_model(model_info, client)
 
-    # ── event surfaces ──────────────────────────────────────
-    def drain_events(self, limit: int = 1_000) -> list[tuple[str, dict[str, Any]]]:
-        # The engine's per-round pump must not consume child activity: the
-        # facade is its only reader (see pump_agent_events).
-        return []
+    # ── the sdk's model hook ────────────────────────────────
+    def _resolve_model(self, override: str) -> tuple[Any, ModelInfo] | None:
+        """Resolve an agent type's model into (client, ModelInfo).
 
-    def drain_agent_events(self, limit: int = 1_000) -> list[AgentEvent]:
-        events: list[AgentEvent] = []
-        while len(events) < limit and self._agent_events:
-            kind, payload = self._agent_events.popleft()
-            events.append(self._as_agent_event(kind, payload))
-        return events
-
-    def _as_agent_event(self, kind: str, payload: dict[str, Any]) -> AgentEvent:
-        agent = str(payload.get('agent', ''))
-        if kind == 'usage':
-            usage = {key: payload.get(key) for key in
-                     ('input_tokens', 'cached_input_tokens', 'output_tokens')}
-            return AgentEvent(agent, 'usage', content=json.dumps(usage))
-        if kind == 'status':
-            return AgentEvent(agent, 'status',
-                              status=str(payload.get('status', '')))
-        if kind == 'tool_start':
-            return AgentEvent(agent, 'tool_start',
-                              tool_name=str(payload.get('name', '')),
-                              tool_args=dict(payload.get('args') or {}))
-        if kind == 'tool_output':
-            return AgentEvent(agent, 'tool_output_line',
-                              content=str(payload.get('text', '')))
-        if kind == 'tool_end':
-            return AgentEvent(agent, 'tool_result',
-                              content=str(payload.get('output', ''))[:500])
-        if kind == 'agent_event':
-            return AgentEvent(agent, 'status',
-                              status=str(payload.get('status', '')),
-                              content=str(payload.get('content', '')))
-        if kind in ('text_delta', 'thinking_delta', 'compaction_delta'):
-            return AgentEvent(agent, kind, content=str(payload.get('text', '')))
-        return AgentEvent(agent, 'message', content=str(payload))
-
-    # ── event delivery ──────────────────────────────────────
-    def _deliver_to_parent(self, record: AgentRecord) -> None:
-        """Mailbox delivery + lifecycle event, into THIS manager's queue.
-
-        The base class feeds its own ``_events`` deque; the facade consumes
-        ``_agent_events`` (drain_events stays inert on purpose), so the
-        lifecycle announcement lands there too.
+        The override is ``provider::model`` or a bare model id looked up in
+        the current provider.  ``None`` keeps the parent's model.
         """
-        parent = self._agents.get(record.parent) if record.parent else None
-        if parent is None:
-            return
-        body = record.error or record.final_message
-        parent.inbox.append(
-            f'<subagent_update agent="{record.name}" '
-            f'status="{record.status}">\n{body}\n</subagent_update>')
-        self._agent_events.append(('agent_event', {
-            'agent': record.name, 'status': record.status, 'content': body}))
-        self._agent_events.append(('agents_refresh', {}))
-        self._touch(record)
-
-    # ── spawning with agent types ───────────────────────────
-    async def spawn(self, name: str, message: str, *,
-                    agent_type: str = 'general',
-                    fork_turns: str | int = 'all',
-                    system: str = '') -> AgentRecord:
-        if not re.match(r'^[a-z0-9_]+$', str(name)):
-            raise ValueError('task_name must match ^[a-z0-9_]+$')
-        name = str(name).strip().lower()
-        if not message.strip():
-            raise ValueError('message must not be empty')
-        parent = self._current_name()
-        parent_record = self._agents.get(parent)
-        depth = (parent_record.depth + 1) if parent_record else 0
-        if depth > self.config.max_depth:
-            raise ValueError(f'max depth {self.config.max_depth} exceeded')
-        if name in self._agents and self._agents[name].status in ACTIVE_STATES:
-            raise ValueError(f'agent {name} is already active')
-        active = [r for r in list(self._agents.values())
-                  if r.status in ACTIVE_STATES]
-        if len(active) >= max(1, self.config.max_concurrent):
-            raise ValueError('too many concurrent agents')
-
-        type_config = self._resolve_type(agent_type)
-        provider, model_config, child_client = self._resolve_client(
-            parent_record, type_config)
-        model_info = _model_info(provider, model_config)
-        allowed_tools = set(type_config.tools) if type_config.tools else None
-
-        child = ConversationEngine(
-            client=child_client, registry=self._registry, store=self._store,
-            cwd=self._cwd, model=model_info,
-            config=EngineConfig(agents=self.config),
-            system_provider=lambda: self._child_system(
-                parent_record, type_config.system,
-                model_config.id, provider.name),
-            allowed_tools=allowed_tools, agent_name=name)
-        child.sink = _child_sink(child, self._agent_events.append)
-        child.conversation.committed.extend(
-            self._fork_history(parent_record, fork_turns))
-        record = AgentRecord(name=name, parent=parent, depth=depth, engine=child)
-        self._agents[name] = record
-        self._touch(record)
-        record.task = self._loop.create_task(self._run_child(record, message))
-        return record
-
-    def _resolve_type(self, name: str):
-        agent_type = self.app_config.agent_types.get(name)
-        if agent_type is None:
-            agent_type = self.app_config.agent_types.get(self.settings.default_type)
-        if agent_type is None:
-            from adcode.config import AgentTypeConfig
-            agent_type = AgentTypeConfig(name=name)
-        return agent_type
-
-    def _resolve_client(self, parent_record, type_config):
-        """Resolve (provider, model, client) for a child's agent type."""
-        override = (type_config.model or '').strip()
+        override = (override or '').strip()
         if not override:
-            return self._provider, self._model_config, self._shared_client
+            return None
         if '::' in override:
             provider_name, model_id = override.split('::', 1)
             provider = self.app_config.provider_by_name(provider_name)
-            model = None
-            if provider is not None:
-                model = provider.model(model_id)
+            model = provider.model(model_id) if provider is not None else None
             if model is None:
                 model = ModelConfig(id=model_id)
             if provider is None:
                 provider = self._provider
         else:
             provider = self._provider
-            model = (provider.model(override) if provider is not None else None)
+            model = (provider.model(override) if provider is not None
+                     else None)
             if model is None:
                 model = ModelConfig(id=override)
         if (provider is self._provider and model is not None
                 and self._model_config is not None
                 and model.id == self._model_config.id):
-            return provider, model, self._shared_client
+            return self._shared_client, self._model
         if self._client_factory is None:
-            return provider, model, self._shared_client
-        return provider, model, self._client_factory(provider, model)
+            return self._shared_client, _model_info(provider, model)
+        client = self._client_factory(provider, model)
+        return client, _model_info(provider, model)
 
-    def _fork_history(self, parent_record,
-                      fork_turns: str | int) -> list[dict[str, Any]]:
-        """Safe history for a child: user messages and plain assistant text.
+    # ── the child's system prompt ───────────────────────────
+    def _parent_system(self, parent_record: AgentRecord,
+                       model: ModelInfo | None = None) -> str:
+        """The parent prompt a child starts from, with the identity swapped.
 
-        Tool-call exchanges belong to the turn that made them; copying them
-        into a fresh child leaves dangling tool results no provider accepts.
+        The child may run a different model; without the swap it would claim
+        to be the parent's model.
         """
-        if not parent_record or fork_turns in ('none', 'None', 0):
-            return []
-        safe = [copy.deepcopy(m) for m in parent_record.engine.request_messages()
-                if m.get('role') == 'user'
-                or (m.get('role') == 'assistant' and not m.get('tool_calls'))]
-        if str(fork_turns).lower() == 'all':
-            return safe
-        try:
-            keep = int(fork_turns)
-        except (TypeError, ValueError):
-            return safe
-        starts = [i for i, m in enumerate(safe) if m.get('role') == 'user']
-        if 0 < keep < len(starts):
-            safe = safe[starts[-keep]:]
-        return safe
+        prompt = parent_record.engine.system_prompt()
+        if model is not None and model.id:
+            prompt = replace_identity(
+                prompt, model.id, model.provider,
+                agent_name=RUNTIME_NAME, role='sub-agent')
+        return prompt
 
-    def _child_system(self, parent_record, type_system: str,
-                      model_id: str = '', provider: str = '') -> str:
-        parts = []
-        if parent_record is not None:
-            parent_prompt = parent_record.engine.system_prompt()
-            # The child may run a different model; keep the parent's prompt
-            # but swap the identity so the child does not claim to be the
-            # parent's model.
-            if model_id:
-                parent_prompt = replace_identity(
-                    parent_prompt, model_id, provider,
-                    agent_name=RUNTIME_NAME, role='sub-agent')
-            parts.append(parent_prompt)
-        parts.append(SUBAGENT_SYSTEM)
-        if type_system:
-            parts.append(type_system)
-        if self.settings.system_suffix:
-            parts.append(self.settings.system_suffix)
-        return '\n\n'.join(p for p in parts if p)
+    def extra_tools(self) -> list[AnnotatedTool]:
+        """The goal tool rides along with the collaboration suite."""
+        return self._goal_tools()
+
+    def reinstall_tools(self) -> None:
+        """Re-register the collaboration tools, with their declared specs.
+
+        The sdk's collaboration tools carry no spec, which would make the
+        guard treat spawning a worker as the strictest case there is.
+        """
+        super().reinstall_tools()
+        from adcode.tools.specs import attach_registry_specs
+        attach_registry_specs(self._registry)
 
     # ── goal tool ───────────────────────────────────────────
     def _goal_tools(self) -> list[AnnotatedTool]:
@@ -411,20 +224,80 @@ class AgentManager(SdkAgentManager):
             ),
         ]
 
-    # ── compatibility shims ─────────────────────────────────
-    def root_scope(self) -> contextlib.AbstractContextManager:
-        """Identity scope: per-agent isolation comes from ToolContext.agent."""
-        return contextlib.nullcontext()
+    # ── the activity stream, in transcript vocabulary ───────
+    def drain_agent_events(self, limit: int = 1_000) -> list[AgentEvent]:
+        """Convert the sdk activity stream into the transcript vocabulary."""
+        events: list[AgentEvent] = []
+        while len(events) < limit:
+            batch = self.drain_activity(limit - len(events))
+            if not batch:
+                break
+            events.extend(self._as_agent_event(kind, payload)
+                          for kind, payload in batch)
+        return events
 
-    def scope(self, scope: Any) -> contextlib.AbstractContextManager:
-        return contextlib.nullcontext()
+    def _as_agent_event(self, kind: str, payload: dict[str, Any]) -> AgentEvent:
+        agent = str(payload.get('agent', ''))
+        if kind == 'usage':
+            usage = {key: payload.get(key) for key in
+                     ('input_tokens', 'cached_input_tokens', 'output_tokens')}
+            return AgentEvent(agent, 'usage', content=json.dumps(usage))
+        if kind == 'status':
+            return AgentEvent(agent, 'status',
+                              status=str(payload.get('status', '')))
+        if kind == 'tool_start':
+            return AgentEvent(agent, 'tool_start',
+                              tool_name=str(payload.get('name', '')),
+                              tool_args=dict(payload.get('args') or {}))
+        if kind == 'tool_output':
+            return AgentEvent(agent, 'tool_output_line',
+                              content=str(payload.get('text', '')))
+        if kind == 'tool_end':
+            return AgentEvent(agent, 'tool_result',
+                              content=str(payload.get('output', ''))[:500])
+        if kind == 'agent_event':
+            return AgentEvent(agent, 'status',
+                              status=str(payload.get('status', '')),
+                              content=str(payload.get('content', '')))
+        if kind in ('text_delta', 'thinking_delta', 'compaction_delta'):
+            return AgentEvent(agent, kind, content=str(payload.get('text', '')))
+        return AgentEvent(agent, 'message', content=str(payload))
 
-    def current_scope(self) -> str:
-        return self._current_name()
-
-    @property
-    def enabled(self) -> bool:
-        return self.settings.max_concurrent > 0
-
+    # ── compatibility ───────────────────────────────────────
     def records(self) -> dict[str, AgentRecord]:
+        """The live agent records, keyed by name."""
         return self._agents
+
+    def agent_rows(self) -> list[dict[str, Any]]:
+        """A per-frame copy of the agent state for a UI to render.
+
+        The records belong to the manager's loop, while the UI samples them
+        from its own thread (a spawn or a completion can land mid-copy), so
+        the copy is taken defensively: a frame that races just shows nothing
+        new rather than raising.
+        """
+        try:
+            records = list(self._agents.values())
+        except RuntimeError:      # mutated during the copy
+            return []
+        now = time.monotonic()
+        rows: list[dict[str, Any]] = []
+        for record in records:
+            running = record.status in ACTIVE_STATES
+            started = self._agent_started.setdefault(record.name, now)
+            if running:
+                if self._agent_stopped.pop(record.name, None) is not None:
+                    # a finished name was reused by a new agent
+                    started = self._agent_started[record.name] = now
+                finished = now
+            else:
+                finished = self._agent_stopped.setdefault(record.name, now)
+            rows.append({
+                'name': record.name,
+                'parent': record.parent,
+                'depth': record.depth,
+                'status': record.status,
+                'started': started,
+                'elapsed': max(0.0, finished - started),
+            })
+        return rows

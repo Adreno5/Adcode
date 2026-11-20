@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from adcode.crypto import decrypt_secret, encrypt_secret
+from adcode.i18n import normalize_locale
 from adcode.tui.keymap import BINDINGS, validate_key_name
 
 CONFIG_DIR = Path.home() / '.adcode'
@@ -25,13 +26,16 @@ CONFIG_PATH = CONFIG_DIR / 'config.json'
 LEGACY_CONFIG_PATH = Path(__file__).resolve().parent.parent / 'config.json'
 CONFIG_VERSION = 2
 
+#: The document key the configuration is stored under.
+CONFIG_KEY = 'config'
+
 API_WIRES = (
     'openai chat completions',
     'openai responses',
     'anthropic messages',
 )
 REASONING_EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max', 'ultra')
-THINKING_MODES = ('hidden', 'label', 'partial', 'full', 'summary')
+THINKING_MODES = ('hidden', 'label', 'partial', 'full')
 THINKING_ANIMATIONS = ('fixed', 'rotating')
 THINKING_STYLES = ('normal', 'gradient')
 ELLIPSIS_STYLES = ('none', 'label', 'count')
@@ -39,7 +43,30 @@ TOOL_MODES = ('hidden', 'call', 'result', 'both')
 RESULT_MODES = ('partial', 'full')
 #: How a chain of consecutive tool calls is shown.
 TOOL_CHAINS = ('separate', 'merged')
+#: What is left of a thinking block once it has finished.  The same four
+#: modes the ongoing block offers; ``keep`` is the old "let the ongoing mode
+#: decide" value, still accepted from a config file and used by the alt-held
+#: reveal, but never written.
+THINKING_AFTER_COMPLETION = ('keep', 'hidden', 'label', 'partial', 'full')
 THEMES = ('dark', 'light')
+
+#: The work-step preset the user edited the thinking and tool settings under.
+STEPS_CUSTOM = 'custom'
+#: The work-step presets.  Each one writes the thinking and tool settings that
+#: belong to it; the settings themselves stay the source of truth, so a preset
+#: is only a named starting point and ``custom`` is "the user's own mix".
+STEP_PRESETS: dict[str, dict[str, Any]] = {
+    'concise': {'thinking.mode': 'label', 'thinking.label_tokens': True,
+                'thinking.after_completion': 'label', 'tools.chain': 'merged'},
+    'standard': {'thinking.mode': 'partial', 'thinking.label_tokens': False,
+                 'thinking.after_completion': 'partial',
+                 'tools.chain': 'separate'},
+    'detailed': {'thinking.mode': 'full', 'thinking.label_tokens': False,
+                 'thinking.after_completion': 'full', 'tools.chain': 'separate',
+                 'tools.result_mode': 'full'},
+}
+#: Every value ``steps.preset`` may hold (the presets plus ``custom``).
+STEPS_PRESETS = (*STEP_PRESETS, STEPS_CUSTOM)
 
 
 def _now() -> str:
@@ -57,6 +84,16 @@ def _bounded_int(value: Any, low: int, high: int, default: int) -> int:
 
 def _choice(value: Any, choices: tuple[str, ...], default: str) -> str:
     return value if isinstance(value, str) and value in choices else default
+
+
+def _bounded_float(value: Any, low: float, high: float, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number:      # NaN
+        return default
+    return max(low, min(high, number))
 
 
 def _bool(value: Any, default: bool) -> bool:
@@ -154,6 +191,9 @@ class ProviderConfig:
     models: list[ModelConfig] = field(default_factory=list)
     extra_headers: dict[str, str] = field(default_factory=dict)
     reasoning_extra_body: dict[str, Any] = field(default_factory=dict)
+    #: Whether requests carry Console's ``x-opencode-session`` header:
+    #: ``auto`` sends it to opencode.ai endpoints only, ``on``/``off`` force it.
+    opencode_session: str = 'auto'
 
     def model(self, model_id: str) -> ModelConfig | None:
         return next((model for model in self.models if model.id == model_id), None)
@@ -187,6 +227,8 @@ class ProviderConfig:
                 for key, value in _mapping(raw.get('extra_headers')).items()
             },
             reasoning_extra_body=_mapping(raw.get('reasoning_extra_body')),
+            opencode_session=_choice(
+                raw.get('opencode_session'), ('auto', 'on', 'off'), 'auto'),
         )
 
 
@@ -207,7 +249,12 @@ class ThinkingDisplay:
     gradient_top_alpha: int = 40
     ellipsis: str = 'label'
     ellipsis_label: str = '...'
-    show_completed: bool = True
+    # The label line can carry the size of the reasoning it stands for.
+    label_tokens: bool = False
+    # What the finished reasoning looks like: the same four modes as the
+    # ongoing block.  ``keep`` ("render it as the ongoing mode does") is still
+    # read from old files and used by the alt-held reveal.
+    after_completion: str = 'label'
 
     @classmethod
     def from_dict(cls, raw: Any) -> 'ThinkingDisplay':
@@ -218,8 +265,30 @@ class ThinkingDisplay:
         rotation_ms = raw.get('rotation_ms')
         if not isinstance(rotation_ms, list) or len(rotation_ms) != len(rotation):
             rotation_ms = [400] * len(rotation)
+        after = raw.get('after_completion')
+        if after is None:
+            # Older files stored the same decision as a boolean.
+            after = 'keep' if _bool(raw.get('show_completed'), True) else 'hide'
+        mode = _choice(raw.get('mode'), THINKING_MODES, 'label')
+        label_tokens = raw.get('label_tokens')
+        if raw.get('mode') == 'summary':
+            # The token count used to be a mode of its own; it is an attribute
+            # of the label line now, so the old mode becomes "label + count".
+            mode = 'label'
+            if label_tokens is None:
+                label_tokens = True
+        label_tokens = _bool(label_tokens, False)
+        if after == 'hide':
+            # The old name for "nothing left of it".
+            after = 'hidden'
+        after = _choice(after, THINKING_AFTER_COMPLETION, 'keep')
+        if after == 'keep':
+            # "Whatever the ongoing mode renders" used to be one setting; the
+            # two stages are configured separately now, so resolve it to the
+            # mode it used to follow.
+            after = mode
         return cls(
-            mode=_choice(raw.get('mode'), THINKING_MODES, 'label'),
+            mode=mode,
             label=_str(raw.get('label'), 'Thinking') or 'Thinking',
             animation=_choice(raw.get('animation'), THINKING_ANIMATIONS, 'rotating'),
             fixed_suffix=_str(raw.get('fixed_suffix'), '...'),
@@ -231,8 +300,36 @@ class ThinkingDisplay:
             gradient_top_alpha=_bounded_int(raw.get('gradient_top_alpha'), 0, 255, 40),
             ellipsis=_choice(raw.get('ellipsis'), ELLIPSIS_STYLES, 'label'),
             ellipsis_label=_str(raw.get('ellipsis_label'), '...'),
-            show_completed=_bool(raw.get('show_completed'), True),
+            label_tokens=label_tokens,
+            after_completion=after,
         )
+
+
+@dataclass
+class StepsSettings:
+    """Which work-step preset wrote the thinking and tool settings.
+
+    Any preset but ``custom`` owns those settings: ``/config`` shows them
+    read-only, and only ``custom`` unlocks them for editing.
+    """
+
+    preset: str = STEPS_CUSTOM
+    #: Fold a finished turn's steps -- the reasoning and every tool call -- into
+    #: one summary row (``Thought for 812 tokens, bash x2, edit``).
+    collapse_after_completion: bool = False
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> 'StepsSettings':
+        raw = raw if isinstance(raw, dict) else {}
+        return cls(
+            preset=_choice(raw.get('preset'), STEPS_PRESETS, STEPS_CUSTOM),
+            collapse_after_completion=_bool(
+                raw.get('collapse_after_completion'), False),
+        )
+
+    @property
+    def custom(self) -> bool:
+        return self.preset == STEPS_CUSTOM
 
 
 @dataclass
@@ -272,6 +369,64 @@ class ToolDisplay:
 
 
 @dataclass
+class FooterSettings:
+    """How the status line under the input behaves.
+
+    Three things live on that line:
+
+    - a light that runs along it while the agent works;
+    - a progress bar when the running command reports a percentage;
+    - the green "the task is done" state, which stays until the user types.
+    """
+
+    # the running light
+    sweep_enabled: bool = True
+    sweep_period: float = 1.0      # seconds per crossing
+    sweep_span: int = 12           # the width of the light, in cells
+    # the light follows the speed of the model while it generates
+    sweep_tok_speed: bool = False
+    sweep_tok_rate: float = 60.0   # tokens per second at ``sweep_period``
+    sweep_slow_factor: float = 6.0  # how much slower it moves without a rate
+    # One cycle of the light per N tokens; 0 keeps the time based speed.
+    sweep_tokens_per_cycle: int = 0
+    # the breathing line while the provider is contacted
+    connect_pulse: float = 1.2     # seconds per breath
+    # the progress bar
+    progress_enabled: bool = True
+    progress_window: float = 10.0  # how long a sample stays fresh
+    progress_samples: int = 2      # samples needed before the bar shows
+    # the done state
+    done_enabled: bool = True
+    done_wipe: float = 0.5         # seconds for the wipe in and out
+    done_color: str = ''           # '' = the palette's success green
+    done_text_color: str = ''      # '' = white
+    done_hold: bool = True         # stay green until the user types
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> 'FooterSettings':
+        raw = raw if isinstance(raw, dict) else {}
+        return cls(
+            sweep_enabled=_bool(raw.get('sweep_enabled'), True),
+            sweep_period=_bounded_float(raw.get('sweep_period'), 0.05, 60, 1.0),
+            sweep_span=_bounded_int(raw.get('sweep_span'), 1, 200, 12),
+            sweep_tok_speed=_bool(raw.get('sweep_tok_speed'), False),
+            sweep_tok_rate=_bounded_float(raw.get('sweep_tok_rate'), 1, 100_000, 60.0),
+            sweep_slow_factor=_bounded_float(raw.get('sweep_slow_factor'), 1, 100, 6.0),
+            sweep_tokens_per_cycle=_bounded_int(
+                raw.get('sweep_tokens_per_cycle'), 0, 1_000_000, 0),
+            connect_pulse=_bounded_float(raw.get('connect_pulse'), 0.1, 60, 1.2),
+            progress_enabled=_bool(raw.get('progress_enabled'), True),
+            progress_window=_bounded_float(raw.get('progress_window'), 0.5, 600, 10.0),
+            progress_samples=_bounded_int(raw.get('progress_samples'), 1, 100, 2),
+            done_enabled=_bool(raw.get('done_enabled'), True),
+            done_wipe=_bounded_float(raw.get('done_wipe'), 0.0, 60, 0.5),
+            done_color=_str(raw.get('done_color'), ''),
+            done_text_color=_str(raw.get('done_text_color'), ''),
+            done_hold=_bool(raw.get('done_hold'), True),
+        )
+
+
+@dataclass
 class HoldSettings:
     """Keep retrying a request that was cut short.
 
@@ -294,6 +449,24 @@ class HoldSettings:
             max_retries=_bounded_int(raw.get('max_retries'), 0, 10_000, 20),
             delay=_bounded_int(raw.get('delay'), 0, 600, 2),
         )
+
+
+@dataclass
+class FailoverSettings:
+    """Try the other providers when the selected one is down.
+
+    With ``enabled`` the engine talks to a failover chain: the selected
+    provider first, then the remaining configured ones (the same model id
+    when a provider has it, its first model otherwise).  A provider whose
+    stream already produced content is never switched mid-answer.
+    """
+
+    enabled: bool = True
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> 'FailoverSettings':
+        raw = raw if isinstance(raw, dict) else {}
+        return cls(enabled=_bool(raw.get('enabled'), True))
 
 
 @dataclass
@@ -329,6 +502,26 @@ class ReasoningSettings:
             effort=_choice(raw.get('effort'), REASONING_EFFORTS, 'medium'),
             force=_bool(raw.get('force'), False),
         )
+
+
+#: How much the agent has to ask for.
+SECURITY_MODES = ('off', 'ask')
+
+#: What the agent may do to a project folder.
+#:
+#: ``readonly``   read the project; change nothing (not even a temp file)
+#: ``workspace``  change files inside the project; nothing outside it
+#: ``full``       no boundary at all -- the user's own permissions
+#:
+#: The three are cumulative in write scope: each one allows strictly less
+#: than the next.  Read access is the same in all of them -- a read-only
+#: project is still readable, that is the point of it.
+ACCESS_LEVELS = ('readonly', 'workspace', 'full')
+
+#: The old name of the sandbox setting.  Kept so an older configuration
+#: file still reads: ``none`` meant "no boundary" (= ``full``) and
+#: ``workspace`` meant "writes inside the project".
+SANDBOX_MODES = ('none', 'workspace')
 
 
 @dataclass
@@ -384,9 +577,69 @@ class SkillsSettings:
 
 
 @dataclass
+class SecuritySettings:
+    """How much the agent may do, and how much it has to ask for.
+
+    ``mode``
+        ``off``  -- everything is allowed, but every call is still audited.
+        ``ask``  -- the effectful tools (shell, network, collaboration) wait
+                    for a yes; the answer can be remembered for the session.
+    ``access``
+        What the agent may do to the project folder:
+        ``readonly`` / ``workspace`` / ``full`` (see :data:`ACCESS_LEVELS`).
+    ``access_by_project``
+        Per-project overrides: the project root -> the level for it.  A
+        project the user trusts can be ``full`` while the default stays
+        ``readonly``; the level travels with the folder, not with the app.
+    ``network_allowlist``
+        Hosts the ``fetch`` tool may reach.  Empty means "no restriction".
+    ``deny_tools``
+        Tool names that are refused outright.
+    ``approval_timeout``
+        Seconds to wait for an answer; after that the call is refused.
+    """
+
+    mode: str = 'off'
+    access: str = 'full'
+    access_by_project: dict[str, str] = field(default_factory=dict)
+    network_allowlist: list[str] = field(default_factory=list)
+    deny_tools: list[str] = field(default_factory=list)
+    approval_timeout: float = 120.0
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> 'SecuritySettings':
+        raw = raw if isinstance(raw, dict) else {}
+        hosts = raw.get('network_allowlist')
+        denied = raw.get('deny_tools')
+        by_project = raw.get('access_by_project')
+        access = _choice(raw.get('access'), ACCESS_LEVELS, '')
+        if not access:
+            # An older configuration: the sandbox setting said how far the
+            # shell was fenced.  'none' meant no boundary at all.
+            legacy = _choice(raw.get('sandbox'), SANDBOX_MODES, '')
+            access = {'none': 'full', 'workspace': 'workspace'}.get(legacy, '')
+        return cls(
+            mode=_choice(raw.get('mode'), SECURITY_MODES, 'off'),
+            access=access or 'full',
+            access_by_project={
+                str(root): _choice(level, ACCESS_LEVELS, 'full')
+                for root, level in (by_project or {}).items()
+            } if isinstance(by_project, dict) else {},
+            network_allowlist=[str(item) for item in hosts]
+            if isinstance(hosts, list) else [],
+            deny_tools=[str(item) for item in denied]
+            if isinstance(denied, list) else [],
+            approval_timeout=float(_bounded_int(
+                raw.get('approval_timeout'), 5, 3_600, 120)),
+        )
+
+
+@dataclass
 class UiSettings:
     theme: str = 'dark'
     accent: str = '#8fa7d6'
+    #: The language of the interface: ``en`` or ``zh``.
+    locale: str = 'en'
     mouse_scroll_lines: int = 3
     show_header: bool = True
     show_token_status: bool = True
@@ -400,6 +653,7 @@ class UiSettings:
         return cls(
             theme=_choice(raw.get('theme'), THEMES, 'dark'),
             accent=_str(raw.get('accent'), '#8fa7d6') or '#8fa7d6',
+            locale=normalize_locale(raw.get('locale')),
             mouse_scroll_lines=_bounded_int(raw.get('mouse_scroll_lines'), 1, 30, 3),
             show_header=_bool(raw.get('show_header'), True),
             show_token_status=_bool(raw.get('show_token_status'), True),
@@ -422,11 +676,13 @@ class KeysSettings:
     palette: str = 'ctrl+p'
     config: str = 'ctrl+,'
     sessions: str = 'ctrl+h'
+    agents: str = 'ctrl+g'
     exit_chord: str = 'ctrl+c'
     exit_eof: str = 'ctrl+d'
     redraw: str = 'ctrl+l'
     paste: str = 'ctrl+v'
     attach_image: str = 'alt+v'
+    copy_last: str = 'alt+c'
     cut: str = 'ctrl+x'
     select_all: str = 'ctrl+a'
     undo: str = 'ctrl+z'
@@ -533,11 +789,15 @@ class AppConfig:
     mcp_servers: list[dict[str, Any]] = field(default_factory=list)
     thinking: ThinkingDisplay = field(default_factory=ThinkingDisplay)
     tools: ToolDisplay = field(default_factory=ToolDisplay)
+    steps: StepsSettings = field(default_factory=StepsSettings)
     hold: HoldSettings = field(default_factory=HoldSettings)
+    failover: FailoverSettings = field(default_factory=FailoverSettings)
+    footer: FooterSettings = field(default_factory=FooterSettings)
     context: ContextSettings = field(default_factory=ContextSettings)
     reasoning: ReasoningSettings = field(default_factory=ReasoningSettings)
     agents: AgentsSettings = field(default_factory=AgentsSettings)
     skills: SkillsSettings = field(default_factory=SkillsSettings)
+    security: SecuritySettings = field(default_factory=SecuritySettings)
     ui: UiSettings = field(default_factory=UiSettings)
     keys: KeysSettings = field(default_factory=KeysSettings)
     max_output_tokens: int = 8_192
@@ -633,6 +893,12 @@ def migrate_legacy(raw: dict[str, Any]) -> AppConfig:
     if isinstance(theme, str) and theme.startswith('\x1b['):
         config.ui.accent = '#c8cbd1' if '37m' in theme else config.ui.accent
 
+    # A file that already carries the newer ui block keeps it: the legacy
+    # path only fills in what it knows about.
+    legacy_ui = raw.get('ui')
+    if isinstance(legacy_ui, dict):
+        config.ui = UiSettings.from_dict(legacy_ui)
+
     for model in (model for provider in config.providers for model in provider.models):
         if model.max_output_tokens == 8_192:
             model.max_output_tokens = min(max_output, 2_000_000)
@@ -664,11 +930,15 @@ def config_from_dict(raw: dict[str, Any]) -> AppConfig:
     ]
     config.thinking = ThinkingDisplay.from_dict(raw.get('thinking'))
     config.tools = ToolDisplay.from_dict(raw.get('tools'))
+    config.steps = StepsSettings.from_dict(raw.get('steps'))
     config.hold = HoldSettings.from_dict(raw.get('hold'))
+    config.failover = FailoverSettings.from_dict(raw.get('failover'))
+    config.footer = FooterSettings.from_dict(raw.get('footer'))
     config.context = ContextSettings.from_dict(raw.get('context'))
     config.reasoning = ReasoningSettings.from_dict(raw.get('reasoning'))
     config.agents = AgentsSettings.from_dict(raw.get('agents'))
     config.skills = SkillsSettings.from_dict(raw.get('skills'))
+    config.security = SecuritySettings.from_dict(raw.get('security'))
     config.ui = UiSettings.from_dict(raw.get('ui'))
     config.keys = KeysSettings.from_dict(raw.get('keys'))
     config.max_output_tokens = _bounded_int(
@@ -701,12 +971,51 @@ def config_to_dict(config: AppConfig) -> dict[str, Any]:
     return data
 
 
-class ConfigStore:
-    """Loads, migrates, and atomically saves the config file."""
+#: The configuration of the running session.  Tools run in worker threads and
+#: have no handle on the app, so the app publishes its config here; the
+#: security settings (which hosts may be reached) are read from it.
+_CURRENT: "AppConfig | None" = None
 
-    def __init__(self, path: str | os.PathLike[str] | None = None) -> None:
-        self.path = Path(path) if path is not None else CONFIG_PATH
+
+def set_current_config(config: "AppConfig | None") -> None:
+    """Publish the configuration the running session uses."""
+    global _CURRENT
+    _CURRENT = config
+
+
+def current_config() -> "AppConfig | None":
+    """The published configuration, if a session is running."""
+    return _CURRENT
+
+
+class ConfigStore:
+    """Loads, migrates, and saves the configuration.
+
+    Two routes:
+
+    * **the state database** (the default) -- the configuration is
+      structured state, and a JSON file lying around is exactly what this
+      app stopped doing.  The document key is ``config``.
+    * **a file** -- for tools, for tests, and for anybody who wants to
+      read the configuration with ``cat``.
+
+    The old file (``~/.adcode/config.json``, or the one next to the
+    package) is imported into the database on first load and then removed.
+    """
+
+    def __init__(self, path: str | os.PathLike[str] | None = None, *,
+                 documents: Any = None) -> None:
+        self.path = Path(path) if path is not None else None
+        self._documents = documents
         self.config = AppConfig()
+
+    # ── the store behind the store ─────────────────────────
+    def _document_store(self) -> Any:
+        """The document store to use (the state database by default)."""
+        if self._documents is None:
+            from adcode.state import state_store
+            self._documents = state_store().documents
+        return self._documents
 
     def load(self) -> AppConfig:
         raw, legacy = self._read_payload()
@@ -721,6 +1030,23 @@ class ConfigStore:
 
     def _read_payload(self) -> tuple[Any, Path | None]:
         """Read the config payload, falling back to the pre-``~/.adcode`` file."""
+        if self.path is None:
+            # The database route: the document first, the old file second.
+            try:
+                document = self._document_store().load(CONFIG_KEY)
+            except Exception:      # noqa: BLE001 - no database, no config
+                document = None
+            if isinstance(document, dict) and document:
+                return document, None
+            for legacy_path in (CONFIG_PATH, LEGACY_CONFIG_PATH):
+                if not legacy_path.exists():
+                    continue
+                try:
+                    raw = json.loads(legacy_path.read_text(encoding='utf-8-sig'))
+                except (OSError, ValueError):
+                    continue
+                return raw, legacy_path
+            return {}, None
         if (not self.path.exists() and self.path == CONFIG_PATH
                 and LEGACY_CONFIG_PATH.exists()):
             try:
@@ -752,6 +1078,12 @@ class ConfigStore:
 
     def save(self) -> bool:
         payload = config_to_dict(self.config)
+        if self.path is None:
+            try:
+                self._document_store().save(CONFIG_KEY, payload)
+                return True
+            except Exception:      # noqa: BLE001 - an unwritable database
+                return False       # must not take the agent down
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             fd, temp_name = tempfile.mkstemp(
@@ -785,3 +1117,18 @@ def set_by_path(config: Any, path: str, value: Any) -> None:
     for part in parts[:-1]:
         current = getattr(current, part)
     setattr(current, parts[-1], value)
+
+def apply_step_preset(config: Any, level: str) -> bool:
+    """Write the thinking and tool settings of one work-step level.
+
+    The preset is recorded too, so ``/config`` knows whether those settings
+    still belong to a preset or were edited by hand.  False when ``level`` is
+    not one of the presets.
+    """
+    paths = STEP_PRESETS.get(level)
+    if paths is None:
+        return False
+    for path, value in paths.items():
+        set_by_path(config, path, value)
+    config.steps.preset = level
+    return True

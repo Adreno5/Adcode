@@ -8,23 +8,35 @@ event queue consumed here.
 
 from __future__ import annotations
 
+import math
 import os
 import queue
+import re
 import threading
+import uuid
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
+from adcode.access import effective_access
 from adcode.agent_loop import AgentLoop, AgentSnapshot
-from adcode.config import AppConfig, ConfigStore, ProviderConfig, ModelConfig
+from adcode.commands import ARCHIVED_HINT, ARCHIVED_REFUSAL
+from adcode.config import AppConfig, set_current_config, ConfigStore, ProviderConfig, ModelConfig
 from adcode.goals import GoalStore
+from adcode.i18n import t, tf
 from adcode.images import (
     ImageStore, count_image_markers, file_uri_to_path, image_marker, is_image_url,
     read_clipboard_image, resolve_image,
 )
+from infra.policy.predictor import DurationPredictor
+
 from adcode.mcp.manager import get_mcp_manager
-from adcode.paths import goals_file, sessions_db
-from adcode.session import DbSessionStore, TranscriptItem
+from adcode import paths
+from adcode.paths import sessions_db
+from adcode.session import (
+    ArchivedSessionStore, TranscriptItem,
+)
 from adcode.skills import SkillRegistry
 from adcode.theme import Palette, build_palette
 from adcode.tools.builtin import shutdown_shell_sessions
@@ -45,6 +57,8 @@ from adcode.tui.text import (
     Line, Span, add_span, line_text_between, line_width, plain_text,
     split_line_columns,
 )
+from adcode.tui import agents_panel, todo_panel
+from adcode.tui.approval import ApprovalDialog
 from adcode.tui.transcript import LiveRender, TranscriptRenderer
 
 SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
@@ -56,6 +70,8 @@ _DEFAULT_FPS = 60
 SWEEP_PERIOD = 1.0
 # The UI error log is capped; a bug that fires every frame would fill it.
 _LOG_MAX_BYTES = 2 * 1024 * 1024
+#: How far back the token rate is measured, in seconds.
+_TOKEN_RATE_WINDOW = 3.0
 # How wide the light is, in cells.
 SWEEP_SPAN = 12
 # How long the event loop sleeps when there is nothing to draw. A keypress
@@ -141,6 +157,26 @@ class PromptState:
     def copy(self) -> str:
         start, end = self.selection()
         return self.text[start:end] if start != end else ''
+
+
+#: A percentage in a line of command output.
+_PERCENT_RE = re.compile(r'(\d{1,3})\s*%')
+
+
+def _percent_in(text: str) -> int | None:
+    """The last percentage a line of output mentions."""
+    if not text:
+        return None
+    matches = _PERCENT_RE.findall(text)
+    if not matches:
+        return None
+    try:
+        value = int(matches[-1])
+    except ValueError:
+        return None
+    if value < 0 or value > 100:
+        return None
+    return value
 
 
 def _format_tokens(value: int) -> str:
@@ -234,8 +270,27 @@ class AdCodeApp:
                  input_queue: 'queue.Queue[KeyEvent] | None' = None,
                  input_thread: InputThread | None = None) -> None:
         self.cwd = cwd or os.getcwd()
+        # The state never lands inside the project being worked on.  This has
+        # to be known before anything writes: the state directory, the
+        # database, the images, the log.
+        paths.set_project_root(self.cwd)
+        # Older versions kept their state in files -- some of them in the
+        # project itself.  The database takes over first (it has to move
+        # before anything opens it), the documents and the audit trail
+        # follow.
+        from adcode.state import (import_legacy_audit, merge_legacy_databases,
+                                  migrate_legacy_database,
+                                  migrate_legacy_images)
+        migrate_legacy_database()
+        # The logs belong in the log file: a stray warning on stderr would
+        # land on the full-screen interface and shred the frame.
+        from adcode.logging_setup import configure_logging
+        configure_logging()
         self.store = ConfigStore(config_path)
         self.config: AppConfig = self.store.load()
+        # the tools read their settings from here (they run in worker threads
+        # and have no handle on the app)
+        set_current_config(self.config)
         self.keymap = KeyMap(self.config.keys)
         # The terminal pieces are injectable so a harness can drive the real
         # application loop without owning a console (see the test harness).
@@ -248,14 +303,39 @@ class AdCodeApp:
             input_thread if input_thread is not None
             else InputThread(self.input_queue))
         self.posted: 'queue.Queue[Callable[[], None]]' = queue.Queue()
-        self.session_store = DbSessionStore(db_path=str(sessions_db()))
-        self.images = ImageStore(os.path.join(self.cwd, 'sessions', 'images'),
-                                 self.cwd)
-        self.goals = GoalStore(str(goals_file()))
+        # One database holds the sessions, the documents and the audit
+        # trail -- and one connection writes it, so the two stores never
+        # fight over the write lock.
+        from adcode.state import state_store
+        self.state = state_store()
+        import_legacy_audit()
+        merge_legacy_databases()
+        migrate_legacy_images()
+        # The store keeps the archived set beside the sessions themselves, so
+        # archiving is a property of the session and not of its messages.
+        self.session_store = ArchivedSessionStore(store=self.state.store,
+                                                  db_path=str(sessions_db()))
+        # Images live with the state, not in the project: a repository is
+        # for code.
+        self.images = ImageStore(str(paths.images_dir()), self.cwd)
+        self.goals = GoalStore()
         self.skills = SkillRegistry(self.config.skills, self.cwd).scan()
         self.registry = ToolRegistry()
         self.mcp = get_mcp_manager(self.registry)
         self.loop: AgentLoop | None = None
+        # The todo panel reads the same store the tool writes; the revision
+        # tells the frame whether anything changed since the last paint.
+        self._todo_store = None
+        self._todo_revision: int | None = None
+        # what each sub-agent is doing right now, from its 'agent_event's
+        self.agent_steps: dict[str, str] = {}
+        # approvals waiting for an answer: id -> (request, decision holder)
+        self._approvals: dict[str, dict[str, Any]] = {}
+        # the access level in force for this project (see adcode.access)
+        self._applied_access: str = effective_access(self.config, self.cwd)
+        # the second currently painted in the strip's elapsed column; the
+        # panel ticks once per second even while the root agent is idle
+        self._agent_clock: int | None = None
         self.standalone_items: list[TranscriptItem] = []
         self.transcript = TranscriptRenderer()
         self.prompt = PromptState()
@@ -268,6 +348,10 @@ class AdCodeApp:
         self.config_version = 0
         self.btw_mode = False
         self.exit_armed = False
+        # The loaded session is archived: it is read-only until /respawn.
+        self.session_archived = False
+        # The sessions browser hides archived rows until Alt reveals them.
+        self._sessions_show_archived = False
         self.last_render = 0.0
         self._prompt_cache: tuple[tuple[Any, ...], tuple[list[Line], int, int]] | None = None
         self._snapshot_cache: AgentSnapshot | None = None
@@ -284,6 +368,13 @@ class AdCodeApp:
         self.last_interrupt = 0.0
         self.last_width = 0
         self.last_title = ''
+        # Holding Alt for this long temporarily reveals every detail (full
+        # reasoning, every tool call and result, and error bodies).  Releasing
+        # Alt restores the configured display policy.  A modifier press event
+        # starts the timer; None means Alt is not currently held.
+        self._alt_pressed_at: float | None = None
+        self._alt_details_shown = False
+        self._alt_reveal_seconds = 1.0
         self._last_total = 0
         self._last_viewport = 0
         self._last_max_scroll = 0
@@ -302,10 +393,30 @@ class AdCodeApp:
         # level shows them next to the tool name as the current action.
         self.status_args: dict[str, Any] = {}
         self.status_tool_name = ''
+        # The state of the status line: normal, done (the task finished) or
+        # fading (the user typed, the green leaves again).
+        self.footer_state = 'normal'
+        self.footer_state_at = 0.0
+        # The percentages the running command reported, with their time.
+        self._progress: list[tuple[float, int]] = []
+        # The output tokens of the model, with their time: they say how fast
+        # it generates.
+        self._token_samples: list[tuple[float, int]] = []
+        # The tokens the model produced in this turn, counted while they
+        # stream: they move the light in the token driven mode.
+        self._stream_tokens = 0
+        # When the first token of the turn arrived: the speed is measured
+        # from there, so the wait for the provider is not part of it.
+        self._stream_started = 0.0
         # Wall clock start of the current connection attempt, so the footer can
         # show how long the provider has been silent.
         self.connect_started = 0.0
         self.connect_retrying = False
+        # Learns how long a request takes from the finished ones; the footer
+        # turns that into an estimate while the provider is silent.
+        self._predictor = self._load_predictor()
+        self._last_cache_hit: float | None = None
+        self._last_usage: dict[str, Any] = {}
         self._resume = resume
         self._started_at = time.time()
         self._tool_signature = self._tool_config_signature()
@@ -346,6 +457,8 @@ class AdCodeApp:
         self.loop = AgentLoop(
             self.config, self.registry, self.session_store, self.goals,
             self.skills, emit=self._wake, mcp_manager=self.mcp, cwd=self.cwd,
+            approval_ask=self.request_approval,
+            notice=self.notify,
         )
         self.loop.start()
         self._start_mcp_load()
@@ -385,11 +498,20 @@ class AdCodeApp:
             f'({len(payload.messages)} messages).', level='info')
         self.follow = True
         self.dirty = True
+        self._sync_archive_state()
 
     # ── shutdown ────────────────────────────────────────────
     def _shutdown(self) -> None:
         try:
             self.input_thread.stop()
+            # A tool that is waiting for an approval must not be cancelled
+            # mid-flight: refusing it lets the turn finish on its own, which
+            # keeps the engine's cleanup quiet.
+            if self._approvals:
+                self.refuse_pending_approvals('the session is closing')
+                deadline = time.monotonic() + 2.0
+                while self._approvals and time.monotonic() < deadline:
+                    time.sleep(0.02)
             if self.loop is not None:
                 self.loop.shutdown()
                 self.loop.save_active()
@@ -440,10 +562,11 @@ class AdCodeApp:
 
     # ── notifications ───────────────────────────────────────
     def notify(self, text: str, level: str = 'info') -> None:
+        message = t(text)
         if self.loop is not None:
-            self.loop.add_notice(text, level)
+            self.loop.add_notice(message, level)
         else:
-            self.standalone_items.append(TranscriptItem(kind='notice', text=text,
+            self.standalone_items.append(TranscriptItem(kind='notice', text=message,
                                                         level=level))
         self.dirty = True
 
@@ -453,7 +576,9 @@ class AdCodeApp:
 
     def config_changed(self) -> None:
         self.save_config()
+        set_current_config(self.config)
         self.config_version += 1
+        self._apply_access()
         self.keymap = KeyMap(self.config.keys)
         self.palette = build_palette(self.config.ui.theme, self.config.ui.accent)
         self.canvas.palette = self.palette
@@ -470,6 +595,25 @@ class AdCodeApp:
             # reach it while it runs.
             self.loop.apply_hold()
         self.dirty = True
+
+    def _apply_access(self) -> None:
+        """Put the access level in force.
+
+        The level decides what the agent may change, so it cannot wait for
+        the next turn: the guard, the policy and the declared sandbox of
+        every tool are rebuilt the moment the setting changes.
+        """
+        from adcode.access import effective_access
+        level = effective_access(self.config, self.cwd)
+        if level == getattr(self, '_applied_access', ''):
+            return
+        self._applied_access = level
+        if self.loop is not None:
+            self.loop.apply_access()
+        from adcode.i18n import tf
+        from adcode.tui.settings import ACCESS_LABELS
+        self.notify(tf('Project access: {level}',
+                       level=ACCESS_LABELS.get(level, level)), 'info')
 
     def _tool_config_signature(self) -> tuple[Any, ...]:
         return (
@@ -510,6 +654,11 @@ class AdCodeApp:
 
     def clear_conversation(self) -> None:
         if self.loop is not None:
+            if self.session_archived:
+                # /new in an archived session starts a session of its own: the
+                # engine would otherwise keep the archived name and save the
+                # fresh conversation back into the read-only row.
+                self.loop.forget_session()
             self.loop.clear()
         self.standalone_items.clear()
         self.transcript.invalidate()
@@ -518,7 +667,123 @@ class AdCodeApp:
         # No notice: the empty pane with the welcome logo is the feedback.
         from adcode.commands import random_tip
         self.welcome_tip = random_tip()
+        self.session_archived = False
         self._update_title()
+
+    # ── archived sessions ───────────────────────────────────
+    def _session_name(self) -> str:
+        """The name the engine saves this conversation under ('' before one)."""
+        return self.loop.session_name if self.loop is not None else ''
+
+    def _sync_archive_state(self) -> bool:
+        """Re-read whether the loaded session is archived."""
+        name = self._session_name()
+        archived = bool(name) and self.session_store.is_archived(name)
+        if archived != self.session_archived:
+            self.session_archived = archived
+            self.dirty = True
+        return archived
+
+    def archive_session(self, name: str | None = None) -> bool:
+        """Archive a session: it leaves the list and takes no new messages."""
+        target = (name if name is not None else self._session_name()).strip()
+        if not target:
+            self.notify('Nothing to archive yet · send a message first.',
+                        'warning')
+            return False
+        if self.session_store.is_archived(target):
+            self.notify(tf('Session "{name}" is already archived.', name=target), 'info')
+            self._sync_archive_state()
+            return False
+        current = target == self._session_name()
+        if current and self.phase != 'idle':
+            # A running turn would be saved again behind the archive, and the
+            # user would keep watching it write into a read-only session.
+            self.notify('Wait for the turn to finish before archiving it.',
+                        'warning')
+            return False
+        if not self.session_store.archive(target):
+            self.notify(tf('Session not found: {name}', name=target), 'error')
+            return False
+        if current:
+            self._sync_archive_state()
+            self.status_hint = t(ARCHIVED_HINT)
+        self.notify(tf('Archived "{name}" · /respawn restores it, '
+                       '/perish deletes it', name=target), 'info')
+        self.dirty = True
+        return True
+
+    def respawn_session(self) -> bool:
+        """Bring the loaded session back out of the archive."""
+        name = self._session_name()
+        if not name or not self.session_store.is_archived(name):
+            self.notify('This session is not archived.', 'info')
+            return False
+        self.session_store.unarchive(name)
+        self._sync_archive_state()
+        self.status_hint = ''
+        self.notify(tf('"{name}" is back · messages are accepted again.',
+                                name=name), 'success')
+        self.dirty = True
+        return True
+
+    def rename_session(self, name: str) -> bool:
+        """Rename the loaded session.
+
+        The conversation keeps its content: it is saved under the new name
+        and the row of the old name is removed, so the session is moved
+        rather than copied.
+        """
+        new_name = str(name or '').strip()
+        if not new_name:
+            self.notify('A session needs a name.', 'warning')
+            return False
+        if self.loop is None:
+            self.notify('No active session.', 'warning')
+            return False
+        if self.phase != 'idle':
+            self.notify('Wait for the turn to finish before renaming it.',
+                        'warning')
+            return False
+        old_name = self._session_name()
+        if old_name == new_name:
+            self.notify(f'Session is already named {new_name}.', 'info')
+            return False
+        try:
+            self.loop.rename_session(new_name)
+        except Exception as error:
+            self.notify(f'Could not rename the session: {error}', 'error')
+            return False
+        # The archive remembers a session by name: a renamed session that
+        # was archived stays archived, under its new name.
+        if old_name and self.session_store.is_archived(old_name):
+            self.session_store.archive(new_name)
+            self.session_store.unarchive(old_name)
+        self._sync_archive_state()
+        self._update_title()
+        self.dirty = True
+        self.notify(tf('Session renamed to {name}.', name=new_name), 'success')
+        return True
+
+    def perish_session(self) -> bool:
+        """Delete the loaded session for good."""
+        name = self._session_name()
+        if not name:
+            self.notify('No session to delete.', 'warning')
+            return False
+        if self.phase != 'idle':
+            self.notify('Wait for the turn to finish before deleting it.',
+                        'warning')
+            return False
+        self.session_store.delete(name)
+        if self.loop is not None:
+            # The engine would otherwise name the next message after the
+            # row that was just deleted.
+            self.loop.forget_session()
+        self.clear_conversation()
+        self.notify(tf('Deleted "{name}".', name=name), 'success')
+        self.dirty = True
+        return True
 
     def load_session(self, name: str) -> None:
         if self.loop is None:
@@ -529,8 +794,9 @@ class AdCodeApp:
             self.follow = True
             self.scroll = 0
             self.dirty = True
+            self._sync_archive_state()
         else:
-            self.notify(f'Session not found: {name}', 'error')
+            self.notify(tf('Session not found: {name}', name=name), 'error')
 
     # ── provider selection helpers ──────────────────────────
     def ensure_selection(self) -> tuple[ProviderConfig, ModelConfig] | None:
@@ -596,6 +862,8 @@ class AdCodeApp:
                 if self.loop is not None:
                     self.loop.pump_agent_events()
                     self._apply_loop_events()
+                self._sync_todo()
+                self._sync_agent_clock()
                 self._dispatch_input(event)
                 self._check_resize()
                 self._tick_animation()
@@ -677,6 +945,10 @@ class AdCodeApp:
 
     def _apply_event(self, kind: str, payload: dict[str, Any]) -> None:
         if kind == 'turn_start':
+            # The token samples survive the turn: the output counter is a
+            # session total, so two turns are comparable.
+            self._stream_tokens = 0
+            self._stream_started = 0.0
             self._reset_live()
             # A turn opens by sending a request; no model output exists yet, so
             # the honest phase is "connecting" until the first stream event.
@@ -690,6 +962,7 @@ class AdCodeApp:
             if not self.live_thinking_text:
                 self.live_thinking_started = time.time()
             self.live_thinking_text += payload.get('text', '')
+            self._count_stream_tokens(payload.get('text', ''))
             self.live_thinking.feed(payload.get('text', ''))
         elif kind == 'thinking_end':
             self.live_thinking_text = ''
@@ -702,6 +975,7 @@ class AdCodeApp:
                 self.live_answer_text = ''
                 self.phase = 'answering'
             self.live_answer_text += payload.get('text', '')
+            self._count_stream_tokens(payload.get('text', ''))
             self.live_answer.feed(payload.get('text', ''))
         elif kind == 'text_end':
             self.live_answer = MarkdownRenderer(self._content_width())
@@ -709,6 +983,7 @@ class AdCodeApp:
             if self.phase == 'answering':
                 self.phase = 'idle'
         elif kind == 'tool_start':
+            self._progress = []
             self.live_answer = MarkdownRenderer(self._content_width())
             self.live_answer_text = ''
             self.active_tool = payload.get('call_id', '')
@@ -719,9 +994,12 @@ class AdCodeApp:
             self.status_tool_name = payload.get('name', '') or ''
         elif kind == 'tool_output':
             if payload.get('call_id') == self.active_tool:
-                self.live_tool_output.append(payload.get('text', ''))
+                text = payload.get('text', '')
+                self.live_tool_output.append(text)
                 del self.live_tool_output[:-30]
+                self._sample_progress(text)
         elif kind == 'tool_end':
+            self._progress = []
             self.active_tool = ''
             self.live_tool_output = []
             self.status_args = {}
@@ -736,6 +1014,8 @@ class AdCodeApp:
             self.live_compaction = MarkdownRenderer(self._content_width())
             self.phase = 'thinking'
         elif kind == 'usage':
+            self._sample_tokens()
+            self._learn_request_duration(payload)
             self.dirty = True
         elif kind == 'notice':
             level = payload.get('level', 'info')
@@ -750,6 +1030,8 @@ class AdCodeApp:
             self._reset_live()
             self.phase = 'idle'
             self.status_hint = ''
+            if payload.get('status', 'done') == 'done':
+                self._footer_done()
         elif kind == 'aside_start':
             self.phase = 'aside'
             self.live_aside_question = payload.get('question', '')
@@ -784,6 +1066,19 @@ class AdCodeApp:
             self._update_title()
         elif kind == 'agents_refresh':
             self.dirty = True
+        elif kind == 'agent_event':
+            name = str(payload.get('agent') or '')
+            status = str(payload.get('status') or '')
+            content = str(payload.get('content') or '')
+            if name:
+                if status == 'tool':
+                    self.agent_steps[name] = content
+                elif status in ('completed', 'interrupted', 'errored',
+                                'shutdown'):
+                    self.agent_steps.pop(name, None)
+                elif status in ('tool_result', 'tool_output') and content:
+                    self.agent_steps[name] = content.strip().splitlines()[-1][:80]
+                self.dirty = True
         elif kind == 'model_changed':
             self.dirty = True
         self.dirty = True
@@ -817,10 +1112,28 @@ class AdCodeApp:
         return max(0.0, time.time() - self.connect_started)
 
     def _needs_animation(self) -> bool:
-        return self.phase in ('connecting', 'thinking', 'answering', 'tool',
-                              'compacting', 'aside')
+        # A held Alt needs a tick so the hold timer can fire while the app is
+        # otherwise idle -- but only until it has fired: after that the timer
+        # has nothing left to do, and a release that never arrives must not
+        # keep the UI repainting at the full frame rate.
+        if self._alt_pressed_at is not None and not self._alt_details_shown:
+            return True
+        if self.phase in ('connecting', 'thinking', 'answering', 'tool',
+                          'compacting', 'aside'):
+            return True
+        # The green wipe in and out need frames of their own.
+        if self.footer_state in ('done', 'fading'):
+            wipe = max(0.0, self.config.footer.done_wipe)
+            if wipe <= 0:
+                return False
+            return (time.time() - self.footer_state_at) < wipe
+        return False
 
     def _tick_animation(self) -> None:
+        # The green state leaves on its own; the tick runs every loop, not
+        # only when a frame is drawn.
+        self._footer_tick(time.time())
+        self._tick_alt_reveal()
         if self._needs_animation():
             self.dirty = True
 
@@ -840,6 +1153,36 @@ class AdCodeApp:
             self.dirty = True
 
     # ── input ───────────────────────────────────────────────
+    def _handle_modifier(self, event: KeyEvent) -> None:
+        """Track a held Alt for the temporary "reveal all details" mode."""
+        if event.key != 'alt':
+            return
+        if event.action == 'press':
+            if self.overlay is not None:
+                # A modal owns Alt while it is open: the sessions browser uses
+                # it to reveal the archived rows instead of starting a hold.
+                self.overlay.handle(event)
+                self.dirty = True
+                return
+            if self._alt_pressed_at is None:
+                self._alt_pressed_at = time.monotonic()
+        elif event.action == 'release':
+            self._alt_pressed_at = None
+            if self._alt_details_shown:
+                self._alt_details_shown = False
+                self.transcript.invalidate()
+                self.dirty = True
+
+    def _tick_alt_reveal(self) -> None:
+        """Promote a long Alt hold into a temporary detail reveal."""
+        pressed = self._alt_pressed_at
+        if pressed is None or self._alt_details_shown:
+            return
+        if time.monotonic() - pressed >= self._alt_reveal_seconds:
+            self._alt_details_shown = True
+            self.transcript.invalidate()
+            self.dirty = True
+
     def _handle_event(self, event: KeyEvent) -> None:
         # One key quits, whatever is on the screen -- unless an overlay is
         # capturing a new binding, where the quit chord is the value typed.
@@ -848,6 +1191,9 @@ class AdCodeApp:
         if event.kind == 'key' and not capturing \
                 and event.key == self.keymap.key_of('quit'):
             self.request_exit()
+            return
+        if event.kind == 'modifier':
+            self._handle_modifier(event)
             return
         if self.overlay is not None:
             # A modal owns every event while it is open.  Keys, pastes and the
@@ -875,12 +1221,14 @@ class AdCodeApp:
             return
         if event.kind == 'paste':
             self.prompt.insert(event.text)
+            self._footer_input()
             self.dirty = True
             return
         if event.kind == 'text':
             # Route typing through PromptState so the selection and undo stacks
             # stay consistent.
             self.prompt.insert(event.text)
+            self._footer_input()
             self.dirty = True
             return
         if event.kind != 'key':
@@ -895,6 +1243,7 @@ class AdCodeApp:
                 self.prompt.completion_closed_for = self.prompt.text
                 self.prompt.anchor = None
             elif self.phase != 'idle' and self.loop is not None:
+                self.refuse_pending_approvals('turn interrupted')
                 self.loop.interrupt()
             else:
                 self.prompt.anchor = None
@@ -929,13 +1278,16 @@ class AdCodeApp:
         if action == 'sessions':
             self.open_sessions_browser()
             return
+        if action == 'agents':
+            self.open_agents_browser()
+            return
         if action == 'exit_chord':
             if self._copy_selection():
                 return
             if self.prompt.selection()[0] != self.prompt.selection()[1]:
                 copied = self.prompt.copy()
                 if copied and not set_clipboard(copied):
-                    self.status_hint = 'the clipboard is not available'
+                    self.status_hint = t('the clipboard is not available')
                 self.prompt.anchor = None
             elif self.prompt.text:
                 self.prompt.set_text('')
@@ -946,7 +1298,7 @@ class AdCodeApp:
             else:
                 self.exit_armed = True
                 chord = self.keymap.key_of('exit_chord') or 'ctrl+c'
-                self.status_hint = f'press {chord} again to exit'
+                self.status_hint = t('press {chord} again to exit').format(chord=chord)
             self.dirty = True
             return
         if action == 'exit_eof':
@@ -960,10 +1312,13 @@ class AdCodeApp:
         if action == 'attach_image':
             self.attach_clipboard_image()
             return
+        if action == 'copy_last':
+            self._copy_last_reply()
+            return
         if action == 'cut':
             cut = self.prompt.cut()
             if cut and not set_clipboard(cut):
-                self.status_hint = 'the clipboard is not available'
+                self.status_hint = t('the clipboard is not available')
             self.dirty = True
             return
         if action == 'select_all':
@@ -1055,6 +1410,14 @@ class AdCodeApp:
         text = self.prompt.text.strip()
         if not text:
             return
+        from adcode.commands import command_for
+        if self.session_archived and command_for(text) is None:
+            # Read-only until /respawn: keep the message in the prompt so it is
+            # still there afterwards.  Commands fall through -- the dispatcher
+            # refuses the ones that work on this session and runs the rest.
+            self.status_hint = t(ARCHIVED_HINT)
+            self.dirty = True
+            return
         self.prompt.history.append(self.prompt.text)
         self.prompt.history_index = len(self.prompt.history)
         self.prompt.history_draft = ''
@@ -1065,9 +1428,14 @@ class AdCodeApp:
         self.submit(text)
 
     def submit(self, text: str) -> None:
-        from adcode.commands import dispatch
-        if text.startswith('/'):
+        from adcode.commands import command_for, dispatch
+        # Only a registered name is a command: a message that starts with a
+        # path goes to the model like any other.
+        if command_for(text) is not None:
             dispatch(self, text)
+            return
+        if self.session_archived:
+            self.notify(ARCHIVED_REFUSAL, 'warning')
             return
         if self.loop is None:
             self.notify('No provider is configured. Use /provider add.', 'warning')
@@ -1365,11 +1733,36 @@ class AdCodeApp:
         if not text.strip():
             return False
         if not set_clipboard(text):
-            self.status_hint = 'the clipboard is not available'
+            self.status_hint = t('the clipboard is not available')
         else:
-            self.status_hint = f'copied {len(text)} characters'
+            self.status_hint = t('copied {count} characters').format(count=len(text))
         self.dirty = True
         return True
+
+    def _last_reply_text(self) -> str:
+        """The most recent assistant answer as Markdown source.
+
+        A reply still streaming lives only in ``live_answer_text``; once the
+        turn finishes it is committed to ``items`` as an ``assistant`` item.
+        Prefer the committed one so a finished turn is stable, but fall back
+        to the live buffer when the answer is still being written.
+        """
+        for item in reversed(self.items):
+            if item.kind == 'assistant' and getattr(item, 'text', ''):
+                return item.text
+        return self.live_answer_text
+
+    def _copy_last_reply(self) -> None:
+        """Copy the latest assistant reply (Markdown) to the clipboard."""
+        text = self._last_reply_text()
+        if not text.strip():
+            self.status_hint = t('no assistant reply to copy')
+        elif not set_clipboard(text):
+            self.status_hint = t('the clipboard is not available')
+        else:
+            lines = text.count('\n') + 1
+            self.status_hint = f'copied last reply ({lines} lines) as Markdown'
+        self.dirty = True
 
     def _prompt_rows(self, columns: int) -> tuple[list[Line], int, int]:
         """Wrap the input, reusing the previous result when nothing changed.
@@ -1387,6 +1780,24 @@ class AdCodeApp:
         self._prompt_cache = (key, layout)
         return layout
 
+    def _reveal_config(self) -> tuple[AppConfig, int]:
+        """A throwaway config that shows every detail, plus its cache key.
+
+        Holding Alt swaps this in for one frame.  It never touches the live
+        ``self.config``, so nothing is persisted and releasing Alt restores the
+        user's policy on the next frame.  The cache version is offset so the
+        renderer's per-item memo cannot mistake it for the normal config.
+        """
+        cfg = self.config
+        thinking = replace(cfg.thinking, mode='full', after_completion='keep')
+        tools = replace(cfg.tools, mode='both', chain='separate',
+                        result_mode='full', show_args=True, show_diff=True,
+                        max_result_lines=0)
+        # A collapsed turn is a summary, and Alt asks for the details.
+        steps = replace(cfg.steps, collapse_after_completion=False)
+        return replace(cfg, thinking=thinking, tools=tools,
+                       steps=steps), -1_000_000
+
     def _transcript_lines(self) -> list[Line]:
         width = max(16, self.screen.size().columns - 2)
         live = LiveRender(
@@ -1401,14 +1812,94 @@ class AdCodeApp:
             tool_running=self.phase == 'tool',
             tool_output=self.live_tool_output,
         )
-        return self.transcript.render(self.items, live, width, self.config,
-                                      self.config_version, time.time(),
-                                      self.palette)
+        if self._alt_details_shown:
+            config, version = self._reveal_config()
+        else:
+            config, version = self.config, self.config_version
+        return self.transcript.render(self.items, live, width, config,
+                                      version, time.time(), self.palette)
 
     # ── rendering ───────────────────────────────────────────
     def _viewport_height(self, rows: int) -> int:
         header = 2 if self.config.ui.show_header else 0
         return max(1, rows - header - 1 - 1 - 3)
+
+    # ── todo panel ──────────────────────────────────────────
+    def _todo(self):
+        """The todo store for this project; False once it cannot be opened."""
+        if self._todo_store is None:
+            try:
+                from adcode.tools.todo import todo_store
+                self._todo_store = todo_store(self.cwd)
+            except Exception:      # noqa: BLE001 - a broken list must not kill the UI
+                self._todo_store = False
+        return self._todo_store or None
+
+    def _sync_todo(self) -> None:
+        """One cheap check per frame: did the todo list change?"""
+        store = self._todo()
+        if store is None:
+            return
+        if store.revision != self._todo_revision:
+            self._todo_revision = store.revision
+            self.dirty = True
+
+    def _sync_agent_clock(self) -> None:
+        """Repaint the strip once a second so its elapsed column keeps up.
+
+        A running child is not otherwise a reason to paint: when the root is
+        idle no events arrive, and the panel would freeze at ``0s`` until
+        something else marked the frame dirty.
+        """
+        loop = self.loop
+        if loop is None:
+            return
+        try:
+            rows = loop.agent_view()
+        except Exception:      # noqa: BLE001 - never break the loop
+            return
+        elapsed = [float(row.get('elapsed') or 0.0) for row in rows
+                   if row.get('status') in agents_panel.ACTIVE
+                   and row.get('name') != 'root']
+        if not elapsed:
+            self._agent_clock = None
+            return
+        tick = int(max(elapsed))
+        if tick != self._agent_clock:
+            self._agent_clock = tick
+            self.dirty = True
+
+    def _agents_lines(self, columns: int) -> list:
+        """The sub-agent strip; empty when nothing is running."""
+        loop = self.loop
+        if loop is None:
+            return []
+        try:
+            rows = loop.agent_view()
+        except Exception:      # noqa: BLE001 - a panel must never break a frame
+            return []
+        if not any(row.get('status') in agents_panel.ACTIVE
+                   and row.get('name') != 'root' for row in rows):
+            return []
+        for row in rows:
+            step = self.agent_steps.get(str(row.get('name') or ''))
+            if step:
+                row['step'] = step
+        return agents_panel.panel_lines(rows, columns)
+
+    def _todo_lines(self, columns: int) -> list:
+        """The panel rows, or none while the completion list owns that space."""
+        if self._completion_visible():
+            return []
+        store = self._todo()
+        if store is None:
+            return []
+        try:
+            plan = store.active_plan()
+        except Exception:      # noqa: BLE001 - a bad file shows as no list
+            return []
+        return todo_panel.panel_lines(plan, columns,
+                                      max_rows=todo_panel.MAX_ROWS)
 
     def _render_interval(self) -> float:
         """Seconds between two frames, derived from the configured rate."""
@@ -1449,7 +1940,20 @@ class AdCodeApp:
         prompt_h = max(1, len(visible_prompt))
         footer_y = rows - 1
         prompt_top = footer_y - prompt_h
-        separator_y = prompt_top - 1
+        agents_lines = self._agents_lines(columns)
+        todo_lines = self._todo_lines(columns)
+        # Two strips live between the transcript and the prompt.  Each is capped
+        # on its own and together they stay inside the space above the prompt,
+        # so the conversation always keeps the majority of the screen.
+        room = max(0, prompt_top - header_h - 2)
+        agents_limit = min(agents_panel.MAX_ROWS, room // 4)
+        agents_lines = agents_lines[:agents_limit] if agents_limit else []
+        left = max(0, room - len(agents_lines))
+        todo_limit = min(todo_panel.MAX_ROWS, left // 3)
+        todo_lines = todo_lines[:todo_limit] if todo_limit else []
+        todo_top = prompt_top - len(todo_lines)
+        agents_top = todo_top - len(agents_lines)
+        separator_y = agents_top - 1
         transcript_top = header_h
         viewport_h = max(1, separator_y - transcript_top)
         lines = self._transcript_lines()
@@ -1485,6 +1989,10 @@ class AdCodeApp:
             self._draw_scrollbar(columns, transcript_top, viewport_h, total,
                                  start)
         self.canvas.hline(0, separator_y, columns, self.palette.border, alpha=110)
+        for index, line in enumerate(agents_lines):
+            self._draw_line(0, agents_top + index, line, columns)
+        for index, line in enumerate(todo_lines):
+            self._draw_line(0, todo_top + index, line, columns)
         for index, line in enumerate(visible_prompt):
             self._draw_line(0, prompt_top + index, line, columns)
         if self._completion_visible():
@@ -1606,32 +2114,62 @@ class AdCodeApp:
 
     def _draw_footer(self, columns: int, y: int, max_scroll: int) -> None:
         snap = self.snapshot()
-        frame = SPINNER[int(time.time() * 10) % len(SPINNER)]
+        now = time.time()
+        frame = SPINNER[int(now * 10) % len(SPINNER)]
         phase = self.phase
+        # The background of the line: the green of a finished task, or the
+        # bar of a command that reports its progress.
+        self._footer_tick(now)
+        cover = self._footer_done_cover(columns, now)
+        done = self.footer_state in ('done', 'fading')
+        done_background, done_foreground = self._footer_colors()
+        if cover:
+            self.canvas.fill_row(y, done_background, 255, 0, cover)
+        progress = self._footer_progress(now)
+        if progress is not None and not done:
+            filled = max(1, int(columns * progress / 100))
+            self.canvas.fill_row(y, self.palette.accent, 120, 0, filled)
+        if phase == 'connecting' and not done:
+            # Waiting for the provider: the whole line breathes.
+            self._draw_connect_breath(columns, y, now)
         if phase == 'connecting':
             # Reconnecting is the same wait, but the user deserves to know the
             # first attempt already failed.
-            verb = 'reconnecting' if self.connect_retrying else 'connecting'
+            verb = t('reconnecting') if self.connect_retrying else t('connecting')
             elapsed = self._connect_elapsed()
             suffix = f' {elapsed:.1f}s' if elapsed >= 1.0 else ''
-            status = f'{frame} {verb}{suffix}'
+            status = f'{frame} {verb}{suffix}{self._connect_eta()}'
         elif phase == 'thinking':
-            status = f'{frame} thinking'
+            status = f'{frame} {t("thinking")}'
         elif phase == 'answering':
-            status = f'{frame} writing'
+            status = f'{frame} {t("writing")}'
         elif phase == 'tool':
-            status = f'{frame} {self._current_action()}'
+            if progress is not None:
+                # The command reports its progress: the line says what runs
+                # and how far it is.
+                status = f'{frame} {self._progress_label()} {progress}%'
+            else:
+                status = f'{frame} {self._current_action()}'
         elif phase == 'compacting':
-            status = f'{frame} compacting'
+            status = f'{frame} {t("compacting")}'
         elif phase == 'aside':
-            status = f'{frame} aside'
+            status = f'{frame} {t("aside")}'
+        elif self.session_archived:
+            # Read-only until /respawn: the line says so instead of offering
+            # a prompt that will refuse the message.
+            status = t('archived')
         else:
-            status = 'ready'
+            status = t('ready')
         color = {
             'connecting': 'info', 'thinking': 'subtext', 'answering': 'text',
             'tool': 'accent', 'compacting': 'info', 'aside': 'accent',
             'idle': 'muted',
         }.get(phase, 'muted')
+        if self.session_archived and phase == 'idle':
+            color = 'warning'
+        if done:
+            # On the green the font is white.
+            color = done_foreground
         # The token status sits at the right edge; the status line and the
         # extras get the room that is left of it.
         right = ''
@@ -1645,36 +2183,47 @@ class AdCodeApp:
             right_x = max(1, columns - 1 - text_width(right))
         room = max(0, right_x - 1)
         x = 1
-        x += self.canvas.draw_text(x, y, status, self._color(color, 'muted'),
+        x += self.canvas.draw_text(x, y, status, self._footer_color(color),
                                    None, 0, 255, room)
         extras: list[str] = []
+        rate = self._token_rate()
+        if rate > 0 and phase in ('thinking', 'answering'):
+            extras.append(f'{rate:.0f} tok/s')
+        if self._last_cache_hit is not None:
+            extras.append(f'cache {round(100 * self._last_cache_hit)}%')
         queued = snap.queued
         if queued:
-            extras.append(f'{queued} queued')
+            extras.append(f'{queued} {t("queued")}')
         attached = count_image_markers(self.prompt.text)
         if attached:
-            extras.append(f'{attached} image{"s" if attached > 1 else ""}')
+            extras.append(f'{attached} {t("images") if attached > 1 else t("image")}')
         if self.btw_mode:
-            extras.append('aside question mode')
+            extras.append(t('aside question mode'))
         if self.exit_armed:
-            extras.append('ctrl+c again to exit')
-        agents = [row for row in (snap.agents or []) if row.get('status') not in
+            extras.append(t('ctrl+c again to exit'))
+        agents = [row for row in (snap.agents or [])
+                  if row.get('status') not in
                   ('completed', 'errored', 'interrupted', 'shutdown', None)
-                  and not (isinstance(row.get('status'), dict))]
+                  and not (isinstance(row.get('status'), dict))
+                  and row.get('name') != 'root']
         if agents and self.config.agents.show_activity:
-            extras.append(f'{len(agents)} agent{"s" if len(agents) > 1 else ""}')
-        if self.config.tools.chain == 'merged':
-            extras.append('merged steps')
-        if self.config.thinking.mode == 'summary':
-            extras.append('summary thinking')
+            extras.append(f'{len(agents)} {t("agents") if len(agents) > 1 else t("agent")}')
+        if self.config.steps.collapse_after_completion:
+            extras.append(t('steps collapse when done'))
+        elif self.config.tools.chain == 'merged':
+            extras.append(t('merged steps'))
+        thinking = self.config.thinking
+        if thinking.label_tokens and 'label' in (thinking.mode,
+                                                 thinking.after_completion):
+            extras.append(t('token count'))
         if self.config.hold.enabled:
             extras.append(f'hold ×{self.config.hold.max_retries}')
         if self.scroll > 0:
-            extras.append(f'↑ {self.scroll} lines')
+            extras.append(f'↑ {self.scroll} {t("lines")}')
         selected = self._selection_range()
         if selected is not None:
             length = len(self._selection_text())
-            extras.append(f'{length} selected · ctrl+c copies')
+            extras.append(t('{count} selected · ctrl+c copies').format(count=length))
         # The extras are dropped from the right until they fit: half a word
         # on the line reads like a bug.  The separator in front of the first
         # one counts towards the room.
@@ -1686,13 +2235,300 @@ class AdCodeApp:
                 break
             fitting.append(extra)
         if fitting:
-            x += self.canvas.draw_text(x, y, separator, self.palette.border,
+            x += self.canvas.draw_text(x, y, separator, self._footer_color('border'),
                                        None, 0, 255, right_x - x)
-            self.canvas.draw_text(x, y, '  ·  '.join(fitting), self.palette.muted,
+            self.canvas.draw_text(x, y, '  ·  '.join(fitting),
+                                  self._footer_color('muted'),
                                   None, 0, 255, right_x - x)
-        self._draw_status_sweep(columns, y, phase)
+        if progress is None:
+            # The light only runs when there is no progress bar to show.
+            self._draw_status_sweep(columns, y, phase)
         if right:
-            self.canvas.draw_text(right_x, y, right, self.palette.muted)
+            self.canvas.draw_text(right_x, y, right, self._footer_color('muted'))
+
+    # ── the status line ────────────────────────────────────
+    def _footer_done(self) -> None:
+        """The task finished: the status line turns green."""
+        if not self.config.footer.done_enabled:
+            return
+        self.footer_state = 'done'
+        self.footer_state_at = time.time()
+
+    def _footer_input(self) -> None:
+        """The user typed: the green leaves the status line again."""
+        if self.footer_state != 'done':
+            return
+        if not self.config.footer.done_hold:
+            self.footer_state = 'normal'
+            self.dirty = True
+            return
+        self.footer_state = 'fading'
+        self.footer_state_at = time.time()
+        self.dirty = True
+
+    def _sample_progress(self, text: str) -> None:
+        """Remember the percentage the running command reported.
+
+        A percentage on its own means nothing: pip prints one per package,
+        a build tool one per file.  Only a value that keeps climbing is a
+        total progress, so the samples are kept and compared.
+        """
+        if not self.config.footer.progress_enabled:
+            return
+        value = _percent_in(text)
+        if value is None:
+            return
+        now = time.time()
+        self._progress.append((now, value))
+        # The samples of a run are bounded; the oldest ones say nothing about
+        # the current value anyway.
+        del self._progress[:-64]
+
+    def _footer_progress(self, now: float) -> int | None:
+        """The trustworthy progress of the running command, if there is one.
+
+        A percentage that jumps around is not a total progress: the samples
+        have to climb steadily.  Anything else falls back to the light.
+        """
+        footer = self.config.footer
+        if not footer.progress_enabled or not self._progress:
+            return None
+        values = [value for _, value in self._progress]
+        for older, newer in zip(values, values[1:]):
+            if newer < older:
+                return None
+        if len(values) < footer.progress_samples:
+            return None
+        stamp, value = self._progress[-1]
+        if now - stamp > footer.progress_window:
+            return None
+        return max(0, min(100, value))
+
+    def _footer_tick(self, now: float) -> None:
+        """Leave the green state once the fade is over."""
+        if self.footer_state != 'fading':
+            return
+        wipe = max(0.0, self.config.footer.done_wipe)
+        if wipe <= 0 or now - self.footer_state_at >= wipe:
+            self.footer_state = 'normal'
+            self.footer_state_at = 0.0
+            # The last fading frame still carries a sliver of the green cover.
+            # Leaving the state does not schedule a frame by itself, so without
+            # this the sliver stays on the status line -- over the separator
+            # between the status word and the extras -- until the user types.
+            self.dirty = True
+
+    def _footer_done_cover(self, columns: int, now: float) -> int:
+        """How many columns of the status line the green covers."""
+        footer = self.config.footer
+        if self.footer_state == 'normal':
+            return 0
+        wipe = max(0.0, footer.done_wipe)
+        elapsed = now - self.footer_state_at
+        if self.footer_state == 'done':
+            if wipe <= 0:
+                return columns
+            # The green runs in from the left edge.
+            return min(columns, int(columns * min(1.0, elapsed / wipe)))
+        # Fading: the green leaves from the left edge to the right one.
+        if wipe <= 0:
+            return 0
+        gone = min(1.0, elapsed / wipe)
+        return max(0, int(columns * (1.0 - gone)))
+
+    def _footer_colors(self) -> tuple[Any, Any]:
+        """The background and the font colour of the status line."""
+        from adcode.theme import parse_hex
+        footer = self.config.footer
+        background = (parse_hex(footer.done_color, self.palette.success)
+                      if footer.done_color else self.palette.success)
+        foreground = (parse_hex(footer.done_text_color, (255, 255, 255))
+                      if footer.done_text_color else (255, 255, 255))
+        return background, foreground
+
+    def _footer_color(self, role: Any) -> Any:
+        """The colour of the status line.
+
+        On the green of a finished task every text is white, so the line
+        reads as one block instead of a mix of roles.
+        """
+        if self.footer_state in ('done', 'fading'):
+            return self._footer_colors()[1]
+        return self._color(role, 'muted')
+
+    def _progress_label(self) -> str:
+        """The first word of the running command: what the bar is about."""
+        command = str(self.status_args.get('command', '')).strip()
+        if not command:
+            return self.status_tool_name or self.status_hint or 'tool'
+        first = command.split()[0]
+        # A path or a wrapper hides the real program: "python -m pytest" is
+        # a pytest run, "/usr/bin/pytest" is a pytest run.
+        base = first.rsplit('/', 1)[-1]
+        if base in ('python', 'python3') and 'pytest' in command:
+            return 'pytest'
+        return base or first
+
+    # ── the speed of the model ─────────────────────────────
+    def _count_stream_tokens(self, text: str) -> None:
+        """Count the tokens the model produces while they stream.
+
+        The usage report only arrives when a request ends, which is too late
+        for a light that has to move with the tokens.  The estimate of the
+        streamed text is good enough to walk the light along.
+        """
+        if not text:
+            return
+        from adcode.llm.usage import estimate_text_tokens
+        if not self._stream_started:
+            self._stream_started = time.time()
+        self._stream_tokens += estimate_text_tokens(text)
+
+    def _document_store(self) -> Any:
+        """The document store of the state database."""
+        try:
+            return self.state.documents
+        except Exception:      # noqa: BLE001
+            return None
+
+    def _load_predictor(self) -> Any:
+        """The duration predictor, out of the state database."""
+        from adcode.state import KEY_PREDICTOR, import_legacy_document
+        try:
+            import_legacy_document(KEY_PREDICTOR, 'predictor.json')
+        except Exception:      # noqa: BLE001
+            pass
+        try:
+            return DurationPredictor.load(backend=self._document_store())
+        except Exception:      # noqa: BLE001
+            return DurationPredictor()
+
+    def _learn_request_duration(self, payload: dict[str, Any]) -> None:
+        """Teach the duration predictor from a finished request.
+
+        The elapsed time is the wait the footer has been showing; the token
+        counts are the sizes the next request will roughly have.
+        """
+        hit = payload.get('cache_hit_rate')
+        self._last_cache_hit = float(hit) if hit is not None else None
+        self._last_usage = dict(payload)
+        elapsed = self._connect_elapsed()
+        self.connect_started = 0.0
+        if elapsed < 0.5:
+            return
+        predictor = self._predictor
+        predictor.add(
+            int(payload.get('input_tokens') or 0),
+            int(payload.get('cached_input_tokens') or 0),
+            int(payload.get('output_tokens') or 0),
+            elapsed)
+        try:
+            predictor.save(backend=self._document_store())
+        except Exception:      # noqa: BLE001 - a lost lesson is not a crash
+            pass
+
+    def _connect_eta(self) -> str:
+        """The estimated wait for the current request, from the learned ones."""
+        predictor = self._predictor
+        if predictor.n < 2:
+            return ''
+        usage = self._last_usage
+        if not usage:
+            return ''
+        eta = predictor.predict(
+            int(usage.get('input_tokens') or 0),
+            int(usage.get('cached_input_tokens') or 0),
+            int(usage.get('output_tokens') or 0))
+        if eta <= 0:
+            return ''
+        return f' ~{eta:.0f}s' if eta >= 10 else f' ~{eta:.1f}s'
+
+    def _sample_tokens(self) -> None:
+        """Remember how many tokens the model has produced, and when.
+
+        The difference between two samples is the speed of the model.
+        """
+        try:
+            total = int(self.snapshot().total_out)
+        except Exception:
+            return
+        self._token_samples.append((time.time(), total))
+        del self._token_samples[:-16]
+
+    def _token_rate(self) -> float:
+        """The output tokens per second of the model, as far as it is known.
+
+        The usage report is exact but only arrives when a request ends, and
+        the time between two requests includes the tools and the thinking
+        that ran in between -- that is not the speed of the model.  While the
+        model writes, the streamed tokens and the time since the first one
+        measure it directly.
+        """
+        if len(self._token_samples) >= 2:
+            now, total = self._token_samples[-1]
+            window = [sample for sample in self._token_samples
+                      if now - sample[0] <= _TOKEN_RATE_WINDOW]
+            if len(window) >= 2:
+                stamp, value = window[0]
+                elapsed = now - stamp
+                if elapsed > 0:
+                    exact = (total - value) / elapsed
+                    if exact > 0:
+                        return exact
+        return self._stream_rate()
+
+    def _stream_rate(self) -> float:
+        """The speed of the model, measured while it writes."""
+        if not self._stream_started or not self._stream_tokens:
+            return 0.0
+        elapsed = time.time() - self._stream_started
+        if elapsed <= 0:
+            return 0.0
+        return self._stream_tokens / elapsed
+
+    def _sweep_period(self, phase: str) -> float:
+        """How long the light takes to cross the line.
+
+        While the model generates, the light follows its speed: a fast model
+        gets a fast light.  Without a measurement the light keeps moving,
+        slowly.
+        """
+        footer = self.config.footer
+        base = max(0.05, footer.sweep_period)
+        if not footer.sweep_tok_speed:
+            return base
+        if phase not in ('thinking', 'answering'):
+            return base
+        rate = self._token_rate()
+        if rate <= 0:
+            # Nothing is known yet: the light crawls.
+            return base * max(1.0, footer.sweep_slow_factor)
+        reference = max(1.0, footer.sweep_tok_rate)
+        return max(base / 8.0, min(base * 8.0, base * reference / rate))
+
+    def _sweep_position(self, phase: str, now: float) -> float:
+        """Where the light is on its way, in 0..1.
+
+        In the token driven mode the light walks with the tokens: one cycle
+        of the line per ``sweep_tokens_per_cycle`` tokens.  Otherwise the
+        time decides.
+        """
+        per_cycle = int(self.config.footer.sweep_tokens_per_cycle)
+        if per_cycle > 0 and phase in ('thinking', 'answering'):
+            return (self._stream_tokens % per_cycle) / per_cycle
+        period = self._sweep_period(phase)
+        return (now % period) / period
+
+    def _draw_connect_breath(self, columns: int, y: int, now: float) -> None:
+        """The line breathes while the provider is contacted.
+
+        Nothing happens yet, so the line does not run: it fades in and out
+        instead, which says "waiting" without pretending to be busy.
+        """
+        period = max(0.1, self.config.footer.connect_pulse)
+        phase = (now % period) / period
+        wave = (1.0 - math.cos(phase * 2 * math.pi)) / 2
+        self.canvas.fill_row(y, self.palette.accent, int(18 + 74 * wave))
 
     def _draw_status_sweep(self, columns: int, y: int, phase: str) -> None:
         """The light that runs along the status line while the agent works.
@@ -1702,13 +2538,17 @@ class AdCodeApp:
         the text.  The wait for the provider (``connecting``) has no light:
         nothing is happening yet.
         """
+        footer = self.config.footer
+        if not footer.sweep_enabled:
+            return
         if phase not in ('thinking', 'answering', 'tool', 'compacting', 'aside'):
             return
+        span = max(1, footer.sweep_span)
         # The light enters from beyond the left edge and leaves beyond the
         # right one, so it is never half on screen.
-        head = ((time.time() % SWEEP_PERIOD) / SWEEP_PERIOD
-                * (columns + SWEEP_SPAN) - SWEEP_SPAN)
-        for offset in range(SWEEP_SPAN):
+        position = self._sweep_position(phase, time.time())
+        head = position * (columns + span) - span
+        for offset in range(span):
             x = int(head) - offset
             if not (0 <= x < columns):
                 continue
@@ -1771,7 +2611,7 @@ class AdCodeApp:
     def open_command_palette(self) -> None:
         """Open the command palette (ctrl+p)."""
         from adcode.commands import COMMANDS
-        items = [DialogItem(command.name, command.name, command.description)
+        items = [DialogItem(command.name, command.name, command.label())
                  for command in COMMANDS]
         if not items:
             self.notify('No commands are registered.', 'warning')
@@ -1793,35 +2633,161 @@ class AdCodeApp:
                                            self.config_changed))
 
     def open_sessions_browser(self) -> None:
-        """Browse and load saved sessions (ctrl+h, /sessions)."""
-        rows = self.session_store.list()
-        if not rows:
-            self.notify('No saved sessions.', 'info')
-            return
+        """Browse, load and archive saved sessions (ctrl+h, /sessions).
+
+        Enter loads, Delete archives the highlighted session and Alt shows the
+        archived ones (dimmed) so they can be found again.
+        """
+        # Every visit starts with the list the user expects: live sessions.
+        self._sessions_show_archived = False
+
+        def items() -> list[DialogItem]:
+            rows = self.session_store.list(
+                include_archived=self._sessions_show_archived)
+            return [self._session_item(row) for row in rows]
 
         def choose(name: Any) -> None:
             self.load_session(str(name))
-        self.open_select(
-            'Sessions',
-            [DialogItem(row['name'], row['title'] or row['name'],
-                        f'{row["updated"]} · {row["messages"]} messages')
-             for row in rows],
-            choose, width=86)
+
+        def archive(name: Any) -> list[DialogItem] | None:
+            self.archive_session(str(name))
+            return items()
+
+        def reveal() -> list[DialogItem] | None:
+            self._sessions_show_archived = not self._sessions_show_archived
+            return items()
+
+        listing = items()
+        if not listing and not self.session_store.list(include_archived=True):
+            self.notify('No saved sessions.', 'info')
+            return
+        # An empty list still opens: everything may be archived, and Alt is
+        # how those sessions are found again.
+        self.open_overlay(SelectDialog(
+            t('Sessions'), listing, choose, width=86,
+            on_delete=archive, on_alt=reveal,
+            footer=t('↑↓ move · enter load · del archive · alt archived '
+                     '· esc close')))
+
+    @staticmethod
+    def _session_item(row: dict[str, Any]) -> DialogItem:
+        archived = bool(row.get('archived'))
+        description = t('{count} messages').format(count=row['messages'])
+        description = f'{row["updated"]} · {description}'
+        if archived:
+            description += ' · ' + t('archived')
+        return DialogItem(str(row['name']), row['title'] or row['name'],
+                          description, dim=archived)
+
+    # ── approvals: the agent asks before it acts ─────────────
+    def request_approval(self, request: Any) -> Any:
+        """Ask the user whether a tool call may run.
+
+        Called from the tool's worker thread: the guard's chain is waiting
+        there.  The question is put on the ui thread (the app is still
+        responsive while the tool waits) and this thread blocks until the
+        answer arrives.  No answer within the timeout is a refusal -- the
+        sdk's rule is that "nobody answered" must never read as "yes".
+        """
+        from harness.approval.base import ApprovalDecision
+
+        holder: dict[str, Any] = {}
+        done = threading.Event()
+        request_id = str(getattr(request, 'id', '') or uuid.uuid4().hex)
+
+        def decide(choice: str) -> None:
+            if choice == 'y':
+                holder['decision'] = ApprovalDecision.approve(
+                    by='user', reason='allowed once')
+            elif choice == 'a':
+                holder['decision'] = ApprovalDecision.approve(
+                    by='user', reason='allowed for this session',
+                    scope=f'tool:{getattr(request, "tool", "")}')
+            else:
+                holder['decision'] = ApprovalDecision.deny(
+                    by='user', reason='refused by the user')
+            done.set()
+
+        def show() -> None:
+            self._approvals[request_id] = {'request': request,
+                                           'holder': holder, 'done': done}
+            self.open_overlay(ApprovalDialog(request, decide,
+                                             access=self._applied_access,
+                                             project=self.cwd))
+            self.status_hint = 'waiting for your approval'
+            self.dirty = True
+
+        self.post(show)
+        timeout = max(5.0, float(self.config.security.approval_timeout))
+        if not done.wait(timeout=timeout):
+            holder.setdefault('decision', ApprovalDecision.timeout(
+                by='auto-deny', reason='no answer before the timeout'))
+        self._approvals.pop(request_id, None)
+        return holder.get('decision') or ApprovalDecision.deny(
+            by='auto-deny', reason='no answer was received')
+
+    def refuse_pending_approvals(self, reason: str = 'turn interrupted') -> None:
+        """An interrupted turn must not leave a call waiting to be approved."""
+        from harness.approval.base import ApprovalDecision
+        for entry in list(self._approvals.values()):
+            holder = entry.get('holder')
+            if holder is not None and 'decision' not in holder:
+                holder['decision'] = ApprovalDecision.deny(
+                    by='auto-deny', reason=reason)
+            done = entry.get('done')
+            if done is not None:
+                done.set()
+        self._approvals.clear()
+
+    # ── sub-agents: browse and read their output ────────────
+    def open_agents_browser(self) -> None:
+        """Pick one of the session's sub-agents."""
+        loop = self.loop
+        if loop is None or loop.agents is None:
+            self.notify('Sub-agents are disabled in this session.', 'info')
+            return
+        # the root's own work is the transcript; the browser is for children
+        rows = [row for row in loop.agent_view() if row.get('name') != 'root']
+        if not rows:
+            self.notify('No sub-agents in this session yet.', 'info')
+            return
+        items = []
+        for row in rows:
+            elapsed = agents_panel.format_elapsed(row.get('elapsed'))
+            status = agents_panel.WORDS.get(str(row.get('status') or ''),
+                                            str(row.get('status') or ''))
+            detail = ' '.join(part for part in (status, elapsed) if part)
+            items.append(DialogItem(row['name'], str(row['name']), detail,
+                                    dim=not row.get('status') in agents_panel.ACTIVE))
+        self.open_select('Agents', items, self.open_agent_output, width=64)
+
+    def open_agent_output(self, name: Any) -> None:
+        """The full streamed output of one sub-agent, scrollable."""
+        text = ''
+        if self.loop is not None:
+            text = self.loop.agent_output(str(name))
+        title = f'Agent · {name}'
+        body = text or '(no output yet)'
+        # Opened from the browser (ctrl+g), the dialog that fired this callback
+        # still owns the key event that selected the row: deferring by one
+        # iteration keeps the ENTER that picked the agent from also closing the
+        # view it just opened.
+        self.post(lambda: self.open_message(title, body))
 
     def open_message(self, title: str, message: str) -> None:
-        self.open_overlay(MessageDialog(title, message))
+        self.open_overlay(MessageDialog(t(title), message))
 
     def open_select(self, title: str, items: list[DialogItem],
                     on_select: Callable[[Any], None],
                     width: int = 72) -> None:
-        self.open_overlay(SelectDialog(title, items, on_select, width=width))
+        self.open_overlay(SelectDialog(t(title), items, on_select, width=width))
 
     def open_confirm(self, title: str, message: str,
                      on_result: Callable[[bool], None]) -> None:
-        self.open_overlay(ConfirmDialog(title, message, on_result))
+        self.open_overlay(ConfirmDialog(t(title), message, on_result))
 
     def open_text_prompt(self, title: str, label: str, initial: str,
                          on_submit: Callable[[str], None],
                          hint: str = '', password: bool = False) -> None:
-        self.open_overlay(TextPrompt(title, label, initial, on_submit,
-                                     hint=hint, password=password))
+        self.open_overlay(TextPrompt(t(title), t(label), initial, on_submit,
+                                     hint=t(hint), password=password))

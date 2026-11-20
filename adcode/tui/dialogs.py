@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from adcode.i18n import t
 from adcode.theme import Palette
 from adcode.tui.canvas import BOLD, DIM, Canvas, text_width, truncate_text
 from adcode.tui.input import KeyEvent, get_clipboard, is_paste_key
@@ -18,6 +19,9 @@ class DialogItem:
     label: str
     description: str = ''
     selected: bool = False
+    # A dimmed entry is still selectable but reads as set aside: the sessions
+    # browser uses it for archived sessions.
+    dim: bool = False
 
 
 def wheel_step(event: KeyEvent) -> int:
@@ -219,9 +223,9 @@ class MessageDialog(Overlay):
             _draw_spans(canvas, x + 3, y + 2 + index, line, palette)
         _draw_scroll_marker(canvas, x + w - 1, y + 2, body_rows, len(body), top,
                             palette)
-        hint = 'enter / esc close'
+        hint = t('enter / esc close')
         if self.body.scrollable():
-            hint = '↑↓ / wheel scroll · ' + hint
+            hint = t('↑↓ / wheel scroll · ') + hint
         _draw_hint(canvas, x, y + h - 2, w, hint, palette)
 
 
@@ -230,12 +234,20 @@ class SelectDialog(Overlay):
                  on_select: Callable[[Any], None],
                  on_cancel: Callable[[], None] | None = None,
                  allow_filter: bool = True, width: int = 72,
-                 footer: str = '') -> None:
+                 footer: str = '',
+                 on_delete: Callable[[Any], list[DialogItem] | None] | None = None,
+                 on_alt: Callable[[], list[DialogItem] | None] | None = None
+                 ) -> None:
         super().__init__()
         self.title = title
         self.items = items
         self.on_select = on_select
         self.on_cancel = on_cancel
+        # Both hooks return the list to show next, or None to keep this one:
+        # the caller owns what the rows mean (archiving a session, revealing
+        # the archived ones) while the dialog keeps the cursor where it was.
+        self.on_delete = on_delete
+        self.on_alt = on_alt
         self.allow_filter = allow_filter
         self.desired_width = width
         self.footer = footer
@@ -252,7 +264,26 @@ class SelectDialog(Overlay):
             if lowered in item.label.lower() or lowered in item.description.lower()
         ]
 
+    def _apply_items(self, items: list[DialogItem] | None) -> None:
+        """Show the list a hook returned, keeping the cursor on a real row."""
+        if items is None:
+            return
+        self.items = items
+        if not items:
+            self.index = 0
+            self.top = 0
+            return
+        self.index = max(0, min(self.index, len(items) - 1))
+        self.top = max(0, min(self.top, self.index))
+
     def handle(self, event: KeyEvent) -> bool:
+        if event.kind == 'modifier':
+            # A modifier press is a gesture of its own here: the sessions
+            # browser toggles the archived rows with it.
+            if (event.key == 'alt' and event.action == 'press'
+                    and self.on_alt is not None):
+                self._apply_items(self.on_alt())
+            return True
         if event.kind == 'paste':
             if self.allow_filter:
                 self.filter += event.text.replace('\r', '').replace('\n', ' ')
@@ -291,6 +322,11 @@ class SelectDialog(Overlay):
             if visible:
                 self.index = min(len(visible) - 1, self.index + 8)
             return True
+        if key == 'delete' and self.on_delete is not None:
+            if visible:
+                self._apply_items(
+                    self.on_delete(visible[min(self.index, len(visible) - 1)].value))
+            return True
         if key == 'enter':
             if visible:
                 self.closed = True
@@ -326,8 +362,9 @@ class SelectDialog(Overlay):
         total = len(visible)
         if total == 0:
             _draw_frame(canvas, x, y, w, h, palette, self.title)
-            canvas.draw_text(x + 3, y + 2, '(nothing to select)', palette.muted)
-            _draw_hint(canvas, x, y + h - 2, w, 'esc close', palette)
+            canvas.draw_text(x + 3, y + 2, t('(nothing to select)'),
+                             palette.muted)
+            _draw_hint(canvas, x, y + h - 2, w, t('esc close'), palette)
             return
         self.index = max(0, min(self.index, total - 1))
         body_height = h - 5
@@ -347,7 +384,13 @@ class SelectDialog(Overlay):
             item = visible[position]
             selected = position == self.index
             bg = palette.selection_bg if selected else None
-            fg = palette.selection_fg if selected else palette.text
+            if selected:
+                fg = palette.selection_fg
+            elif item.dim:
+                fg = palette.muted
+            else:
+                fg = palette.text
+            attrs = BOLD if selected else (DIM if item.dim else 0)
             if bg is not None:
                 canvas.fill_rect(x + 1, row, w - 2, 1, bg)
             marker = '› ' if selected else '  '
@@ -356,7 +399,7 @@ class SelectDialog(Overlay):
                              bg, BOLD if selected else 0)
             label_width = max(8, w - 6 - text_width(item.description))
             label = truncate_text(item.label, label_width)
-            canvas.draw_text(x + 4, row, label, fg, bg, BOLD if selected else 0)
+            canvas.draw_text(x + 4, row, label, fg, bg, attrs)
             if item.description:
                 desc_x = x + 5 + text_width(label)
                 canvas.draw_text(desc_x, row, truncate_text(
@@ -364,11 +407,11 @@ class SelectDialog(Overlay):
                     palette.muted, bg, DIM)
             row += 1
         if self.allow_filter and self.filter:
-            canvas.draw_text(x + 2, y + h - 3, 'filter: ' + self.filter,
+            canvas.draw_text(x + 2, y + h - 3, t('filter: ') + self.filter,
                              palette.subtext, None, DIM)
-        hint = self.footer or '↑↓ move · enter select · esc cancel'
+        hint = self.footer or t('↑↓ move · enter select · esc cancel')
         if self.allow_filter:
-            hint += ' · type to filter'
+            hint += t(' · type to filter')
         _draw_hint(canvas, x, y + h - 2, w, hint, palette)
 
 
@@ -559,9 +602,9 @@ class MultiSelectDialog(Overlay):
                     palette.muted, bg, DIM)
             row += 1
         if self.allow_filter and self.filter:
-            canvas.draw_text(x + 2, y + h - 3, 'filter: ' + self.filter,
+            canvas.draw_text(x + 2, y + h - 3, t('filter: ') + self.filter,
                              palette.subtext, None, DIM)
-        hint = '↑↓ move · space toggle · enter confirm · esc cancel'
+        hint = t('↑↓ move · space toggle · enter confirm · esc cancel')
         if self.allow_manual:
             hint += ' · + adds a custom entry'
         _draw_hint(canvas, x, y + h - 2, w, hint, palette)
@@ -789,7 +832,8 @@ class TextPrompt(Overlay):
         if self.hint:
             canvas.draw_text(x + 3, y + 6, truncate_text(self.hint, inner_width),
                              palette.muted, None, DIM)
-        _draw_hint(canvas, x, y + h - 2, w, 'enter confirm · esc cancel', palette)
+        _draw_hint(canvas, x, y + h - 2, w, t('enter confirm · esc cancel'),
+                   palette)
 
 
 class ConfirmDialog(Overlay):
@@ -842,7 +886,7 @@ class ConfirmDialog(Overlay):
             _draw_spans(canvas, x + 3, y + 2 + index, line, palette)
         _draw_scroll_marker(canvas, x + w - 1, y + 2, body_rows, len(body), top,
                             palette)
-        hint = 'enter / y confirm · esc / n cancel'
+        hint = t('enter / y confirm · esc / n cancel')
         if self.body.scrollable():
-            hint = '↑↓ / wheel scroll · ' + hint
+            hint = t('↑↓ / wheel scroll · ') + hint
         _draw_hint(canvas, x, y + h - 2, w, hint, palette)

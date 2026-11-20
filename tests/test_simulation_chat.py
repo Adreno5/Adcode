@@ -13,6 +13,7 @@ import threading
 import pytest
 
 from adcode import images
+from adcode.tui.text import ROW_BAR
 from bench.script import ScriptedResponder, ToolCall, Turn
 from bench.workspace import GLOBAL_MARKER, PROJECT_MARKER
 
@@ -113,7 +114,10 @@ def test_alt_v_sends_a_native_image_part(harness_factory, wire):
     session = harness.workspace.session_payload()
     assert session
     content = session['messages'][0]['content']
-    assert isinstance(content, str) and '[image: sessions/images/paste-' in content
+    # the marker points at the state directory, not at the project
+    assert isinstance(content, str) and '[image: ' in content
+    assert '/images/paste-' in content
+    assert 'sessions/images' not in content
     assert 'base64' not in content
     user_items = [text for kind, text in harness.transcript_texts()
                   if kind == 'user']
@@ -191,6 +195,51 @@ def test_tool_call_writes_into_the_temp_workspace(harness):
     assert 'notes.txt' in follow_up.all_text
     assert 'from a scripted tool call' in follow_up.all_text
 
+
+def test_a_finished_turn_collapses_its_steps(harness_factory):
+    """The real app folds a completed turn into one row, once the answer is in."""
+    def collapse(config):
+        config.steps.collapse_after_completion = True
+
+    harness = harness_factory(config_mutator=collapse)
+    harness.gateway.responder = ScriptedResponder([
+        Turn(thinking='COLLAPSED-REASONING: read the file first.',
+             tool_calls=[ToolCall(
+                 name='write',
+                 args={'path': 'notes.txt', 'content': 'hello\n'},
+                 id='call_write_1')]),
+        Turn(text='COLLAPSED-ANSWER: wrote the file.'),
+    ])
+    harness.submit('create notes.txt', expect_requests=2, timeout=25.0)
+    harness.wait_idle(20.0)
+    harness.wait_for_text('COLLAPSED-ANSWER')
+
+    frame_text = harness.screen_text()
+    # One row stands for the whole turn: the thought as a count, the tool
+    # with how often it ran.
+    rows = [line for line in frame_text.splitlines()
+            if line.strip().startswith(ROW_BAR)]
+    assert len(rows) == 1, frame_text
+    row = rows[0]
+    assert 'Thought for' in row and 'tokens' in row, row
+    assert 'write' in row, row
+    # The work itself is still in the transcript, just not on screen.
+    assert 'COLLAPSED-REASONING' not in frame_text
+    assert 'notes.txt' not in row
+    kinds = [item['kind'] for item in harness.transcript_items()]
+    assert kinds.count('thinking') == 1 and kinds.count('tool') == 1, kinds
+
+
+def test_a_message_that_starts_with_a_path_reaches_the_model(harness):
+    """Only a command name makes the input a command."""
+    harness.gateway.responder = ScriptedResponder([Turn(text='reading it.')])
+    message = '/home/darkstar/temp_workspace/CODE_STYLE.md summarize this'
+    harness.submit(message)
+    assert harness.requests[0].last_user_text() == message
+    assert harness.transcript_texts()[0] == ('user', message)
+    # nothing was swallowed by the command dispatcher
+    assert not [item for item in harness.transcript_items()
+                if item['kind'] == 'notice' and 'Unknown command' in item['text']]
 
 def test_thinking_is_visible_before_the_answer_arrives(harness):
     hold = threading.Event()

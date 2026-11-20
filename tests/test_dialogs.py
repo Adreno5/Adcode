@@ -115,5 +115,42 @@ def test_model_editor_toggle_and_render():
     editor.handle(KeyEvent(kind='key', key='down'))
     editor.handle(KeyEvent(kind='key', key='enter'))  # vision toggle
     assert model.vision is True
-    editor.handle(KeyEvent(kind='key', key='ctrl+s'))
+    # The change is persisted the moment it is made; ctrl+s only closes.
     assert saved == [1]
+    editor.handle(KeyEvent(kind='key', key='ctrl+s'))
+    assert saved == [1, 1]
+    assert editor.closed
+
+def test_model_editor_saves_a_typed_value_without_ctrl_s():
+    provider = ProviderConfig(name='P', base_url='http://x',
+                              models=[ModelConfig(id='m')])
+    model = provider.models[0]
+    saved = []
+    editor = ModelEditorOverlay(provider, model, lambda: saved.append(1))
+    render(editor)
+    editor.handle(KeyEvent(kind='key', key='enter'))  # edit the context window
+    # The editor opens on the current value; clear it first.
+    for _ in range(len(editor.edit_text)):
+        editor.handle(KeyEvent(kind='key', key='backspace'))
+    editor.handle(KeyEvent(kind='text', text='4096'))
+    editor.handle(KeyEvent(kind='key', key='enter'))
+    assert model.context_window == 4096
+    assert saved == [1]
+
+def test_model_editor_keeps_the_notice_for_the_final_save():
+    # A change is saved quietly; the notice belongs to the closing save, so
+    # the transcript does not fill up with one notice per keystroke.
+    provider = ProviderConfig(name='P', base_url='http://x',
+                              models=[ModelConfig(id='m')])
+    model = provider.models[0]
+    quiet, loud = [], []
+    editor = ModelEditorOverlay(provider, model, lambda: loud.append(1),
+                                 on_change=lambda: quiet.append(1))
+    render(editor)
+    editor.handle(KeyEvent(kind='key', key='down'))
+    editor.handle(KeyEvent(kind='key', key='down'))
+    editor.handle(KeyEvent(kind='key', key='enter'))  # vision toggle
+    assert quiet == [1]
+    assert loud == []
+    editor.handle(KeyEvent(kind='key', key='ctrl+s'))
+    assert loud == [1]

@@ -142,3 +142,32 @@ def test_a_wide_glyph_past_the_right_edge_is_dropped(palette):
     canvas.draw_text(5, 0, '中中', canvas.palette.text)
     # The first glyph does not fit either; the canvas stays as it was.
     assert canvas.cell(5, 0).ch == ' '
+
+
+def test_text_does_not_resurrect_the_previous_frames_background(palette):
+    """Drawing text over a cell must not bring back last frame's colour.
+
+    The cell planes still hold the previous frame until the cell is
+    materialized for the new one, so a painter that reads the background
+    before that writes the old value back.  The status line used to keep a
+    trail of its light that way: every frame the text put the tint back.
+    """
+    canvas = Canvas(8, 1, palette)
+    canvas.clear()
+    canvas.fill_rect(0, 0, 8, 1, palette.accent, alpha=130)
+
+    canvas.clear()                       # the next frame starts blank
+    canvas.draw_text(0, 0, 'abcd', palette.text)
+    for x in range(4):
+        assert canvas.cell(x, 0).bg == palette.background
+    # The stroke that never got text still carries the tint of its own frame.
+    assert canvas.cell(6, 0).bg == palette.background
+
+
+def test_text_does_not_resurrect_the_previous_frames_foreground(palette):
+    canvas = Canvas(4, 1, palette)
+    canvas.clear()
+    canvas.draw_text(0, 0, 'abcd', palette.accent)
+    canvas.clear()
+    canvas.draw_text(0, 0, 'abcd', palette.text)
+    assert canvas.cell(0, 0).fg == palette.text

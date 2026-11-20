@@ -55,6 +55,49 @@ def _base_dir() -> str:
     return current_context().cwd or '.'
 
 
+def _network_allowlist() -> list[str]:
+    """The hosts the http tool may reach (``security.network_allowlist``)."""
+    try:
+        from adcode.config import current_config
+        config = current_config()
+        if config is None:
+            return []
+        return list(config.security.network_allowlist)
+    except Exception:      # noqa: BLE001 - no config, no restriction
+        return []
+
+
+def _access() -> str:
+    """What the agent may do to this project right now."""
+    try:
+        from adcode.access import effective_access
+        from adcode.config import current_config
+        config = current_config()
+        if config is None:
+            return 'full'
+        return effective_access(config, _base_dir())
+    except Exception:      # noqa: BLE001 - no config, no restriction
+        return 'full'
+
+
+def _write_refusal(raw_path: str) -> str:
+    """Why this path may not be written (or an empty string when it may)."""
+    try:
+        from adcode.access import write_allowed
+        allowed, reason = write_allowed(raw_path, _base_dir(), _access())
+        if allowed:
+            return ''
+        return f'Error: {reason} (refused: {raw_path})'
+    except Exception:      # noqa: BLE001 - no config, no restriction
+        return ''
+
+
+def _refuse_write(args: dict[str, Any]) -> str:
+    """The refusal text for a write the access level forbids."""
+    raw_path = str(args.get('path', ''))
+    return _write_refusal(raw_path)
+
+
 def _resolve(path: str) -> str:
     return resolve_path(path)
 
@@ -99,6 +142,9 @@ def _read(args: dict[str, Any]) -> str:
 
 def _write(args: dict[str, Any]) -> str:
     raw_path = str(args['path'])
+    refusal = _refuse_write(args)
+    if refusal:
+        return refusal
     path = _resolve(raw_path)
     content = str(args['content'])
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
@@ -120,6 +166,9 @@ def _write(args: dict[str, Any]) -> str:
 
 def _edit(args: dict[str, Any]) -> str:
     raw_path = str(args['path'])
+    refusal = _refuse_write(args)
+    if refusal:
+        return refusal
     path = _resolve(raw_path)
     old = str(args['old'])
     new = str(args['new'])
@@ -269,6 +318,23 @@ def _grep(args: dict[str, Any]) -> str:
     return _grep_python(args)
 
 
+def _host_allowed(url: str, allowlist: list[str]) -> bool:
+    """Is this host on the list?  An empty list allows everything."""
+    if not allowlist:
+        return True
+    from urllib.parse import urlsplit
+    host = (urlsplit(url).hostname or '').lower()
+    if not host:
+        return False
+    for entry in allowlist:
+        entry = entry.strip().lower().lstrip('.')
+        if not entry:
+            continue
+        if host == entry or host.endswith('.' + entry):
+            return True
+    return False
+
+
 def _fetch(args: dict[str, Any]) -> str:
     url = str(args['url'])
     method = str(args.get('method', 'GET')).upper()
@@ -278,6 +344,10 @@ def _fetch(args: dict[str, Any]) -> str:
     body = args.get('body') or None
     if isinstance(body, str):
         body = body.encode('utf-8')
+    allowlist = _network_allowlist()
+    if not _host_allowed(url, allowlist):
+        return (f'Error: the host is not on the allowed list: '
+                f'{url} (allowed: {", ".join(allowlist) or "(none)"})')
     try:
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
         with net.urlopen(request, timeout=30) as response:

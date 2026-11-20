@@ -1,51 +1,169 @@
+<div align="center">
+
 # AdCode
 
-AdCode is a configurable, full-screen terminal coding agent. It streams from
-OpenAI-compatible and Anthropic model APIs, runs a ReAct loop with tools
-(files, search, a persistent shell, HTTP, git diffs), delegates work to
-sub-agents and teams, loads MCP servers, and reads skills from
-`~/.agents/skills`.
+**A configurable, full-screen terminal coding agent.**
 
-The interface is a small software renderer: every widget draws into a shared
-cell canvas with an alpha channel, the compositor blends the frame, and the
-whole screen is written to the terminal in one pass.
+**Built with [AICF](https://github.com/ccjjfdyqlhy/aicf-core).**
+
+AdCode streams from OpenAI-compatible and Anthropic APIs, runs a ReAct loop
+with real tools, delegates to sub-agents, and paints the whole session into a
+hand-written software renderer — no terminal widget toolkit, no browser
+required.
+
+[![Python](https://img.shields.io/badge/python-3.14%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555?style=flat-square)](#requirements)
+[![UI](https://img.shields.io/badge/UI-full--screen%20TUI-8A7DD6?style=flat-square)](#highlights)
+[![License](https://img.shields.io/badge/license-MIT-3DA639?style=flat-square)](#license)
+
+[Highlights](#highlights) · [Install](#installation) · [Demo](#demo) · [Keyboard](#keyboard) · [Commands](#commands) · [Configuration](#configuration-file) · [Architecture](#rendering-architecture)
+
+</div>
+
+![AdCode in action: planning, tools, sub-agents, settings and more](docs/demo.gif)
+
+<div align="center">
+
+<sub>Recorded from the real application — [watch the higher-quality WebM](docs/demo.webm)</sub>
+
+</div>
+
+> **The tour above shows:** the welcome screen and prompt, streamed reasoning
+> and Markdown, the todo plan, chained tool calls (`glob`, `read`, `write`,
+> `bash`), the live sub-agent strip, `ctrl+g` agent browser and full agent
+> output, `/agents list`, `/diff`, the command palette, the `/config`
+> settings tree with a live theme change, the sessions browser, scrolling the
+> scrollback, the footer progress bar and finished state, image attachment,
+> and `esc` interrupting a held stream.
+>
+> The recording is deterministic: it drives the real app against the fake
+> local gateway used by the test harness, so it needs no API key.  See
+> [Demo](#demo) to regenerate it.
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=adreno5%2Fadcode&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=adreno5/adcode&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=adreno5/adcode&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=adreno5/adcode&type=date&legend=top-left" />
+ </picture>
+</a>
+
+## Table of contents
+
+- [Highlights](#highlights)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Demo](#demo)
+- [First run](#first-run)
+- [Web access from other devices](#web-access-from-other-devices)
+- [Keyboard](#keyboard)
+- [Command palette](#command-palette)
+- [Commands](#commands)
+- [Settings](#settings-config)
+- [Configuration file](#configuration-file)
+- [MCP](#mcp)
+- [Skills](#skills)
+- [Sessions](#sessions)
+- [Images](#images)
+- [Rendering architecture](#rendering-architecture)
+- [Agent loop](#agent-loop)
+- [Project structure](#project-structure)
+- [Development](#development)
+- [Test harness](#test-harness)
+- [Clipboard](#clipboard)
+- [Proxies](#proxies)
+- [Dependencies](#dependencies)
+- [License](#license)
 
 ## Highlights
 
-- **Full-screen canvas UI** -- a unified style built from white and light grey
+**The interface**
+
+- **Full-screen canvas UI** — a unified style built from white and light grey
   layers, with the accent colour used only for small markers (`>`, `│`, `›`).
-  Every frame is composited in software and printed at once.
-- **Alpha-aware rendering bus** -- widgets call `draw_text`, `fill_rect`,
+  Every frame is composited in software and written to the terminal in one
+  pass.
+- **Alpha-aware rendering bus** — widgets call `draw_text`, `fill_rect`,
   `box`, and friends; colours blend through 8-bit alpha, which drives the
   fading thinking window, dimmed modal backdrops, and gradients.
-- **App-managed scrolling** -- the transcript is a virtual scrollback with a
+- **App-managed scrolling** — the transcript is a virtual scrollback with a
   scrollbar, mouse-wheel support, PageUp/PageDown, and follow-tail behaviour.
-- **Streaming ReAct loop** -- thinking, answers, tool calls, and usage stream
-  from worker threads; the UI stays responsive and Esc interrupts a turn or a
-  running shell command.
-- **Automatic context compaction** -- old complete turns are summarized
+- **Responsive, configurable footer** — a travelling light while the model
+  works, a breathing line while connecting, a real progress bar for commands
+  that print percentages, and a green wipe when the task is done.
+- **Live work panels** — the todo plan and the running sub-agents sit above
+  the prompt, with progress, elapsed time and the current step at a glance.
+- **Command palette** — `ctrl+p` opens every command in a searchable list,
+  and `ctrl+q` quits.
+
+**The engine**
+
+- **Streaming ReAct loop** — thinking, answers, tool calls and usage stream
+  from worker threads; the UI stays responsive and `esc` interrupts a turn or
+  a running shell command.
+- **Automatic context compaction** — old complete turns are summarized
   through a streaming model call, archived locally, and replaced atomically.
-- **Provider and model management** -- `/provider add` fetches the model list,
+- **Provider and model management** — `/provider add` fetches the model list,
   offers a filterable multi-select table, accepts custom model ids, and fills
   capabilities (vision, context window, max output tokens, reasoning efforts)
   from [models.dev](https://models.dev). Every model can be edited by hand.
-- **Sub-agents and agent teams** -- configurable agent types, background ReAct
+- **Session toolkit** — rollback, edit-and-resend, fork, aside questions
+  (`/btw`), durable goals, archived sessions, and automatic crash recovery.
+- **Images and vision** — paste a screenshot with `alt+v`, attach files or
+  URLs, and let vision models look on their own with `view_image`.
+
+**Delegation and extension**
+
+- **Sub-agents and agent teams** — configurable agent types, background ReAct
   workers, a shared workspace, mailboxes, recursive delegation limits, and
   team spawning.
-- **MCP support** -- stdio, Streamable HTTP, and legacy SSE transports, with
+- **Logs in a file, never on the screen** — the interface owns the terminal:
+  every log record goes to `~/.adcode/adcode.log`, so a warning from a
+  library can never land on the frame and shred it.
+- **A guard in front of every tool call** — every call goes through the sdk's
+  `ToolGuard`: each tool declares what it does (read, write, shell, network,
+  collaboration), a policy decides what may run, the effectful ones can wait
+  for your yes (answered once per tool, not once per call), and every call
+  lands in an append-only audit trail (`/audit`).  `/config` holds the
+  switches.
+- **Three permissions per project** — *read-only* (the project can be read,
+  nothing can be changed), *workspace* (files inside the project may be
+  changed, nothing outside it) and *full access* (no boundary at all).  The
+  level belongs to the folder: `/permissions` sets it for the project you are
+  in, the settings browser sets the default for every project, and the level
+  takes effect at once — the policy, the sandbox and the shell all follow it.
+- **State in the database, never in your repository** — the sessions, the
+  todo plan, the goals, the wire cache, the prediction state, the
+  configuration and the audit trail live in one sqlite file under
+  `~/.adcode`.  The project keeps only what it owns: your code, and the work
+  the agent does.  `ADCODE_HOME` may point the state somewhere else, but
+  never into a checkout: a directory that is (or is inside) a repository is
+  refused, because a repository is for code and session state is not.
+- **Sub-agent visibility** — while background workers run, a strip above the
+  prompt lists them with their state, elapsed time, the step they are on and a
+  tail of what they are producing; `ctrl+g` (or `/agents show`) opens any
+  agent's full streamed output, and `/agents list` shows the tree with the
+  outcome each one reported.
+- **Visible todo plan** — the model plans multi-step work with the `todo`
+  tool (`create` / `add` / `update` / `complete` / `fail`) and the plan is
+  painted right above the input bar as a live checklist, with progress and the
+  step being worked on; it lives in `.harness_todo.json`, so it survives a
+  restart and every sub-agent shares it.
+- **MCP support** — stdio, Streamable HTTP, and legacy SSE transports, with
   automatic tool scanning (including pagination cursors).
-- **Skills** -- scans `~/.agents/skills` (plus project and extra paths), gives
+- **Skills** — scans `~/.agents/skills` (plus project and extra paths), gives
   the model a compact preview, and loads full instructions on demand.
-- **Image attachments** -- `alt+v` pastes a copied screenshot into the
-  message. The image is uploaded through the provider's Files API once and
-  referenced by id; images are stored as files, never as base64 in the history.
-- **Session toolkit** -- rollback, edit-and-resend, fork, aside questions
-  (`/btw`), durable goals, and automatic crash recovery.
-- **Single settings browser** -- `/config` exposes thinking display, tool
+
+**Everywhere**
+
+- **Single settings browser** — `/config` exposes thinking display, tool
   display, appearance, reasoning, context, agents, skills, and MCP settings.
-- **Command palette** -- `ctrl+p` opens every command in a searchable list,
-  and `ctrl+q` quits.
-- **Clipboard and proxy support** -- pasting works on every platform and in
+- **Browser access over the LAN** — `--web` serves the same full-screen UI
+  to phones and tablets on your network, with an on-screen key bar for `Esc`,
+  `Tab`, the arrows and `Ctrl`/`Alt` chords.
+- **Clipboard and proxy support** — pasting works on every platform and in
   every input field, and HTTP or SOCKS5 proxies are honoured everywhere.
 
 ## Requirements
@@ -68,6 +186,17 @@ Or with uv:
 uv sync
 ```
 
+The engine sdk (`aicf-core`) is the foundation of this app. The app needs
+`aicf-core>=1.0.0rc3`, which is where the **document store**
+(`infra.store.documents`), the **sandbox write level** that follows the
+tool's own declaration (`ToolSpec.sandbox='readonly'`) and the **control
+plane** landed. To work on the sdk itself, use the local checkout instead:
+
+```bash
+# the sdk the app is developed against
+pip install -e ~/DSN-exp          # harness/ + infra/ from the local checkout
+```
+
 Run it:
 
 ```bash
@@ -76,17 +205,34 @@ adcode
 python main.py
 ```
 
-## First Run
+## Demo
+
+The GIF at the top of this page is a recording of the actual TUI.  The bench
+harness starts the real `AdCodeApp`, points it at a local fake LLM gateway,
+and feeds it scripted turns and keystrokes, so the demo is repeatable and
+offline.
+
+```bash
+# writes docs/demo.gif, docs/demo.webm and docs/demo-poster.png
+python -m bench demo --out docs
+```
+
+The recorder needs `ffmpeg` (for assembly) and Pillow (for rasterizing the
+cell grid).  Frames are sampled at 8 fps; the scripted run takes under a
+minute, and rasterizing plus encoding adds a couple more.  Useful flags:
+`--fps`, `--no-video`, `--keep-frames`.
+
+## First run
 
 AdCode opens a four-step provider setup:
 
-1. **Base URL** -- the API endpoint. End with `#` to use it exactly as typed;
+1. **Base URL** — the API endpoint. End with `#` to use it exactly as typed;
    otherwise `/v1` is appended when missing.
-2. **API key** -- encrypted with Fernet; the Fernet key lives in the OS
+2. **API key** — encrypted with Fernet; the Fernet key lives in the OS
    keyring (Windows Credential Manager, macOS Keychain, or Secret Service).
    An empty key is allowed for local servers.
-3. **Display name** -- how the provider appears in the UI.
-4. **API structure** -- OpenAI Chat Completions, OpenAI Responses, or
+3. **Display name** — how the provider appears in the UI.
+4. **API structure** — OpenAI Chat Completions, OpenAI Responses, or
    Anthropic Messages.
 
 The model list is fetched next. If the provider exposes `/models`, a
@@ -94,7 +240,84 @@ filterable multi-select table appears (`space` toggles, `enter` confirms, `+`
 adds a custom id). If fetching fails, you can retry, probe with another wire,
 or enter model ids manually. Metadata is matched against models.dev when
 available. A final step lets you review the selected model's context window,
-maximum output, vision support, tool calling, and reasoning efforts.
+maximum output, vision support, tool calling, and reasoning efforts. Every
+value in the model editor is written to `config.json` as soon as it changes,
+so there is nothing to save by hand.
+
+## Web access from other devices
+
+`--web` serves the same TUI to browsers on the local network, so a phone, a
+tablet or a second laptop can drive the session running on your machine:
+
+```bash
+adcode --web                        # http://<lan-ip>:8765/?token=<random>
+adcode --web --port 9000 --token mysecret
+adcode --web --host 127.0.0.1       # keep it on this machine only
+adcode --web --no-token             # no check at all: see Security below
+```
+
+The terminal UI is not re-implemented for the web.  The same
+`AdCodeApp` runs inside the server and only its two terminal edges are
+swapped:
+
+- `adcode/web/screen.py` publishes the composited cell grid — text, colours
+  and attributes — instead of writing ANSI to a console, so the browser paints
+  cells instead of parsing escape sequences;
+- `adcode/web/input.py` turns browser keystrokes into the byte sequences a
+  terminal sends, so they go through the app's own `KeyParser`.  A button in
+  the browser and the same chord on a real keyboard take exactly one code path.
+
+Frames are diffed per row before they leave the process: an idle UI sends
+nothing, and streaming text rewrites one row — the same economy the terminal
+path gets from `Canvas.render_diff`.
+
+### On-screen keys
+
+Not every device has a keyboard with an Esc, Tab, arrows or Control.  The bar
+under the terminal provides them:
+
+- `Esc`, `Tab`, `⇤` (shift+tab), `⏎` (enter), `⌫` (backspace),
+  `↑ ↓ ← →`, `Home`, `End`, `PgUp`, `PgDn`, `Del`, `/`;
+- `^C`, `^P`, `^H`, `^J`, `^A`, `^X`, `^V`, `^Q` as one-tap
+  chords (copy or interrupt, palette, sessions, newline, select all, cut,
+  paste, quit);
+- sticky `Ctrl`, `Alt` and `Shift`: tap one and the next key or typed
+  character carries it — `Ctrl` then `↑`, or `Alt` then `c` for the `alt+c`
+  a terminal has.  A modifier is one-shot and clears itself after that key;
+- hold `Alt` — or hold the keyboard's own `Alt` in a desktop browser — to
+  show every detail, exactly as holding it in a terminal does.
+
+While `--web` runs, the local terminal is not attached to the app: the
+connected browsers are its screen and its keyboard.  `^Q` (or `/quit`) in a
+browser ends the session and stops the server.
+
+Typing uses the device's own keyboard: tap the terminal to raise it, and the
+hidden field forwards text, Enter, Backspace, Tab, the arrows and Ctrl/Alt
+chords.  `Ctrl+V` and the `Paste` button paste this device's clipboard when
+the browser allows it and fall back to the clipboard of the machine running
+AdCode otherwise; long-pressing the terminal's hidden field always works.
+Dragging up or down scrolls the transcript (a mouse wheel does the same).
+Text can be selected and copied natively, and page zoom works.
+
+The page has no third-party dependency — no CDN, no bundler, three files in
+`adcode/web/static/` — so a device that can only reach your machine still
+gets a working terminal.
+
+### Several devices, one session
+
+Every browser drives the same conversation and a newcomer is sent a full
+repaint of the current screen.  The grid is the *smallest* window any connected
+browser reports, and each window scales that grid to fill its own screen, so
+nothing is ever off-screen on the phone.  Close the small window and the grid
+grows back for the remaining ones.
+
+### Security
+
+The session runs with your tools and your shell, so anyone who can reach the
+port can drive it.  `--web` therefore generates a random token per run,
+prints it with the URL, and requires it for the WebSocket.  Treat the printed
+URL as a password and do not forward the port beyond your own network.
+`--no-token` disables the check.
 
 Official OpenCode Console and Go API URLs on `opencode.ai` automatically get
 an `x-opencode-session` header, including legacy `/zen` URLs. AdCode keeps
@@ -115,6 +338,8 @@ new ID when you clear or fork it. An explicit header in the provider's
 | `ctrl+c` | Copy the selected transcript text, else the input selection, else clear the input, else interrupt; press twice on an empty prompt to exit |
 | `ctrl+v`, `shift+insert` | Paste text, or attach a copied screenshot when the clipboard has no text |
 | `alt+v` | Attach the clipboard image, image path, or image URL to the message |
+| `alt+c` | Copy the latest assistant reply to the clipboard as Markdown |
+| hold `alt` | Show every detail while it is held: full reasoning, every tool call and result, complete error bodies.  Releasing `alt` restores the configured display |
 | `ctrl+a` | Select all |
 | `shift+left` / `shift+right` | Extend the selection by one character |
 | `shift+home` / `shift+end` | Extend the selection to the line edge |
@@ -128,6 +353,7 @@ new ID when you clear or fork it. An explicit header in the provider's
 | `ctrl+p` | Open the command palette (type to filter, enter to run) |
 | `ctrl+,` | Open the settings browser |
 | `ctrl+h` | Browse and load saved sessions |
+| `ctrl+g` | Browse sub-agents and read one's full output |
 | `ctrl+q` | Quit |
 
 Every application shortcut above is rebindable: `/keys` opens the bindings
@@ -138,18 +364,27 @@ unbound). Bindings are stored in `~/.adcode/config.json` under `keys` and take
 effect immediately. `enter`, `esc`, and the dialog navigation keys stay fixed;
 `/help` always shows the live bindings.
 
-### Chords on punctuation
+### Chords on punctuation, and held modifiers
 
 `ctrl+,` and the other chords on punctuation (`ctrl+.`, `ctrl+/`, ...) have no
 control byte in the legacy terminal encoding, so a terminal cannot report
 them the old way. AdCode asks for the
 [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
-(`CSI > 1 u`, the "disambiguate escape codes" flag) when it starts, and
-terminals that speak it (kitty, Ghostty, WezTerm, alacritty, foot, iTerm2,
-Microsoft Terminal, rio, Warp, xterm.js) deliver the chord. Terminals that do
-not support the protocol ignore the request and keep sending plain
-characters, so on those the chord does not fire -- rebind it with `/keys` if
-you need it there.
+when it starts, with four flags: disambiguate escape codes (`1`), report event
+types (`2`), report every key as an escape code (`8`), and report the text a
+key produced (`16`) -- `CSI > 27 u`.
+
+Terminals that speak it (kitty, Ghostty, WezTerm, alacritty, foot, iTerm2,
+Microsoft Terminal, rio, Warp, xterm.js) deliver the punctuation chords *and*
+the modifier keys themselves, which is how a held `alt` is told apart from a
+tapped one.  Flag 8 takes the plain text bytes away, so the app rebuilds the
+characters from the key codes and uses the text the terminal reports when it
+honours flag 16 — that is what keeps input methods, dead keys and AltGr
+working.
+
+Terminals without the protocol ignore the request and keep sending plain
+characters: everything else still works, but the punctuation chords do not
+fire (rebind them with `/keys`) and holding `alt` does nothing.
 
 ## Selecting text
 
@@ -176,28 +411,37 @@ is taller than the panel.
 Type `/` to open the command palette. Up/Down selects a candidate, Tab or
 Enter completes it, and Enter runs the command.
 
+Only a command name makes the input a command. A message that starts with a
+slash but no known name - a path like `/home/me/notes.md`, or any other text -
+is sent to the model like every other message.
+
 | Command | Description |
 |---|---|
 | `/help` | Commands and key bindings |
-| `/config` | Open the settings browser |
+| `/config` or `/settings` | Open the settings browser |
+| `/permissions [level]` | What the agent may do to this project |
 | `/keys` | Open the key bindings panel |
 | `/model [list\|edit]` | Switch models or edit the selected model's capabilities |
 | `/provider add\|edit\|remove\|list` | Manage providers and their models |
 | `/effort [level]` | Set `low`, `medium`, `high`, `xhigh`, `max`, or `ultra` |
-| `/thinking [mode]` | Set thinking display: `hidden`, `label`, `partial`, `full`, `summary` |
-| `/steps [level]` | Preset the work-step settings: `concise`, `standard`, `detailed` |
+| `/thinking [ongoing\|after] [mode]` | Set the thinking display: a bare `hidden`, `label`, `partial` or `full` moves both stages, `ongoing`/`after` one of them |
+| `/steps [level]` | Preset the work-step settings: `concise`, `standard`, `detailed` (the same **Preset** in `/config`, where `custom` unlocks them) |
 | `/hold [on\|off\|<retries>]` | Keep retrying a request that was cut short |
 | `/max_tokens [n]` | Set the maximum output tokens per request |
 | `/compact` | Compact older turns immediately |
 | `/context`, `/cache`, `/prefix` | Inspect context size, cache usage, and the stable prefix |
 | `/goal <objective>` | Start a durable goal (`status`, `list`, `pause`, `resume`, `complete`, `blocked`, `cancel`) |
-| `/agents list\|max\|depth\|wait\|interrupt\|types\|teams` | Inspect and configure sub-agents |
+| `/agents list\|show\|max\|depth\|wait\|interrupt\|types\|teams` | Inspect and configure sub-agents; `show <name>` opens one agent's output |
 | `/mcp add\|edit\|remove\|list\|doctor\|refresh` | Manage MCP servers and rescan their tools |
 | `/skills [list\|reload]` | Browse and reload installed skills |
 | `/image <path\|url>` | Attach an image file or URL to the next message |
 | `/diff [path]` | Show the Git working-tree diff in the transcript |
-| `/sessions` | Browse and load saved sessions |
+| `/sessions` | Browse and load saved sessions; `delete` archives the highlighted one, `alt` reveals the archived ones |
+| `/archive` | Archive this session: read-only and hidden until `/respawn` |
+| `/respawn` | Restore this archived session and accept messages again |
+| `/perish` | Delete this session for good (asks first) |
 | `/save [name]` / `/load [name]` | Save / load a session |
+| `/rename [name]` | Rename the current session; without a name it asks for one |
 | `/rewind` | Roll the conversation back to an earlier turn |
 | `/edit` | Rewind to a turn and prefill its message for editing |
 | `/fork [name]` | Fork the conversation into a new session |
@@ -208,21 +452,61 @@ Enter completes it, and Enter runs the command.
 
 ## Settings (`/config`)
 
-`/config` is a tree of grouped settings rendered as a modal panel:
+`/config` opens a tree of grouped settings rendered as a modal panel.
+`/settings` is the same command under its other name.
 
 - **Move** with Up/Down.
 - **Enter** expands a setting vertically, selects an option, or starts inline
   editing for numbers and text.
-- **Esc** cancels the item: it restores the values captured when the item was
-  expanded, then collapses it. At the top level it closes the panel.
+- **Esc** or **Left** closes the item that is open; at the top level Esc
+  closes the panel. Nothing is taken back: every change is applied and saved
+  the moment it is made, which is also why there is no Ctrl+S to press.
 - **Enter on an expanded setting's title** confirms it and collapses it.
-- **Ctrl+S** saves and closes.
+
+The tree opens with a pinned **Recents** section: the settings that are
+changed most often (theme, language, accent colour, work-step preset,
+reasoning effort, call chain), each one a copy of the real setting, so
+editing it there edits the setting itself.
+
+### Language
+
+The interface speaks English and Simplified Chinese. The language is a
+setting like any other: **Appearance → Language**, or the pinned **Recents**
+entry, switches it at once; `adcode --locale zh` sets it for one run. A
+string without a Chinese counterpart simply stays English.
+
+### Project access
+
+**Security → Project access** is the default for every project;
+**Security → This project** is the rule for the folder you are working in
+(the two differ only when you have set one). The three levels are:
+
+| level | what the agent may do |
+|---|---|
+| Read-only | read the project; change nothing, not even a temporary file |
+| Workspace | change files inside the project; nothing outside it |
+| Full access | no boundary — the agent runs with your own rights |
+
+Read access is the same in all three: a read-only project is still
+readable, that is the point of it. The level takes effect at once — the
+policy, the sandbox and the shell are rebuilt the moment it changes, and
+the approval dialog tells you which level is in force. `/permissions` does
+the same thing without opening the settings.
 
 Selecting an option that has children expands its sub-settings automatically.
 Changes apply to the running app immediately (theme and accent included) and
-are persisted to `config.json`.
+are persisted to `config.json` the moment they are made — there is nothing
+to save by hand.
 
 ### Thinking display
+
+The display has two stages, configured separately in **Work steps**:
+
+- **Ongoing** (`thinking.mode`): the block while the model is reasoning
+- **After completion** (`thinking.after_completion`): what is left of it once
+  the thought has finished
+
+Both stages offer the same four modes:
 
 | Mode | Behaviour |
 |---|---|
@@ -230,7 +514,22 @@ are persisted to `config.json`.
 | `label` | One label line with a fixed or rotating suffix |
 | `partial` | A configurable window of the rendered reasoning |
 | `full` | The complete reasoning stream |
-| `summary` | The reasoning is kept but not spelled out: one line per finished thought, `thought of 412 tokens` |
+
+The window of `partial` (its start, end, style and omitted-content marker) is
+one setting shared by both stages, so the two cannot drift apart.
+`/thinking <mode>` moves both stages at once, `/thinking ongoing <mode>` and
+`/thinking after <mode>` move one of them.
+
+Old config files are migrated: `show_completed` and the old `hide` value land
+on `hidden`, and the old `keep` ("render it as the ongoing mode does") is
+resolved to the mode it used to follow.
+
+The label line carries a **Token count** switch (`thinking.label_tokens`): on,
+a finished thought reads `Thinking · 1.5s · 412 tokens` instead of just
+`Thinking · 1.5s`.  The switch sits in the label mode's settings and again
+under the label collapse of **After completion** — it is one setting, shown
+wherever a label can appear.  The count lands when the round ends, not while
+the thought streams.
 
 The `label` mode configures the label text (`Thinking`, `Reasoning`,
 `Polishing`, ...), the suffix animation (`fixed` or `rotating`), the rotation
@@ -282,26 +581,106 @@ between attempts).
 The thinking and the tool settings live in one **Work steps** group of
 `/config`; they decide how much of the work chain the transcript spells out.
 
+The first item is **Collapse after completion**
+(`steps.collapse_after_completion`, off by default). Once the turn's answer is
+in, its steps fold into one row:
+
+```text
+▏ Thought for 812 tokens, bash x2, edit, grep x3
+```
+
+The reasoning becomes a token count and every tool is named with how often it
+ran. The details stay in the transcript model, so holding `alt` shows them
+again, and a turn that is still working -- or was interrupted, or never
+answered -- keeps its steps on screen. A row only lists what the display
+policy would show anyway: hidden reasoning stays hidden, hidden tools stay
+hidden. It is built once per turn, not per frame, and no preset owns it.
+
+Below the toggle, **Preset** is the same choice `/steps` offers, plus
+**Custom**: the thinking, tool and chain settings below it are editable only
+while the preset is Custom.  Under a named preset they still show what they
+are set to, but cannot be opened or edited -- the preset would otherwise stop
+being what its name says.
+
 Two of them do the heavy lifting:
 
 - **Chain of calls** (`tools.chain`) -- `separate` gives every call its own
   row, `merged` folds a chain of consecutive calls into one row with the
   tool names and their counts: `bash x2, grep, write`.  A merged chain shows
   no details; the whole chain stays in the history.
-- **Thinking display** (`thinking.mode`) -- `summary` keeps the reasoning but
-  only says how much there was: `thought of 412 tokens`.
+- **Ongoing** (`thinking.mode`) and **After completion**
+  (`thinking.after_completion`) -- the reasoning while it streams and what is
+  left of it afterwards; see [Thinking display](#thinking-display).
 
 `/steps` is a shortcut that writes those settings:
 
 | Level | Writes |
 |---|---|
-| `concise` | `thinking.mode = summary`, `tools.chain = merged` |
-| `standard` | `thinking.mode = partial`, `tools.chain = separate` |
-| `detailed` | `thinking.mode = full`, `tools.chain = separate`, `tools.result_mode = full` |
+| `concise` | `thinking.mode = label`, `thinking.label_tokens = on`, `thinking.after_completion = label`, `tools.chain = merged` |
+| `standard` | `thinking.mode = partial`, `thinking.label_tokens = off`, `thinking.after_completion = partial`, `tools.chain = separate` |
+| `detailed` | `thinking.mode = full`, `thinking.label_tokens = off`, `thinking.after_completion = full`, `tools.chain = separate`, `tools.result_mode = full` |
 
-While the agent works, a light runs along the status line under the input:
-it enters at the left edge, crosses the screen once per second and leaves at
-the right one.  The wait for the provider (`connecting`) has no light.
+The command also records the level as the preset, so `/config` reflects what
+`/steps` just did.  It only ever jumps to one of the three levels; `custom` is
+selected in `/config`, and editing the thinking mode with `/thinking` marks
+the settings custom again.
+
+### The status line
+
+The line under the input carries the state of the session.  `/config` has a
+**Footer status** group for it; almost every part is configurable.
+
+**While the agent works.** A light runs along the line: it enters at the left
+edge, crosses the screen once per second and leaves at the right one.
+
+The light can follow the speed of the model (`footer.sweep_tok_speed`): the
+period is scaled by the output tokens per second, so a fast model gets a fast
+light.  `footer.sweep_tok_rate` is the rate at which the light keeps the
+configured period, and `footer.sweep_slow_factor` says how much slower it
+moves while there is no measurement yet (tok/s of zero).
+
+Or it can walk with the tokens themselves (`footer.sweep_tokens_per_cycle`):
+the number is how many tokens the model has to produce for the light to
+cross the line once.  A value of zero keeps the time based speed.  The
+tokens per second of the model show up on the line while it writes.
+
+**While the provider is contacted.** The whole line breathes -- it fades in
+and out (`footer.connect_pulse`) instead of running a light: nothing is
+happening yet.
+
+**A command that reports its progress.**  When the running command prints a
+percentage -- a pytest run, a build, a download -- the line becomes a
+progress bar: the background fills up to the percentage and the text names
+the command and the number (`pytest 45%`).
+
+A percentage on its own means nothing: pip prints one per package, a build
+tool one per file.  Only a value that keeps climbing is a total progress, so
+the samples are compared -- a value that jumps around is not one, and the
+light comes back instead of a bar that lies.
+
+**When the task is done.**  The line turns green with white text: the green
+runs in from the left edge in half a second, stays until the user types
+something, and then leaves again from the left to the right in half a
+second.
+
+| Setting | Meaning |
+|---|---|
+| `footer.sweep_enabled` | The light that runs along the line |
+| `footer.sweep_period` | Seconds per crossing |
+| `footer.sweep_span` | The width of the light, in cells |
+| `footer.sweep_tok_speed` | The light follows the tokens per second |
+| `footer.sweep_tok_rate` | The tokens per second at `sweep_period` |
+| `footer.sweep_slow_factor` | How much slower it moves without a rate |
+| `footer.sweep_tokens_per_cycle` | Tokens per cycle of the light (0 = by time) |
+| `footer.connect_pulse` | Seconds per breath while connecting |
+| `footer.progress_enabled` | The progress bar |
+| `footer.progress_window` | How long a percentage stays fresh |
+| `footer.progress_samples` | Samples needed before the bar shows |
+| `footer.done_enabled` | The green state of a finished task |
+| `footer.done_wipe` | Seconds for the wipe in and out |
+| `footer.done_hold` | Stay green until the user types |
+| `footer.done_color` | The green (`#rrggbb`, empty = the palette green) |
+| `footer.done_text_color` | The font (`#rrggbb`, empty = white) |
 
 ### Tool display
 
@@ -326,7 +705,7 @@ Result sections support the same negative-row window, style, gradient, and
 ellipsis controls as thinking, plus a full mode with an optional line cap.
 File diffs are rendered inline and can be toggled.
 
-## Configuration File
+## Configuration file
 
 `config.json` lives in `~/.adcode/` (user-level, shared across projects). API
 keys are encrypted before writing. An older file next to the package is moved
@@ -354,14 +733,21 @@ there automatically on first load. A minimal file looks like this:
         }
     ],
     "selected_model": "DeepSeek::deepseek-chat",
+    "ui": {"theme": "dark", "accent": "#8fa7d6", "locale": "en"},
     "thinking": {"mode": "partial", "style": "gradient"},
     "tools": {"mode": "both", "chain": "separate", "result_mode": "partial"},
     "hold": {"enabled": false, "max_retries": 20, "delay": 2},
+    "footer": {"sweep_enabled": true, "sweep_period": 1, "sweep_span": 12,
+               "progress_enabled": true, "done_enabled": true,
+               "done_wipe": 0.5, "done_hold": true},
     "agents": {"enabled": true, "max_concurrent": 10, "max_depth": 4},
     "agent_types": {},
     "agent_teams": {}
 }
 ```
+
+`ui.locale` is the interface language (`en` or `zh`); it is the same setting
+as **Appearance → Language** in the settings browser.
 
 `selected_model` uses the `provider::model` form. `agent_types` and
 `agent_teams` default to the built-in sets (general, explorer, reviewer,
@@ -380,6 +766,38 @@ worker; explore, build, review) and can be replaced with custom definitions:
     "agent_teams": {
         "ship": ["docs", "reviewer"]
     }
+}
+```
+
+### OpenCode Console
+
+[Console](https://opencode.ai/docs/console/harnesses/) serves its models at
+`https://opencode.ai/inference` (pay-as-you-go) and
+`https://opencode.ai/inference/go` (Go). It reads a stable conversation id from
+the `x-opencode-session` header so it can route a conversation consistently
+and reuse its prompt cache; the Go plan requires it.
+
+AdCode keeps one id per session in `~/.adcode/opencode_sessions.json`, so a
+resumed conversation sends the id its cache was written under, a sub-agent
+reports the same one, and the conversation after a delete or an archive starts
+under a new one. Nothing else changes: the header rides on the HTTP request,
+not on the wire body, and every API path (OpenAI Chat Completions, OpenAI
+Responses, Anthropic Messages) carries it.
+
+Each provider says where the header goes:
+
+| `opencode_session` | Behaviour |
+|---|---|
+| `auto` (default) | `opencode.ai` endpoints only, so no other gateway ever sees a header it does not know |
+| `on` | every request to this provider, e.g. a proxy in front of Console |
+| `off` | never |
+
+```json
+{
+    "name": "Console",
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "wire": "openai chat completions",
+    "opencode_session": "auto"
 }
 ```
 
@@ -443,9 +861,45 @@ session files are migrated on load.
   and resend.
 - `/fork` copies the conversation into a new session and continues there.
 - `/save` / `/load` / `/sessions` manage named sessions.
+- `/rename` renames the session you are in: the conversation is saved under
+  the new name and the old row is removed, so the session is moved, not
+  copied.  The Console session id follows it, so the prompt cache of the
+  conversation survives the rename.
 
-Goals live in `sessions/goals.json` and are injected into the system prompt
-while active. Global instructions are read from `~/.adcode/AGENTS.md` and
+### Archived sessions
+
+Archiving sets a session aside without touching it: the row, its messages and
+its transcript stay exactly where the engine wrote them, so it can be read
+and restored later.  The archive lives in its own table in the session
+database (`adcode_archived_sessions`), which is why a session the engine
+saves again stays archived, and why an archived session is never the one a
+new run resumes.
+
+- `delete` in the sessions browser (`ctrl+h`) archives the highlighted
+  session; `/archive` archives the one you are in.
+- An archived session is read-only: a message is refused (and stays in the
+  prompt).  The status line says `archived` while that is the case.
+- Only the commands that work on that session are refused: the ones that
+  send a turn or rewrite the stored conversation (`/btw`, `/compact`,
+  `/edit`, `/fork`, `/goal`, `/image`, `/rewind`, `/save`), and the ones
+  that retune the engine behind it (`/effort`, `/hold`, `/max_tokens`,
+  `/model`, `/provider`, `/steps`, `/thinking`), and `/rename`.  Every other command keeps
+  working -- `/help`, `/config`, `/keys`, `/sessions`, `/load`, `/diff`,
+  `/quit`, and `/new`, which starts a live session and leaves the archived
+  one exactly as it was.
+- `/respawn` restores it: the session is back in the list and takes messages
+  again.
+- `/perish` deletes it for good after a confirmation, and the next message
+  starts a new session.
+- The browser hides archived sessions; pressing `alt` shows them (dimmed,
+  marked `archived` in the row) and pressing it again hides them.  This
+  needs the terminal to report the modifier keys themselves, which the kitty
+  keyboard protocol does -- see [Chords on punctuation, and held
+  modifiers](#chords-on-punctuation-and-held-modifiers).  In the web UI the
+  `Alt` button on the key bar sends the same event.
+
+Goals live in the state database (`~/.adcode/adcode.db`) and are injected
+into the system prompt while active. Global instructions are read from `~/.adcode/AGENTS.md` and
 project instructions from `AGENTS.md` (or `prompt`) in the working directory.
 Both are inserted into the system prompt; when they conflict, the project
 instructions take precedence.
@@ -473,14 +927,14 @@ model is not marked as vision-capable. Each attachment counts in the footer as
 The marker is expanded into a native image part only while a request is being
 built, and the image is first uploaded through the provider's Files API:
 
-- **Upload once** -- `POST /files` through the SDK, then the returned id is
+- **Upload once** — `POST /files` through the SDK, then the returned id is
   cached in `sessions/images/files.json` under `provider|base_url`, so the same
   screenshot is uploaded a single time no matter how many turns mention it.
-- **OpenAI Responses** -- `input_text` and `input_image` parts; the image part
+- **OpenAI Responses** — `input_text` and `input_image` parts; the image part
   carries `file_id`.
-- **Anthropic Messages** -- `text` and `image` blocks with a
+- **Anthropic Messages** — `text` and `image` blocks with a
   `{"type": "file", "file_id": ...}` source.
-- **OpenAI Chat Completions** -- this wire has no file id, so the part carries
+- **OpenAI Chat Completions** — this wire has no file id, so the part carries
   a data URL. That is the only wire where base64 reaches the request body.
 
 An endpoint that rejects the upload (a 400/403/404 and friends, typical of
@@ -530,7 +984,7 @@ normal image part. `view_image` is only offered to models marked
 vision-capable: a text-only model never sees the schema, and sub-agents inherit
 the same rule from their own model.
 
-## Rendering Architecture
+## Rendering architecture
 
 ```
 widgets ──draw──▶ Canvas (width × height cells, fg/bg/attrs/alpha)
@@ -549,11 +1003,14 @@ widgets ──draw──▶ Canvas (width × height cells, fg/bg/attrs/alpha)
   prompt, footer), scrolling, input handling, and overlays.
 - `adcode/tui/transcript.py` renders transcript items and live streaming
   state according to the `/config` display policies.
+- `adcode/tui/agents_panel.py` renders the sub-agent strip: state, elapsed,
+  the current step and a tail of the output.
+- `adcode/tui/todo_panel.py` renders the live plan above the prompt.
 - `adcode/tui/markdown.py` is an incremental Markdown renderer producing
   styled spans (headings, emphasis, code fences, lists, quotes, tables, links,
   math).
 
-## Agent Loop
+## Agent loop
 
 `adcode/agent_loop.py` runs on a worker thread. It stages user messages,
 streams one request at a time, executes tool calls, feeds results back, drains
@@ -591,14 +1048,36 @@ there leaves the model without a result it can attach to its own call: it
 stops learning from the tools and repeats them until the turn is interrupted.
 `adcode/llm/client.py` therefore translates the history per wire.
 
-## Project Structure
+### Endpoints with a half-implemented Responses wire
+
+Plenty of OpenAI-compatible gateways answer `/v1/responses` by translating a
+chat completion into events, and drop the ones they consider optional -- most
+often `response.content_part.added`.  The openai SDK's stream state machine
+needs that event: it indexes the accumulating message content on the first
+`response.output_text.delta`, so the first token fails with
+`IndexError: list index out of range` raised inside the SDK.  A gateway that
+implements the wire properly -- MiniMax, OpenAI itself -- never hits this.
+
+AdCode recognises that shape error, switches the endpoint to chat completions
+for the rest of the session and says so in the transcript.  The lesson is
+written to `~/.adcode/wires.json`, keyed by the endpoint and by the wire that
+failed, so the next start goes straight to the wire that works.  The
+provider's own `wire` setting is left alone, and moving that provider to a
+different wire ignores the old lesson; delete the file (or its entry) to make
+AdCode try the configured wire again.
+
+A request that fails before it streamed anything is replayed on chat
+completions inside the same turn.  One that had already streamed the
+reasoning ends that turn with the error -- replaying it would duplicate the
+thinking that reached the conversation -- and the next turn is clean; with
+`/hold on` the engine retries the round by itself and the turn completes.
+
+## Project structure
 
 ```
 adcode/
 ├── cli.py            # console entry point
-├── net.py            # proxy-aware HTTP (SOCKS5, urllib fallbacks)
 ├── agent_loop.py     # the engine facade: events, sessions, control plane
-├── engine.py         # the engine itself: interruptions, hold, reasoning
 ├── config.py         # settings schema, migration, atomic save
 ├── crypto.py         # Fernet API-key encryption
 ├── models_dev.py     # models.dev catalogue and cache
@@ -617,12 +1096,20 @@ adcode/
 ├── tools/
 │   ├── builtin.py    # read, write, edit, glob, grep, bash, fetch, diff, ls
 │   ├── registry.py   # schemas, dispatch, diff attachment
-│   └── runtime.py    # per-thread tool context (interrupts, live output)
+│   ├── runtime.py    # per-thread tool context (interrupts, live output)
+│   └── todo.py       # the visible plan, backed by the sdk store
 ├── mcp/
 │   ├── client.py     # stdio, Streamable HTTP, and SSE transports
 │   └── manager.py    # server lifecycle, tool registration, diagnostics
 ├── agents/
 │   └── manager.py    # sub-agent tree, teams, mailboxes, ReAct workers
+├── web/
+│   ├── server.py     # the page, its assets, and the WebSocket upgrade
+│   ├── session.py    # the app, the connected browsers, the frame diff
+│   ├── screen.py     # cell-grid frames instead of a terminal
+│   ├── input.py      # browser keys -> the sequences the app parses
+│   ├── websocket.py  # minimal RFC 6455 server side
+│   └── static/       # index.html, app.js, style.css
 └── tui/
     ├── app.py        # layout, input, scrolling, overlays
     ├── canvas.py     # software renderer and alpha compositing
@@ -632,6 +1119,8 @@ adcode/
     ├── markdown.py   # incremental Markdown -> styled spans
     ├── text.py       # spans and width-aware wrapping
     ├── transcript.py # transcript and live-state rendering
+    ├── agents_panel.py # the sub-agent strip
+    ├── todo_panel.py # the live plan above the prompt
     ├── dialogs.py    # select, multi-select, prompts, confirmations
     ├── settings.py   # the /config tree browser
     └── provider_ui.py# provider setup and model editor
@@ -646,28 +1135,30 @@ python -m pytest
 
 The test suite covers canvas compositing, wrapping and Markdown, config
 migration, models.dev matching, compaction, sessions and rewind, skills, the
-tools, the agent loop, sub-agents, all three MCP transports, commands, input
-parsing, transcript display policies, settings behavior, and prompt layout.
+tools, the agent loop, sub-agents and their panel, the todo tool and panel,
+all three MCP transports, commands, input parsing, transcript display
+policies, settings behavior, prompt layout, and the browser bridge (key
+sequences, frame runs, the served page over a real WebSocket).
 
 It also contains real controlled-run simulations: the actual application is
 started against a temporary config, a local fake LLM gateway, and scripted
-keyboard/mouse input.  See [Test Harness](#test-harness).
+keyboard/mouse input.  See [Test harness](#test-harness).
 
-## Test Harness
+## Test harness
 
 The harness starts the real `AdCodeApp` loop on a worker thread and replaces
 only the terminal edges:
 
-- **Temporary config and workspace** -- every run gets a private
+- **Temporary config and workspace** — every run gets a private
   `project/` and `home/.adcode/config.json`; the real `~/.adcode` is never
   read or written.
-- **Fake local LLM gateway** -- a real HTTP server that speaks OpenAI Chat
+- **Fake local LLM gateway** — a real HTTP server that speaks OpenAI Chat
   Completions, OpenAI Responses and Anthropic Messages over SSE.  The
   production `LLMClient` and the official SDKs make the request, accumulate
   tool-call deltas and parse usage exactly as they do in production.
-- **Scripted input** -- raw arrow/control/paste/SGR-mouse sequences are fed
+- **Scripted input** — raw arrow/control/paste/SGR-mouse sequences are fed
   through AdCode's own `KeyParser`, so the app's real key handlers run.
-- **Recorded frames** -- a fake screen snapshots every composited frame,
+- **Recorded frames** — a fake screen snapshots every composited frame,
   replays the serialized ANSI through a small VT emulator and exposes the
   text, cells, colours and cursor.
 
@@ -686,6 +1177,9 @@ python -m bench run chat             # one scenario
 python -m bench run all              # every scenario
 python -m bench run commands --width 120 --height 40 --out out/
 ```
+
+`python -m bench demo --out docs` records the README tour (see
+[Demo](#demo)).
 
 Each run writes:
 
@@ -707,7 +1201,7 @@ out/
 
 SVG screenshots always work.  PNG needs Pillow; if the app virtualenv does not
 have it, the harness automatically looks for an interpreter that does
-(`ADCODE_RASTER_PYTHON`, then `python`/`python3`/`py`).  Scenarios: `chat`,
+(`ADCODE_RASTER_PYTHON`, then `python`/`python3`/`py`). Scenarios: `chat`,
 `tool-call`, `keyboard`, `commands`, `scroll`, `resize`, `interrupt`.
 
 ## Clipboard
@@ -742,12 +1236,15 @@ of crashing the app.
 
 ## Dependencies
 
-- `openai` -- OpenAI-compatible Chat Completions and Responses clients
-- `anthropic` -- Messages API client
-- `httpx2[socks]` -- HTTP transport, including the SOCKS5 proxy support
-- `cryptography` -- Fernet encryption for API keys
-- `keyring` -- OS credential storage
-- `pyperclip` -- clipboard access
+- `aicf-core` — the engine sdk: conversation engine, wire clients, tools,
+  sessions, sub-agent collaboration
+- `openai` — OpenAI-compatible Chat Completions and Responses clients
+- `anthropic` — Messages API client
+- `httpx2[socks]` — HTTP transport, including the SOCKS5 proxy support
+- `cryptography` — Fernet encryption for API keys
+- `keyring` — OS credential storage
+- `pyperclip` — clipboard access
+- `pyyaml` — skill frontmatter
 
 ## License
 

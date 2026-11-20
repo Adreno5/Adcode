@@ -26,20 +26,25 @@ from typing import Any, Callable
 
 from harness.agent import ConversationEngine, EngineConfig, EngineSnapshot
 from harness.agent.engine_config import (
-    AgentSettings, ContextSettings, ModelInfo, ReasoningSettings,
-    ThinkingSettings,
+    AgentSettings, ContextSettings, HoldSettings, ModelInfo,
+    ReasoningSettings, ThinkingSettings,
 )
 from harness.agent.events import EventSink
 from harness.images import FileIdCache
 from harness.transcript import SessionPayload, TranscriptItem
+from infra.orchestrator.failover import FailoverChat, FailoverEndpoint
 
 from adcode.agents.manager import AgentManager, AgentStatus
-from adcode.engine import AdCodeEngine
-from adcode.config import AppConfig, ModelConfig, ProviderConfig
+from adcode.config import AppConfig, FailoverSettings, ModelConfig, ProviderConfig
 from adcode.llm.client import LLMClient
+from adcode.llm.session import OpencodeSessions
 from adcode import paths
 from adcode.system_prompt import build_system_prompt
+from adcode.access import effective_access
+from adcode.security import AuditSink, build_guard
 from adcode.tools.builtin import install_coding_tools, shutdown_shell_sessions
+from adcode.tools.specs import attach_registry_specs, set_sandbox_level
+from adcode.tools.todo import install_todo_tool
 
 # The snapshot the TUI renders is the engine's own dataclass; the fields are
 # identical (status, turn, token counters, context window, session identity,
@@ -104,7 +109,9 @@ class AgentLoop:
 
     def __init__(self, config: AppConfig, registry, store: Any,
                  goals, skills, emit: Callable[[str, dict[str, Any]], None] | None = None,
-                 mcp_manager: Any = None, cwd: str = '') -> None:
+                 mcp_manager: Any = None, cwd: str = '',
+                 approval_ask: Any = None,
+                 notice: Any = None) -> None:
         self.config = config
         self.mcp = mcp_manager
         self.cwd = cwd
@@ -116,64 +123,101 @@ class AgentLoop:
         self._stop = False
         self._work = _WorkQueue()
         self._sink = EventSink(emit=self._on_engine_event)
-        # The bench's wait_idle samples these; both are plain queues.
-        self._events = self._sink._events
 
         self._selected = config.selected()
         if self._selected is None:
             raise RuntimeError('no provider/model configured')
         self.provider, self.model = self._selected
         self._file_cache = FileIdCache(str(paths.image_file_ids()))
-        self.client = self._make_client(self.provider, self.model)
-
+        # Console's session ids, one per saved conversation: the client reads
+        # the live one on every request (see adcode.llm.session).
+        self._opencode = OpencodeSessions()
         # The app hands us an empty registry; the built-in suite is installed
-        # here, and the agent / skill sources follow the engine's lifecycle.
+        # here, and the collab / skill sources follow the engine's lifecycle.
         install_coding_tools(registry)
-        registry.unregister_source('agent')
+        install_todo_tool(registry)
+        registry.unregister_source('collab')
         registry.unregister_source('skill')
+        # Every tool declares what it does; the guard reads those declarations.
+        attach_registry_specs(registry)
+        # One door in front of every tool call: policy, approval, sandbox and
+        # the audit trail.  In 'off' mode nothing waits for a human, but the
+        # trail is written either way.
+        self.audit = AuditSink(on_event=self._on_audit_event,
+                               session_id=lambda: self.session_name)
+        self._approval_ask = approval_ask
+        # a place to put a line in the user's transcript (the app owns it)
+        self._notice = notice or (lambda text, level: None)
+        # What the agent may do to this project, right now.
+        self.access = effective_access(config, self.cwd)
+        self.guard = build_guard(config.security, sink=self.audit,
+                                 ask=approval_ask,
+                                 session_id=self.session_name,
+                                 access=self.access,
+                                 workspace=self.cwd)
+        attach = getattr(registry, 'attach_guard', None)
+        if attach is not None:
+            attach(self.guard)
+        # the declaration follows the setting: 'none' must not be audited as
+        # 'workspace'
+        set_sandbox_level(registry, self.access)
+        # The engine talks to one IChatClient; with failover it is a chain
+        # that tries the other providers when the selected one is down.
+        self._endpoints: list[LLMClient] = []
+        self._rebuild_clients(config.failover)
 
         self.agent_live: dict[str, dict[str, str]] = {}
-        self._engine: AdCodeEngine | None = None
+        self._engine: ConversationEngine | None = None
         self.agents: AgentManager | None = None
         self._thread: threading.Thread | None = None
         self._pump: threading.Thread | None = None
         self._ready = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
 
+    def _on_audit_event(self, kind: str, event: dict[str, Any]) -> None:
+        """A refused call is something the user must see right away."""
+        if kind != 'audit.denied':
+            return
+        from adcode.security import format_audit_event
+        self._notice(format_audit_event(event), 'warning')
+
+    def _rebuild_clients(self, failover: FailoverSettings) -> None:
+        """Build the selected client and, when enabled, the fallback chain.
+
+        A fallback is the same model id on another provider when it has one,
+        its first model otherwise; at most three extra endpoints are built.
+        """
+        primary = self._make_client(self.provider, self.model)
+        self._endpoints = [primary]
+        if failover.enabled:
+            for provider in self.config.providers:
+                if provider is self.provider or not provider.models:
+                    continue
+                if len(self._endpoints) >= 4:
+                    break
+                model = provider.model(self.model.id) or provider.models[0]
+                self._endpoints.append(self._make_client(provider, model))
+        if len(self._endpoints) == 1:
+            self.client = primary
+            return
+        self.client = FailoverChat([
+            FailoverEndpoint(f'{client.provider.name}::{client.model}',
+                             client)
+            for client in self._endpoints
+        ])
+
     # ── construction helpers ────────────────────────────────
     def _on_engine_event(self, kind: str, payload: dict[str, Any]) -> None:
         """Every engine event passes through here before the UI sees it."""
-        if kind == 'turn_end':
-            # The turn is over: the engine has committed or rolled back, so it
-            # is known which sub-agent updates reached the history.
-            self._settle_mailbox()
         try:
             self._wake(kind, payload)
         except Exception:
             pass
 
-    def _settle_mailbox(self) -> None:
-        """Return sub-agent updates a failed turn never delivered."""
-        manager = self.agents
-        engine = self._engine
-        if manager is None or engine is None:
-            return
-        try:
-            lost = manager.settle_mailbox(engine)
-        except Exception:
-            return
-        if lost:
-            self._emit('notice',
-                       text=f'{lost} sub-agent update(s) were kept for the '
-                            f'next turn.', level='warning')
-
     def _make_client(self, provider: ProviderConfig, model: ModelConfig) -> LLMClient:
         return LLMClient(provider, model, base_dir=self.cwd or '.',
                          file_cache=self._file_cache, warn=self._warn,
-                         opencode_session=self._active_opencode_session)
-
-    def _active_opencode_session(self) -> str:
-        return self._engine.opencode_session_id if self._engine is not None else ''
+                         session_id=self.opencode_session_id)
 
     def _warn(self, text: str) -> None:
         engine = self._engine
@@ -191,9 +235,20 @@ class AgentLoop:
             reasoning=bool(model.reasoning),
         )
 
+    @staticmethod
+    def _keep_thinking_items(config: AppConfig) -> bool:
+        """Whether the engine has to record finished reasoning as items.
+
+        The steps summary counts them, so a collapsed turn needs them even
+        when the display policy hides them.
+        """
+        if config.steps.collapse_after_completion:
+            return True
+        return (config.thinking.after_completion not in ('hide', 'hidden')
+                and config.thinking.mode != 'hidden')
+
     def _engine_config(self, config: AppConfig) -> EngineConfig:
-        show_completed = (config.thinking.show_completed
-                          and config.thinking.mode != 'hidden')
+        show_completed = self._keep_thinking_items(config)
         return EngineConfig(
             context=ContextSettings(
                 auto_compact=config.context.auto_compact,
@@ -215,13 +270,16 @@ class AgentLoop:
                 default_type=config.agents.default_type,
                 system_suffix=config.agents.system_suffix,
             ),
+            hold=HoldSettings(enabled=config.hold.enabled,
+                              max_retries=config.hold.max_retries,
+                              delay=config.hold.delay),
             max_output_tokens=config.max_output_tokens,
         )
 
     def apply_hold(self) -> None:
         """Push the ``/hold`` settings into the engine."""
         engine = self._engine
-        if engine is None or not isinstance(engine, AdCodeEngine):
+        if engine is None:
             return
         hold = self.config.hold
         engine.configure_hold(hold.enabled, hold.max_retries, hold.delay)
@@ -252,29 +310,30 @@ class AgentLoop:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         self._loop = loop
-        engine = AdCodeEngine(
+        engine = ConversationEngine(
             client=self.client, registry=self._registry,
             store=self._store,
             sink=self._sink, system_provider=self._system_provider,
             cwd=self.cwd or '.', model=self._model_info(self.provider, self.model),
             config=self._engine_config(self.config))
         self._engine = engine
-        # The client stops the stream at the next chunk when the turn is
+        # The session name is only known now; the guard and the approval
+        # broker key their decisions by it.
+        self.guard.session_id = engine.session_name
+        # Every endpoint stops its stream at the next chunk when the turn is
         # interrupted, so an interrupt is not stuck behind a slow response.
-        self.client.interrupt = engine._interrupt
+        for endpoint in self._endpoints:
+            endpoint.interrupt = engine.interrupt_event
         self.apply_hold()
         if self.config.agents.enabled:
             self.agents = AgentManager(
                 self.config, self.config.agents, self._registry,
                 client=self.client,
                 model_info=self._model_info(self.provider, self.model),
+                provider=self.provider, model_config=self.model,
                 goal_store=self.goals,
                 client_factory=self._client_for,
                 cwd=self.cwd or '.', store=self._store)
-            self.agents._provider = self.provider
-            self.agents._model_config = self.model
-            self.agents._loop = loop
-            self.agents._condition = asyncio.Condition()
 
         def boot() -> None:
             # attach and engine.start need a *running* loop, so they run from
@@ -291,9 +350,14 @@ class AgentLoop:
             loop.close()
 
     def _client_for(self, provider: ProviderConfig, model: ModelConfig) -> LLMClient:
-        """Build a dedicated client for a child agent's provider::model."""
+        """Build a dedicated client for a child agent's provider::model.
+
+        A sub-agent works inside the same conversation, so it reports the same
+        Console session id and shares the prompt cache.
+        """
         return LLMClient(provider, model, base_dir=self.cwd or '.',
-                         file_cache=self._file_cache, warn=self._warn)
+                         file_cache=self._file_cache, warn=self._warn,
+                         session_id=self.opencode_session_id)
 
     def _sync_config(self, engine: ConversationEngine) -> None:
         """Copy the live config knobs into the engine before a turn.
@@ -312,15 +376,19 @@ class AgentLoop:
         context.reserved_output = self.config.context.reserved_output
         context.compaction_reasoning_effort = \
             self.config.context.compaction_reasoning_effort
+        # Turning the steps summary on has to take effect in the next turn:
+        # it needs the thinking items the hidden policy would otherwise skip.
+        engine.config.thinking.show_completed = self._keep_thinking_items(
+            self.config)
 
     def _submit_now(self, mode: str, text: str) -> None:
-        # Bypass engine.submit's own queued event: the facade emitted one with
-        # the facade-side queue position already.
+        # The queued event was emitted with the facade-side queue position
+        # already, so the engine's own copy is suppressed.
         engine = self._engine
         if engine is None:
             return
         self._sync_config(engine)
-        engine._work.put_nowait((mode, text))
+        engine.submit(text, mode, announce=False)
 
     def _pump_thread(self) -> None:
         """Hand queued turns to the engine, in order.
@@ -361,7 +429,7 @@ class AgentLoop:
             return False
         engine = self._engine
         if engine is not None and not engine.busy():
-            engine._interrupt.clear()
+            engine.clear_interrupt()
         self._work.put((mode, text))
         self._emit('queued', text=text, mode=mode,
                    position=self._work.qsize())
@@ -377,7 +445,7 @@ class AgentLoop:
     def request_compact(self) -> None:
         engine = self._engine
         if engine is not None and not engine.busy():
-            engine._interrupt.clear()
+            engine.clear_interrupt()
         self._work.put(('compact', ''))
 
     def add_notice(self, text: str, level: str = 'info') -> None:
@@ -396,30 +464,62 @@ class AgentLoop:
 
     def set_model(self, provider: ProviderConfig, model: ModelConfig) -> None:
         self._require_idle('model change')
-        client = self._make_client(provider, model)
         model_info = self._model_info(provider, model)
-        self.client = client
         self.provider = provider
         self.model = model
-        self._call(lambda: self._apply_model(provider, model, model_info, client))
+        # The chain is rebuilt around the new selection: the engine and the
+        # agent manager only ever see the primary client.
+        primary = self._endpoints[0]
+        if (self._endpoints and primary.provider is provider
+                and primary.model == model.id):
+            client = self.client
+        else:
+            self._rebuild_clients(self.config.failover)
+            client = self._endpoints[0]
+        self._call(lambda: self._apply_model(provider, model, model_info,
+                                             client))
 
     def _apply_model(self, provider, model, model_info, client) -> None:
         engine = self._engine
         if engine is not None:
-            engine.set_client(client, model_info)
+            engine.set_client(self.client, model_info)
+            for endpoint in self._endpoints:
+                endpoint.interrupt = engine.interrupt_event
         if self.agents is not None:
             self.agents.set_model(provider, model, model_info, client)
+
+    def apply_access(self) -> str:
+        """Rebuild the guard for the access level that applies now.
+
+        The level can change while the session runs (the user picks another
+        one in the settings, or opens a different project), and the guard
+        holds the policy, the approval broker and the sandbox -- so it has
+        to be rebuilt, not patched.  Returns the level now in force.
+        """
+        access = effective_access(self.config, self.cwd)
+        self.access = access
+        self.guard = build_guard(self.config.security, sink=self.audit,
+                                 ask=self._approval_ask,
+                                 session_id=self.session_name,
+                                 access=access,
+                                 workspace=self.cwd)
+        attach = getattr(self._registry, 'attach_guard', None)
+        if attach is not None:
+            attach(self.guard)
+        set_sandbox_level(self._registry, access)
+        return access
 
     def refresh_tools(self) -> None:
         self._require_idle('tool refresh')
         registry = self._registry
-        registry.unregister_source('agent')
+        registry.unregister_source('collab')
         registry.unregister_source('skill')
         if self.agents is not None:
             self.agents.reinstall_tools()
         specs = self.skills.tool_specs() if self.skills is not None else []
         for tool in specs:
             registry.register(tool, replace=True, source='skill')
+        attach_registry_specs(registry)
         self._call(lambda: self._engine.refresh_tools())
 
     def shutdown(self) -> None:
@@ -474,17 +574,28 @@ class AgentLoop:
     @property
     def usage_records(self) -> list[dict[str, Any]]:
         engine = self._engine
-        return engine._usage_records if engine is not None else []
+        return engine.usage_records() if engine is not None else []
 
     @property
     def session_name(self) -> str:
-        engine = self._engine
+        # The engine exists only after the loop starts, so the property has
+        # to tolerate its absence.
+        engine = getattr(self, '_engine', None)
         return engine.session_name if engine is not None else ''
 
     @property
     def session_title(self) -> str:
         engine = self._engine
         return engine.session_title if engine is not None else ''
+
+    def opencode_session_id(self) -> str:
+        """The Console session id of the live conversation.
+
+        Read while a request is being built: the engine names its session
+        only after the first save, so the id follows that name as it appears.
+        """
+        engine = self._engine
+        return self._opencode.current(engine.session_name if engine is not None else '')
 
     def snapshot(self) -> AgentSnapshot:
         engine = self._engine
@@ -518,6 +629,35 @@ class AgentLoop:
         self._require_idle('session rename')
         self._sync_call(lambda: self._engine.save_as(name))
 
+    def rename_session(self, name: str) -> str:
+        """Rename the live conversation and move its saved row.
+
+        The engine saves the conversation under the new name; the row the
+        old name left behind is deleted, so a rename moves the session
+        instead of copying it.  The Console id follows the session, so the
+        prompt cache it was written under survives the rename.
+        """
+        self._require_idle('session rename')
+        new_name = str(name or '').strip()
+        if not new_name:
+            raise ValueError('session name must not be empty')
+        old_name = self.session_name
+
+        def rename() -> str:
+            engine = self._engine
+            engine.session_name = new_name
+            engine.save_active()
+            return new_name
+
+        result = self._sync_call(rename)
+        if old_name and old_name != new_name:
+            try:
+                self._store.delete(old_name)
+            except Exception:
+                pass
+        self._opencode.rename(old_name, new_name)
+        return str(result)
+
     def load_session(self, name: str) -> bool:
         self._require_idle('session load')
         return self._sync_call(lambda: self._engine.load_session(name))
@@ -535,6 +675,23 @@ class AgentLoop:
             self._engine.session_title = ''
 
         self._sync_call(reset)
+
+    def forget_session(self) -> None:
+        """Drop the session identity after its row was deleted.
+
+        The engine names a session on its first save and keeps that name; a
+        deleted session must not be resurrected by the next message under the
+        old name.
+        """
+        self._require_idle('session delete')
+
+        def reset() -> None:
+            self._engine.session_name = ''
+            self._engine.session_title = ''
+
+        self._sync_call(reset)
+        # The deleted conversation's Console id must not follow the next one.
+        self._opencode.forget()
 
     def rewind(self, turn: int) -> str:
         self._require_idle('rewind')
@@ -566,6 +723,10 @@ class AgentLoop:
                         'compaction_delta': 'compacting'}[event.kind]
                 live = self.agent_live.setdefault(
                     name, {'mode': mode, 'text': ''})
+                if live['mode'] != mode and live['text']:
+                    # thinking and the answer are different voices; without a
+                    # break the panel's tail shows them glued together
+                    live['text'] += '\n'
                 live['mode'] = mode
                 live['text'] = (live['text'] + event.content)[-4_000:]
                 dirty = True
@@ -601,8 +762,74 @@ class AgentLoop:
         if dirty:
             self._emit('agents_refresh')
 
+    # ── the panel's view of the children ────────────────────
+    def agent_view(self) -> list[dict[str, Any]]:
+        """Rows for the sub-agent panel: manager state plus the live text.
+
+        ``agent_live`` is filled by :meth:`pump_agent_events`, which the UI
+        thread calls, so the merge here needs no locking.
+        """
+        manager = self.agents
+        if manager is None:
+            return []
+        rows = manager.agent_rows()
+        for row in rows:
+            live = self.agent_live.get(row['name']) or {}
+            row['mode'] = live.get('mode', '')
+            row['tail'] = _tail_line(live.get('text') or '')
+        return rows
+
+    def wait_for_agent_activity(self, timeout_ms: int = 0) -> dict[str, Any]:
+        """Block until a sub-agent reports activity, or the timeout passes.
+
+        ``wait_for_activity`` is a coroutine that belongs to the manager's
+        loop: calling it from a worker thread only hands back a coroutine
+        nobody awaits, so it is submitted to the loop instead.
+        """
+        manager = self.agents
+        loop = self._loop
+        if manager is None or loop is None or loop.is_closed():
+            return {'timed_out': True, 'updated_agents': []}
+        future = asyncio.run_coroutine_threadsafe(
+            manager.wait_for_activity(timeout_ms), loop)
+        try:
+            return future.result(timeout=max(5.0, timeout_ms / 1000 + 5))
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            return {'timed_out': True, 'updated_agents': []}
+
+    def agent_output(self, name: str) -> str:
+        """Everything an agent has produced, for the output viewer.
+
+        Prefers the streamed text the pump keeps; falls back to the finished
+        record so a completed agent can still be inspected.
+        """
+        live = self.agent_live.get(name) or {}
+        text = str(live.get('text') or '').strip()
+        if text:
+            return text
+        manager = self.agents
+        if manager is None:
+            return ''
+        try:
+            record = manager.records().get(name)
+        except RuntimeError:
+            return ''
+        if record is None:
+            return ''
+        return str(record.error or record.final_message or '').strip()
+
     def _emit(self, kind: str, **payload: Any) -> None:
         self._sink.emit(kind, payload)
+
+
+def _tail_line(text: str, limit: int = 96) -> str:
+    """The last non-empty line of a stream, trimmed for a panel row."""
+    for line in reversed(str(text or '').splitlines()):
+        line = line.strip()
+        if line:
+            return line[:limit] + ('…' if len(line) > limit else '')
+    return ''
 
 
 def _tool_brief(args: dict[str, Any]) -> str:

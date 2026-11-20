@@ -61,7 +61,7 @@ def build_config(base_url: str, wire: str = 'openai chat completions', *,
     config.max_output_tokens = 4_096
     config.thinking.mode = 'full'
     config.thinking.style = 'normal'
-    config.thinking.show_completed = True
+    config.thinking.after_completion = 'keep'
     config.tools.mode = 'both'
     config.tools.result_mode = 'full'
     config.tools.show_args = True
@@ -142,7 +142,7 @@ class Workspace:
         from harness.transcript import DbSessionStore
 
         return DbSessionStore(
-            db_path=self.root / 'adcode-home' / 'sessions' / 'adcode.db')
+            db_path=self.root / 'adcode-home' / 'adcode.db')
 
     def session_payload(self, name: str = '__last__') -> dict[str, Any]:
         return self.session_store().load(name).to_json() \

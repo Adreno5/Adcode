@@ -21,7 +21,7 @@ class ScriptedClient:
     instances: list['ScriptedClient'] = []
 
     def __init__(self, provider, model=None, *, base_dir='', file_cache=None,
-                 warn=None, opencode_session=None):
+                 warn=None, session_id=None):
         self.provider = provider
         self.model = model.id if model is not None else 'test-model'
         self.base_dir = base_dir
@@ -182,6 +182,38 @@ def test_compaction_trigger(config, tmp_path, monkeypatch):
         loop.shutdown()
 
 
+def test_the_steps_summary_keeps_the_reasoning_items(config, tmp_path,
+                                                     monkeypatch):
+    """A collapsed turn needs the thinking items even when they are hidden.
+
+    The engine records a finished thought as an item only when the display
+    asks for it; the steps summary counts it, so the toggle has to reach the
+    running engine -- in the next turn, without a restart.
+    """
+    monkeypatch.setattr(agent_loop, 'LLMClient', ScriptedClient)
+    config.thinking.after_completion = 'hidden'
+    config.thinking.mode = 'hidden'
+    loop = AgentLoop(
+        config, ToolRegistry(),
+        DbSessionStore(db_path=tmp_path / 'sessions' / 'adcode.db'),
+        GoalStore(tmp_path / 'goals.json'),
+        SkillRegistry(config.skills, str(tmp_path)),
+        emit=lambda kind, payload: None)
+    loop.start()
+    try:
+        loop.submit('hello there')
+        wait_idle(loop)
+        assert [item.kind for item in loop.items_snapshot()] == \
+            ['user', 'assistant']
+        config.steps.collapse_after_completion = True
+        loop.submit('and again')
+        wait_idle(loop)
+        turns = [(item.turn, item.kind) for item in loop.items_snapshot()]
+        assert (2, 'thinking') in turns, turns
+    finally:
+        loop.shutdown()
+
+
 def test_interrupt(config, tmp_path, monkeypatch):
     class SlowClient(ScriptedClient):
         async def stream(self, messages, tools=None, **kwargs):
@@ -314,21 +346,24 @@ def test_the_system_prompt_carries_the_model_identity(loop):
     assert 'model id: test-model' not in system
 
 
-def test_the_turn_end_settles_the_sub_agent_mailbox(loop):
-    """The adapter returns undelivered sub-agent updates when a turn ends."""
+def test_a_failed_turn_settles_the_sub_agent_mailbox(loop):
+    """A turn that fails after the updates were staged keeps them for the
+    next turn: the sdk engine settles the mailbox when the turn ends."""
     manager = loop.agents
     assert manager is not None
-    engine = loop._engine
-    # A sub-agent update sits in the inbox and the turn takes it over.
     record = manager.records()['root']
     record.inbox.append('<subagent_update agent="scout" status="completed">'
-                         '\nfound it\n</subagent_update>')
-    updates = manager.consume_mailbox(engine)
-    assert len(updates) == 1
-    assert not record.inbox
+                        '\nfound it\n</subagent_update>')
+    client = ScriptedClient.instances[0]
 
-    # The turn ends without committing the update: it must come back.
-    loop._on_engine_event('turn_end', {'turn': 1, 'status': 'interrupted'})
+    async def broken(messages, tools=None, **kwargs):
+        raise RuntimeError('provider down')
+        yield  # pragma: no cover - keeps this an async generator
+
+    client.stream = broken
+    loop.submit('go')
+    wait_idle(loop)
+
     assert len(record.inbox) == 1
     assert 'found it' in record.inbox[0]
     # And the user is told about it.

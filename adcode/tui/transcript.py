@@ -8,6 +8,7 @@ fade, or the complete block.
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -81,6 +82,54 @@ def tool_arg_brief(name: str, args: dict[str, Any]) -> str:
         key = next(iter(args))
         return str(args[key]).replace('\n', ' ')
     return ''
+
+
+def tool_result_brief(name: str, output: str) -> str:
+    """The one-line version of a result, for tools whose JSON is not worth it.
+
+    ``todo`` answers with the whole plan so the model can act on it; the panel
+    above the prompt already shows that plan, so echoing the JSON into the
+    transcript only pushes the conversation away.  Any other tool returns ''
+    and keeps its normal rendering.
+    """
+    if not output.lstrip().startswith(('{', '[')):
+        return ''
+    if name == 'spawn_agent':
+        return _spawn_brief(output)
+    if name != 'todo':
+        return ''
+    try:
+        view = json.loads(output)
+    except ValueError:
+        return ''
+    if not isinstance(view, dict):
+        return ''
+    items = view.get('items')
+    if not isinstance(items, list):
+        return ''
+    parts = [f'{view.get("done", 0)}/{len(items)}']
+    status = str(view.get('status') or '')
+    if status:
+        parts.append(status)
+    current = str(view.get('current') or '')
+    if current and status != 'completed':
+        parts.append(f'now {current}')
+    return '  ·  '.join(parts)
+
+
+def _spawn_brief(output: str) -> str:
+    """``spawn_agent`` answers with a receipt; the panel shows the agent itself."""
+    try:
+        receipt = json.loads(output)
+    except ValueError:
+        return ''
+    if not isinstance(receipt, dict) or not receipt.get('agent'):
+        return ''
+    parts = [str(receipt['agent']), str(receipt.get('status') or '')]
+    depth = receipt.get('depth')
+    if isinstance(depth, int) and depth:
+        parts.append(f'depth {depth}')
+    return '  ·  '.join(part for part in parts if part)
 
 
 def _thinking_suffix(config: ThinkingDisplay, now: float) -> str:
@@ -215,9 +264,14 @@ def _partial_block(lines: list[Line], width: int, from_index: int, to_index: int
 class TranscriptRenderer:
     def __init__(self) -> None:
         self._cache: dict[int, tuple[tuple[Any, ...], list[Line]]] = {}
+        # Whole-run summaries (collapse after completion), keyed by the first
+        # item of the run so a long conversation does not recount its tokens
+        # on every frame.
+        self._runs: dict[int, tuple[tuple[Any, ...], list[Line]]] = {}
 
     def invalidate(self) -> None:
         self._cache.clear()
+        self._runs.clear()
 
     # ── public entry point ──────────────────────────────────
     def render(self, items: list[TranscriptItem], live: LiveRender, width: int,
@@ -227,12 +281,27 @@ class TranscriptRenderer:
         now = time.time() if now is None else now
         width = max(16, width)
         merged = config.tools.chain == 'merged'
+        collapse = bool(config.steps.collapse_after_completion)
+        finished = self._finished_turns(items) if collapse else frozenset()
         output: list[Line] = []
         previous = ''
         index = 0
         while index < len(items):
             item = items[index]
-            if merged and item.kind == 'tool':
+            if collapse and item.kind in ('thinking', 'tool') \
+                    and item.turn in finished:
+                # The turn answered and stopped working: its steps fold into
+                # the one row that says what they were.
+                run = [item]
+                index += 1
+                while (index < len(items) and items[index].turn == item.turn
+                       and items[index].kind in ('thinking', 'tool')):
+                    run.append(items[index])
+                    index += 1
+                block = self._steps_summary(run, width, config, config_version,
+                                            palette)
+                kind = 'tool'
+            elif merged and item.kind == 'tool':
                 # A chain of calls collapses into one row with the tool names
                 # and their counts; the details stay in the history.
                 chain = [item]
@@ -241,20 +310,22 @@ class TranscriptRenderer:
                     chain.append(items[index])
                     index += 1
                 block = self._chain_lines(chain, width, config, now, palette)
+                kind = 'tool'
             else:
                 block = self._item_lines(item, width, config, config_version,
                                          now, palette)
+                kind = item.kind
                 index += 1
             if not block:
                 continue
-            if output and output[-1] and self._needs_gap(previous, item.kind):
+            if output and output[-1] and self._needs_gap(previous, kind):
                 output.append([])
             output.extend(block)
-            if item.kind == 'assistant':
+            if kind == 'assistant':
                 output.append([])
-            elif item.kind == 'thinking':
+            elif kind == 'thinking':
                 output.append([])
-            previous = item.kind
+            previous = kind
         if items:
             self._prune(items)
         live_lines = self._live_lines(live, width, config, now)
@@ -283,6 +354,27 @@ class TranscriptRenderer:
         if len(self._cache) > len(items) * 2 + 32:
             self._cache = {key: value for key, value in self._cache.items()
                            if key in alive}
+        if len(self._runs) > len(items) * 2 + 32:
+            self._runs = {key: value for key, value in self._runs.items()
+                          if key in alive}
+
+    @staticmethod
+    def _finished_turns(items: list[TranscriptItem]) -> set[int]:
+        """The turns whose work is over: answered, and nothing still running.
+
+        An interrupted or failed turn keeps its steps on screen -- what it did
+        is all there is to read about it.
+        """
+        turns: dict[int, list[TranscriptItem]] = {}
+        for item in items:
+            turns.setdefault(item.turn, []).append(item)
+        finished: set[int] = set()
+        for turn, group in turns.items():
+            if any(item.status == 'running' for item in group):
+                continue
+            if group[-1].kind == 'assistant':
+                finished.add(turn)
+        return finished
 
     # ── items ───────────────────────────────────────────────
     def _item_lines(self, item: TranscriptItem, width: int, config: AppConfig,
@@ -336,25 +428,33 @@ class TranscriptRenderer:
         renderer.finish()
         return wrap_lines(renderer.lines(), width)
 
+    def _thinking_label(self, item: TranscriptItem,
+                        config: AppConfig) -> list[Line]:
+        """The one-line form: label, how long it took, how much it said."""
+        label = config.thinking.label or 'Thinking'
+        line: Line = [Span(label, 'subtext', attrs=BOLD)]
+        if item.duration:
+            line.append(Span(f' · {item.duration:.1f}s', 'muted'))
+        if config.thinking.label_tokens:
+            tokens = estimate_text_tokens(item.text or '')
+            line.append(Span(f' · {tokens} token{"s" if tokens != 1 else ""}',
+                             'muted'))
+        return [line]
+
     def _render_thinking(self, item: TranscriptItem, width: int,
                          config: AppConfig) -> list[Line]:
-        mode = config.thinking.mode
+        # The two stages are configured separately: what a committed block
+        # looks like is ``after_completion``, and ''keep'' is the old "follow
+        # the ongoing mode" (old files, and holding alt to read everything).
+        mode = config.thinking.after_completion
+        if mode == 'keep':
+            mode = config.thinking.mode
         if mode == 'hidden':
             return []
-        if not config.thinking.show_completed:
-            return []
-        if mode == 'summary':
-            # The reasoning is kept, but not spelled out: the row says how
-            # much there was.
-            tokens = estimate_text_tokens(item.text or '')
-            return [[Span('thought of ', 'subtext'),
-                     Span(f'{tokens} token{"s" if tokens != 1 else ""}',
-                          'muted')]]
         if mode == 'label':
-            label = config.thinking.label or 'Thinking'
-            suffix = '' if not item.duration else f' · {item.duration:.1f}s'
-            return [[Span(label, 'subtext', attrs=BOLD),
-                     Span(suffix, 'muted')]]
+            # The reasoning is over: say that it happened, not what it said
+            # (and how much there was, when the label carries the count).
+            return self._thinking_label(item, config)
         renderer = MarkdownRenderer(width)
         renderer.feed(item.text)
         renderer.finish()
@@ -418,6 +518,70 @@ class TranscriptRenderer:
             add_span(line, Span(' ' * (row_width - used), None, 'panel'))
         return [Row(line, ROW_BLEED)]
 
+    def _steps_summary(self, run: list[TranscriptItem], width: int,
+                       config: AppConfig, config_version: int,
+                       palette: Palette | None = None) -> list[Line]:
+        """One row for a whole finished turn's work, memoized per run."""
+        if not run:
+            return []
+        signature = ('steps', width, config_version,
+                     _palette_signature(palette),
+                     tuple((item.kind, item.name, item.display, item.status,
+                            len(item.text)) for item in run))
+        cached = self._runs.get(id(run[0]))
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        lines = self._steps_summary_lines(run, width, config, palette)
+        self._runs[id(run[0])] = (signature, lines)
+        return lines
+
+    def _steps_summary_lines(self, run: list[TranscriptItem], width: int,
+                             config: AppConfig,
+                             palette: Palette | None = None) -> list[Line]:
+        """``Thought for 812 tokens, bash x2, edit``: the turn in one line.
+
+        Only what the display policy would show anyway goes into the row, so
+        hidden reasoning stays hidden and hidden tools stay hidden.  Counting
+        the thought costs a pass over its text, which is why the caller
+        memoizes the row.
+        """
+        after = config.thinking.after_completion
+        show_thought = after != 'hidden' and (
+            after != 'keep' or config.thinking.mode != 'hidden')
+        show_tools = config.tools.mode != 'hidden'
+        thoughts = [item for item in run if item.kind == 'thinking']
+        tools = [item for item in run if item.kind == 'tool']
+        tokens = sum(estimate_text_tokens(item.text or '') for item in thoughts)
+        names = _chain_names(tools) if show_tools else []
+        if not (show_thought and tokens) and not names:
+            return []
+        row_width = width + ROW_BLEED
+        line: Line = [Span(ROW_BAR + ' ', 'accent', 'panel')]
+        entries: list[list[Span]] = []
+        if show_thought and tokens:
+            suffix = '' if tokens == 1 else 's'
+            entries.append([Span('Thought for ', 'text', 'panel', attrs=BOLD),
+                            Span(f'{tokens} token{suffix}', 'text', 'panel')])
+        for name, count in names:
+            entry = [Span(name, 'text', 'panel', attrs=BOLD)]
+            if count > 1:
+                entry.append(Span(f' x{count}', 'muted', 'panel'))
+            entries.append(entry)
+        for index, entry in enumerate(entries):
+            if index:
+                add_span(line, Span(', ', 'muted', 'panel'))
+            for span in entry:
+                add_span(line, span)
+        if any(item.status == 'error' for item in tools):
+            add_span(line, Span('  !', 'error', 'panel'))
+        line = truncate_line(line, row_width, ellipsis='…')
+        if palette is not None:
+            line = _paint_lead_in(line, lead_in_gradient(palette))
+        used = line_width(line)
+        if used < row_width:
+            add_span(line, Span(' ' * (row_width - used), None, 'panel'))
+        return [Row(line, ROW_BLEED)]
+
     def _tool_call_line(self, item: TranscriptItem, width: int, config: AppConfig,
                         now: float, palette: Palette | None = None) -> list[Line]:
         # The row bleeds one cell left of the transcript margin, so it is one
@@ -450,6 +614,13 @@ class TranscriptRenderer:
                            config: AppConfig) -> list[Line]:
         if not item.output:
             return []
+        brief = tool_result_brief(item.name, item.output)
+        if brief:
+            line: Line = [Span('│ ', 'border', attrs=DIM),
+                          Span(brief, 'muted')]
+            if item.status == 'error':
+                line = _apply_base_role(line, 'error')
+            return [truncate_line(line, max(8, width - 2), '…')]
         renderer = MarkdownRenderer(max(8, width - 2))
         renderer.feed(item.output)
         renderer.finish()
@@ -553,9 +724,9 @@ class TranscriptRenderer:
         phase = live.phase
         if phase == 'thinking':
             mode = config.thinking.mode
-            if mode in ('label', 'summary'):
-                # The summary mode keeps the running thought out of the way as
-                # well: the label is enough while it is in flight.
+            if mode == 'label':
+                # The label is enough while the thought is in flight: the
+                # token count only lands once the round is over.
                 label = config.thinking.label or 'Thinking'
                 output.append([
                     Span(label, 'subtext', attrs=BOLD),

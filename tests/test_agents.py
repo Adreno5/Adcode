@@ -22,7 +22,7 @@ class ScriptedClient:
     instances: list['ScriptedClient'] = []
 
     def __init__(self, provider=None, model=None, *, base_dir='', file_cache=None,
-                 warn=None):
+                 warn=None, session_id=None):
         self.provider = provider
         self.rounds: list[list[str]] = [['child result']]
         self.calls = 0
@@ -248,7 +248,7 @@ def test_agent_and_goal_tools_registered(tmp_path):
                 'wait_agent', 'interrupt_agent', 'update_goal'} <= names
         sources = {name: manager._registry.source_of(name) for name in
                    ('spawn_agent', 'update_goal')}
-        assert set(sources.values()) == {'agent'}
+        assert set(sources.values()) == {'collab'}
         # the goal tool talks to the GoalStore
         goal_tool = next(tool for tool in manager._registry.tools()
                          if tool.name == 'update_goal')
@@ -280,15 +280,20 @@ def test_drain_agent_events_maps_child_stream(tmp_path):
     asyncio.run(main())
 
 
-def test_drain_events_is_inert_for_the_engine(tmp_path):
+def test_the_engine_pump_never_eats_the_activity_stream(tmp_path):
     async def main():
         root, manager, client = _setup(tmp_path)
-        # the engine's per-round pump must never consume child activity; the
-        # facade owns it (see pump_agent_events)
+        # the engine's per-round pump drains lifecycle events only; the full
+        # child stream is the facade's (see pump_agent_events)
+        manager._activity.append(('text_delta', {'agent': 'x',
+                                                 'text': 'hi'}))
+        manager._activity.append(('agent_event', {'agent': 'x',
+                                                  'status': 'done'}))
+        # ... and with forwarding off, the transcript stream stays empty
+        manager.forward_events = False
         assert manager.drain_events() == []
-        manager._agent_events.append(('agent_event', {'agent': 'x'}))
-        assert manager.drain_events() == []
-        assert len(manager.drain_agent_events()) == 1
+        kinds = [event.kind for event in manager.drain_agent_events()]
+        assert kinds == ['text_delta', 'status']
 
     asyncio.run(main())
 

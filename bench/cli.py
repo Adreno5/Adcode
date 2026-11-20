@@ -23,6 +23,18 @@ def _parser() -> argparse.ArgumentParser:
 
     sub.add_parser('list', help='list the available scenarios')
 
+    demo = sub.add_parser(
+        'demo', help='record the README tour (GIF, WebM and a poster frame)')
+    demo.add_argument('--out', default='docs', help='asset directory')
+    demo.add_argument('--fps', type=int, default=8,
+                      help='recording frame rate (default 8)')
+    demo.add_argument('--keep-frames', action='store_true',
+                      help='keep the raw cell dumps and rendered frames')
+    demo.add_argument('--raster-python', default=None,
+                      help='interpreter with Pillow, if the app venv lacks it')
+    demo.add_argument('--no-video', action='store_true',
+                      help='write the GIF only')
+
     run = sub.add_parser('run', help='run one scenario (or all of them)')
     run.add_argument('scenario', nargs='?', default='all',
                      help='scenario name, or "all" (default)')
@@ -60,6 +72,18 @@ def main(argv: list[str] | None = None) -> int:
         for scenario in list_scenarios():
             print(f'{scenario.name:<12} {scenario.summary}')
         return 0
+
+    if args.command == 'demo':
+        from bench.demo import main as demo_main
+
+        demo_argv = ['--out', args.out, '--fps', str(args.fps)]
+        if args.keep_frames:
+            demo_argv.append('--keep-frames')
+        if args.raster_python:
+            demo_argv.extend(['--raster-python', args.raster_python])
+        if args.no_video:
+            demo_argv.append('--no-video')
+        return demo_main(demo_argv)
 
     requested = args.scenario
     if requested == 'all':

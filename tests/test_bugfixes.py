@@ -166,7 +166,7 @@ def test_compaction_keeps_retained_user_turn_addressable():
 
 class _QuietClient:
     def __init__(self, provider, model=None, *, base_dir='', file_cache=None,
-                 warn=None, opencode_session=None):
+                 warn=None, session_id=None):
         self.provider = provider
 
     async def stream(self, messages, tools=None, **kwargs):
@@ -267,6 +267,26 @@ def test_canvas_drops_wide_glyph_that_cannot_fit():
     canvas = Canvas(3, 1, build_palette('dark'))
     canvas.draw_text(2, 0, '中', canvas.palette.text)
     assert canvas.cell(2, 0).ch == ' '
+
+
+def test_canvas_alpha_text_with_combining_mark_past_edge_does_not_crash():
+    canvas = Canvas(6, 1, build_palette('dark'))
+    canvas.clear()
+    # The glyphs run past the right edge; the combining mark must not try to
+    # attach to a cell outside the canvas (IndexError: list index out of range).
+    canvas.draw_text(4, 0, 'abcdef\u0301', canvas.palette.text,
+                     canvas.palette.background, alpha=128)
+    assert canvas.cell(4, 0).ch == 'a'
+    assert canvas.cell(5, 0).ch == 'b'
+
+
+def test_canvas_draw_text_past_right_edge_is_clipped():
+    canvas = Canvas(6, 1, build_palette('dark'))
+    canvas.clear()
+    advance = canvas.draw_text(4, 0, 'abcdef', canvas.palette.text,
+                               canvas.palette.background)
+    assert advance == 6
+    assert [canvas.cell(x, 0).ch for x in range(6)] == list('    ab')
 
 
 def test_markdown_html_tags_apply_attributes():

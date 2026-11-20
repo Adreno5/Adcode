@@ -51,17 +51,28 @@ def _valid_url(url: str) -> bool:
 
 
 class ModelEditorOverlay(Overlay):
-    """Edit a single model's capability metadata."""
+    """Edit a single model's capability metadata.
+
+    Every change is saved the moment it is made: the panel edits the model
+    of the live config, so the file on disk always holds what the panel
+    shows.  ``ctrl+s`` is kept as a shortcut that saves and closes, but it
+    is not needed to keep a change.
+    """
 
     def __init__(self, provider: ProviderConfig, model: ModelConfig,
                  on_save: Callable[[], None],
-                 on_cancel: Callable[[], None] | None = None) -> None:
+                 on_cancel: Callable[[], None] | None = None,
+                 on_change: Callable[[], None] | None = None) -> None:
         super().__init__()
         self.title = f'Model · {model.id}'
         self.provider = provider
         self.model = model
         self.on_save = on_save
         self.on_cancel = on_cancel
+        # The quiet counterpart of ``on_save``: it persists a change without
+        # announcing it, so a value that is edited does not produce a
+        # notice per keystroke.
+        self.on_change = on_change or on_save
         self.index = 0
         self.editing = False
         self.edit_text = ''
@@ -77,6 +88,10 @@ class ModelEditorOverlay(Overlay):
         self.edit_values = {
             'reasoning_style': ['none', 'effort', 'toggle'],
         }
+
+    def _changed(self) -> None:
+        """A value changed: write it to the config file right away."""
+        self.on_change()
 
     def _value(self, key: str) -> Any:
         return getattr(self.model, key)
@@ -135,6 +150,7 @@ class ModelEditorOverlay(Overlay):
                 if kind == 'bool':
                     setattr(self.model, key, not bool(self._value(key)))
                     self.model.source = 'custom'
+                    self._changed()
                 elif kind in ('number', 'list'):
                     self.editing = True
                     self.edit_text = self._display(key) if kind == 'number' else \
@@ -147,6 +163,7 @@ class ModelEditorOverlay(Overlay):
                     self.model.reasoning_style = next_value
                     self.model.reasoning = next_value != 'none'
                     self.model.source = 'custom'
+                    self._changed()
                 return True
             if event.key == 'left' and self._fields[self.index][2] == 'choice':
                 key, _label, _kind = self._fields[self.index]
@@ -157,12 +174,14 @@ class ModelEditorOverlay(Overlay):
                 self.model.reasoning_style = next_value
                 self.model.reasoning = next_value != 'none'
                 self.model.source = 'custom'
+                self._changed()
                 return True
         return True
 
     def _apply_edit(self) -> None:
         key, _label, kind = self._fields[self.index]
         text = self.edit_text.strip()
+        changed = False
         if kind == 'number':
             try:
                 value = int(text)
@@ -175,12 +194,16 @@ class ModelEditorOverlay(Overlay):
                 value = max(256, min(2_000_000, value))
             setattr(self.model, key, value)
             self.model.source = 'custom'
+            changed = True
         elif kind == 'list':
             values = [item.strip() for item in text.split(',') if item.strip()]
             self.model.reasoning_efforts = values
             self.model.source = 'custom'
+            changed = True
         self.edit_text = ''
         self.editing = False
+        if changed:
+            self._changed()
 
     def render(self, canvas: Canvas, width: int, height: int,
                palette: Palette, now: float) -> None:
@@ -208,7 +231,7 @@ class ModelEditorOverlay(Overlay):
                              truncate_text(value, max(8, x + w - 4 - max(x + 30, value_x))),
                              palette.subtext, bg)
         _draw_hint(canvas, x, y + h - 2, w,
-                   '↑↓ move · enter toggle/edit · ←→ change · ctrl+s save · esc close',
+                   '↑↓ move · enter toggle/edit · ←→ change · esc close',
                    palette)
 
 
@@ -426,7 +449,19 @@ class ProviderWizard:
                     self.app.loop.provider.name == provider.name and \
                     self.app.loop.model.id == model.id:
                 self.app.loop.set_model(provider, model)
-        self.app.open_overlay(ModelEditorOverlay(provider, model, save))
+
+        def changed() -> None:
+            # A value changed while the panel is open: the file is written
+            # right away, but the notice is left for the final save so the
+            # transcript is not filled with one notice per keystroke.
+            self.app.save_config()
+            if self.app.loop is not None and \
+                    self.app.loop.provider.name == provider.name and \
+                    self.app.loop.model.id == model.id:
+                self.app.loop.set_model(provider, model)
+
+        self.app.open_overlay(ModelEditorOverlay(provider, model, save,
+                                                  on_change=changed))
 
     # ── edit flow ───────────────────────────────────────────
     def run_edit(self) -> None:
